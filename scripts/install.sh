@@ -30,7 +30,9 @@ if [ -n "$target" ] && curl -fsSL -o "$tmp/$asset" "$url"; then
   tar -xzf "$tmp/$asset" -C "$tmp"
   # Verify checksum when published alongside the asset
   if curl -fsSL -o "$tmp/$asset.sha256" "$url.sha256" 2>/dev/null; then
-    (cd "$tmp" && shasum -a 256 -c "$asset.sha256")
+    if command -v shasum >/dev/null; then (cd "$tmp" && shasum -a 256 -c "$asset.sha256")
+    elif command -v sha256sum >/dev/null; then (cd "$tmp" && sha256sum -c "$asset.sha256")
+    fi
   fi
   install -m 0755 "$tmp/$BIN" "$INSTALL_DIR/$BIN"
 else
