@@ -5,16 +5,17 @@
 //!
 //! - `api` — direct HTTP to the provider (preferred: no subprocess, no
 //!   nesting issues, works headless):
-//!     claude   →  POST https://api.anthropic.com/v1/messages
-//!                 (x-api-key + anthropic-version: 2023-06-01; model
-//!                 claude-opus-4-8; adaptive thinking; `stop_reason:
-//!                 "refusal"` handled fail-closed)
-//!     chatgpt  →  POST https://api.openai.com/v1/chat/completions
-//!     gemini   →  POST https://generativelanguage.googleapis.com/v1beta/
-//!                 models/{model}:generateContent
+//!   ```text
+//!   claude   →  POST https://api.anthropic.com/v1/messages
+//!               (x-api-key + anthropic-version: 2023-06-01; model
+//!               claude-opus-4-8; adaptive thinking; stop_reason
+//!               "refusal" handled fail-closed)
+//!   chatgpt  →  POST https://api.openai.com/v1/chat/completions
+//!   gemini   →  POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
+//!   ```
 //! - `cli` — drive the installed agent CLI non-interactively:
-//!     claude → `claude -p < {file}`, codex → `codex exec - < {file}`,
-//!     gemini → `gemini < {file}`, custom → the `--ai-cmd` template.
+//!   `claude -p < {file}` / `codex exec - < {file}` / `gemini < {file}` /
+//!   the custom `--ai-cmd` template.
 //! - `auto` (default) — `api` when the provider's key env var is set
 //!   (ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY or GOOGLE_API_KEY),
 //!   otherwise `cli`.

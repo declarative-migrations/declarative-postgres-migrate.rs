@@ -122,6 +122,7 @@ dpm apply  --ai-review --ai-tool gemini --yes ...    # review gates the apply, b
 | `--ai-tool` | `DPM_AI_TOOL` | `claude` (default) \| `codex` \| `chatgpt` (codex alias) \| `gemini` \| `custom` |
 | `--ai-cmd` | `DPM_AI_CMD` | custom command template; `{file}` = payload path (also overrides a named tool) |
 | `--ai-strict` | `DPM_AI_STRICT` | default `true`: a REJECT (or missing verdict) blocks — apply aborts, others exit `4` |
+| `--ai-transport` / `--ai-model` | `DPM_AI_TRANSPORT`, `DPM_AI_MODEL` | `auto` \| `api` \| `cli`; model override for the API transport |
 
 Built-in templates: `claude -p < {file}`, `codex exec - < {file}`, `gemini < {file}`. The reviewer must end with `DPM_VERDICT: APPROVE` or `DPM_VERDICT: REJECT <reason>`; dpm **fails closed** — no parseable verdict, a crashed reviewer, or a nonzero exit all count as rejection. The payload tells the reviewer the exact destructive-consent flags in force, so "a live `DROP TABLE` appeared without `--allow-destructive-sql`" is a policy violation it is instructed to reject. In `dpm apply`, the review runs *before* anything touches the database. Reviewers run via `sh -c`, so the tool must be on `PATH` (or use an absolute path in `--ai-cmd`).
 
@@ -204,7 +205,7 @@ scripts/test.sh           # boots an ephemeral Postgres cluster (initdb/pg_ctl,
                           # tears everything down
 ```
 
-The integration suite's core invariant is **convergence**: for schema pairs covering every supported object class (bootstrap-from-empty, divergent evolution, teardown-to-empty, enum insertion, identical-databases-diff-clean, verify-rehearsal), applying the generated migration and re-diffing must yield zero changes.
+The integration suite's core invariant is **convergence**: for schema pairs covering every supported object class, applying the generated migration and re-diffing must yield zero changes. On top of that sits the **cross-checker matrix** (`matrix_*` tests): ten fixture pairs (bootstrap, teardown, divergent evolution, enum insertion, serial/identity transitions, constraint churn, index churn, views+functions+triggers, RLS/policies, multi-schema) each verified by every installed external tool — 7 tools × 10 fixtures when fully provisioned. This matrix is how the library gets refined: it has already caught and fixed atlas/liquibase/apgdiff/flyway driver quirks and one real dpm gap (target-only schemas are now dropped, gated and non-cascade).
 
 ## Prior art & lineage
 
