@@ -627,8 +627,15 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
     }
     report_checks(&outcome.checks);
 
-    // AI review of the (now convergence-proven) migration.
+    // AI discrepancy scan over the cross-check reports.
     let mut ai_ok = true;
+    if let Some(approved) =
+        maybe_ai_discrepancy_scan(r, outcome.converged, outcome.residual_sql.as_deref(), &outcome.checks).await?
+    {
+        ai_ok &= approved || !ai_strict(r);
+    }
+
+    // AI review of the (now convergence-proven) migration.
     {
         let plan = diff(&inputs.source_cat, &inputs.target_cat);
         let script = emit(
@@ -640,7 +647,7 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
             },
         );
         if let Some(review) = maybe_ai_review(r, &plan, &script, &inputs, policy, false).await? {
-            ai_ok = review.approved || !ai_strict(r);
+            ai_ok &= review.approved || !ai_strict(r);
         }
     }
 
