@@ -55,8 +55,15 @@ DESTRUCTIVE CHANGES (two separate consents)
   --allow-destructive-ops   actually execute destructive statements during `dpm apply`
   --allow-destructive       legacy shorthand for both
 
+CROSS-CHECKS (independent diff engines validate dpm's result; verify + apply)
+  --cross-check-with-migra    run migra after migrating; agreement = no remaining diff
+  --cross-check-with-pgdiff   run pgdiff (joncrlsn) across all schema aspects
+  --external-check 'cmd {target} {source}'   any custom checker (empty stdout = agreement)
+  Install the tools: scripts/install-crosscheckers.sh
+
 EXIT CODES
-  0 success · 1 error · 2 differences found (--fail-on-diff) · 3 verify failed to converge
+  0 success · 1 error · 2 differences found (--fail-on-diff)
+  3 verify/apply not converged or a cross-check disagreed
   4 AI reviewer rejected the migration (with --ai-strict, the default)
 ";
 
