@@ -85,7 +85,7 @@ pub async fn verify(p: VerifyParams<'_>) -> Result<VerifyOutcome> {
 
 /// Materialize a catalog into a fresh shadow database (bootstrap DDL) and
 /// sanity-check the result reproduces the catalog exactly.
-async fn materialize_catalog(
+pub async fn materialize_catalog(
     label: &str,
     cat: &Catalog,
     shadow_server_url: &str,
