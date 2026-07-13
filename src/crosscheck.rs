@@ -826,3 +826,64 @@ Unexpected Column(s): \n     public.orders.legacy\nMissing Table(s): NONE
         assert!(!transcript.contains("Unexpected Column(s): NONE"));
     }
 }
+
+#[cfg(test)]
+mod parser_tests {
+    use super::*;
+
+    #[test]
+    fn liquibase_all_none_and_catalog_noise_is_agreement() {
+        let out = "\
+Reference Database: a
+Comparison Database: b
+Product Version: EQUAL
+Changed Catalog(s):
+     db_one
+          name changed from 'db_one' to 'db_two'
+Missing Table(s): NONE
+Unexpected Table(s): NONE
+Changed Table(s): NONE
+";
+        assert!(liquibase_violations(out).is_empty());
+    }
+
+    #[test]
+    fn liquibase_order_only_column_changes_are_filtered() {
+        let out = "\
+Changed Column(s):
+     public.users.bio
+          order changed from '4' to '5'
+     public.users.created_at
+          order changed from '5' to '4'
+Missing Column(s): NONE
+";
+        assert!(liquibase_violations(out).is_empty());
+    }
+
+    #[test]
+    fn liquibase_real_changes_survive_filtering() {
+        let out = "\
+Changed Column(s):
+     public.users.bio
+          order changed from '4' to '5'
+     public.users.email
+          type changed from 'varchar(100)' to 'text'
+Missing Table(s):
+     public.orders
+Unexpected Index(s): NONE
+";
+        let v = liquibase_violations(out);
+        let text = v.join("\n");
+        assert!(text.contains("public.users.email"), "{text}");
+        assert!(text.contains("type changed"), "{text}");
+        assert!(text.contains("public.orders"), "{text}");
+        assert!(!text.contains("bio"), "order-only entry must be filtered: {text}");
+    }
+
+    #[test]
+    fn ensure_sslmode_respects_existing_choice_and_query() {
+        assert_eq!(ensure_sslmode("postgres://u@h/db"), "postgresql://u@h/db?sslmode=disable");
+        assert_eq!(ensure_sslmode("postgresql://u@h/db?x=1"), "postgresql://u@h/db?x=1&sslmode=disable");
+        assert_eq!(ensure_sslmode("postgresql://u@h/db?sslmode=require"), "postgresql://u@h/db?sslmode=require");
+    }
+}

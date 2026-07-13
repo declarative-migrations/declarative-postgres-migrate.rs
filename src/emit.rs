@@ -591,15 +591,23 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
                 &[format!("DROP EXTENSION IF EXISTS {};", quote_ident(name))],
                 true,
             ),
-            Change::DropSchema { name } => e.change(
+            _ => {}
+        }
+    }
+
+    // Schemas drop LAST: enums/sequences/functions dropped above may live
+    // inside them, and a plain (non-CASCADE) DROP SCHEMA requires the schema
+    // to already be empty of dpm-scoped objects.
+    for c in &plan.changes {
+        if let Change::DropSchema { name } = c {
+            e.change(
                 &format!(
                     "drop schema: {name}\n\
                      Plain DROP (no CASCADE): fails if objects outside dpm's scope remain inside."
                 ),
                 &[format!("DROP SCHEMA IF EXISTS {};", quote_ident(name))],
                 true,
-            ),
-            _ => {}
+            );
         }
     }
 
@@ -891,5 +899,159 @@ mod tests {
         let script = emit(&plan, &EmitOptions::default());
         assert!(script.sql.contains("No schema differences detected"));
         assert!(!script.sql.contains("BEGIN;"));
+    }
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    use super::*;
+    use crate::diff::{diff, Change, Plan};
+    use std::collections::BTreeMap;
+
+    fn plan_of(changes: Vec<Change>) -> Plan {
+        Plan { changes }
+    }
+
+    fn pos(hay: &str, needle: &str) -> usize {
+        hay.find(needle).unwrap_or_else(|| panic!("missing {needle:?} in:\n{hay}"))
+    }
+
+    #[test]
+    fn drops_precede_creates_and_fk_drops_come_first() {
+        let t = QName::new("public", "t");
+        let plan = plan_of(vec![
+            Change::CreateIndex { table: t.clone(), name: "t_idx".into(), def: "CREATE INDEX t_idx ON public.t USING btree (a)".into() },
+            Change::DropIndex { index: QName::new("public", "t_idx"), unique: false, replaced: true },
+            Change::AddConstraint { table: t.clone(), name: "t_chk".into(), def: "CHECK ((a > 0))".into(), kind: ConstraintKind::Check, table_is_new: false },
+            Change::DropConstraint { table: t.clone(), name: "t_chk".into(), kind: ConstraintKind::Check, replaced: true },
+            Change::DropConstraint { table: t.clone(), name: "t_fk".into(), kind: ConstraintKind::ForeignKey, replaced: true },
+            Change::AddConstraint { table: t.clone(), name: "t_fk".into(), def: "FOREIGN KEY (a) REFERENCES public.p(id)".into(), kind: ConstraintKind::ForeignKey, table_is_new: false },
+        ]);
+        let sql = emit(&plan, &EmitOptions { allow_destructive: true, ..Default::default() }).sql;
+
+        // FK drop before non-FK drop; all drops before any (re)creates.
+        assert!(pos(&sql, "DROP CONSTRAINT IF EXISTS \"t_fk\"") < pos(&sql, "DROP CONSTRAINT IF EXISTS \"t_chk\""));
+        assert!(pos(&sql, "DROP CONSTRAINT IF EXISTS \"t_chk\"") < pos(&sql, "ADD CONSTRAINT \"t_chk\""));
+        assert!(pos(&sql, "DROP INDEX IF EXISTS") < pos(&sql, "CREATE INDEX t_idx"));
+        // FK re-add comes after non-FK re-add and after index create.
+        assert!(pos(&sql, "ADD CONSTRAINT \"t_chk\"") < pos(&sql, "ADD CONSTRAINT \"t_fk\""));
+        assert!(pos(&sql, "CREATE INDEX t_idx") < pos(&sql, "ADD CONSTRAINT \"t_fk\""));
+    }
+
+    #[test]
+    fn changed_trigger_drops_before_function_replace_and_recreates_after() {
+        let t = QName::new("public", "ev");
+        let plan = plan_of(vec![
+            Change::CreateFunction { key: "public.bump()".into(), def: "CREATE OR REPLACE FUNCTION public.bump() ...".into(), replacing: true },
+            Change::CreateTrigger { key: "public.ev.trg".into(), table: t.clone(), def: "CREATE TRIGGER trg BEFORE UPDATE ON public.ev ...".into() },
+            Change::DropTrigger { table: t.clone(), name: "trg".into(), replaced: true },
+        ]);
+        let sql = emit(&plan, &EmitOptions::default()).sql;
+        assert!(pos(&sql, "DROP TRIGGER IF EXISTS \"trg\"") < pos(&sql, "CREATE OR REPLACE FUNCTION"));
+        assert!(pos(&sql, "CREATE OR REPLACE FUNCTION") < pos(&sql, "CREATE TRIGGER trg"));
+    }
+
+    #[test]
+    fn drop_schema_renders_gated_and_without_cascade() {
+        let plan = plan_of(vec![Change::DropSchema { name: "app".into() }]);
+        let script = emit(&plan, &EmitOptions::default());
+        assert_eq!(script.gated_count, 1);
+        assert!(script.sql.contains("-- DROP SCHEMA IF EXISTS \"app\";"));
+        assert!(!script.sql.contains("DROP SCHEMA IF EXISTS \"app\" CASCADE"));
+
+        let live = emit(&plan, &EmitOptions { allow_destructive: true, ..Default::default() });
+        assert!(live.sql.contains("\nDROP SCHEMA IF EXISTS \"app\";"));
+    }
+
+    #[test]
+    fn alter_sequence_clamps_counter_before_altering() {
+        let seq = QName::new("public", "order_numbers");
+        let def = Sequence { type_sql: "bigint".into(), start: 100, increment: 10, min_value: 100, max_value: 999, cache: 5, cycle: true };
+        let plan = plan_of(vec![Change::AlterSequence { seq, def }]);
+        let sql = emit(&plan, &EmitOptions::default()).sql;
+        let clamp = pos(&sql, "SELECT setval(");
+        let alter = pos(&sql, "ALTER SEQUENCE");
+        assert!(clamp < alter, "clamp must precede the ALTER");
+        assert!(sql.contains("GREATEST(LEAST(last_value, 999), 100)"));
+        assert!(sql.contains("MINVALUE 100 MAXVALUE 999"));
+        assert!(sql.contains(" CYCLE"));
+    }
+
+    #[test]
+    fn make_serial_emits_sequence_default_ownership_and_setval() {
+        let plan = plan_of(vec![Change::MakeSerial { table: QName::new("public", "a"), column: "id".into(), type_sql: "integer".into() }]);
+        let sql = emit(&plan, &EmitOptions::default()).sql;
+        assert!(sql.contains("CREATE SEQUENCE IF NOT EXISTS \"public\".\"a_id_seq\""));
+        assert!(sql.contains("SET DEFAULT nextval"));
+        assert!(sql.contains("OWNED BY \"public\".\"a\".\"id\""));
+        assert!(sql.contains("setval"));
+    }
+
+    #[test]
+    fn policy_sql_covers_restrictive_roles_and_checks() {
+        let p = Policy {
+            name: "docs_write".into(),
+            permissive: false,
+            command: "UPDATE".into(),
+            roles: vec!["public".into(), "app_user".into()],
+            using_expr: Some("open".into()),
+            check_expr: Some("open AND NOT locked".into()),
+        };
+        let sql = policy_create_sql(&QName::new("public", "docs"), &p);
+        assert_eq!(
+            sql,
+            "CREATE POLICY \"docs_write\" ON \"public\".\"docs\" AS RESTRICTIVE FOR UPDATE TO public, \"app_user\" USING (open) WITH CHECK (open AND NOT locked);"
+        );
+    }
+
+    #[test]
+    fn regenerate_column_is_destructive_and_pairs_drop_add() {
+        let col = Column {
+            name: "title_len".into(),
+            type_sql: "integer".into(),
+            not_null: false,
+            default: None,
+            identity: None,
+            generated: Some("length(title)".into()),
+            is_serial: false,
+            collation: None,
+        };
+        let plan = plan_of(vec![Change::RegenerateColumn { table: QName::new("public", "posts"), def: col }]);
+        let script = emit(&plan, &EmitOptions { allow_destructive: true, ..Default::default() });
+        assert_eq!(script.destructive_count, 1);
+        let sql = script.sql;
+        assert!(pos(&sql, "DROP COLUMN IF EXISTS \"title_len\"") < pos(&sql, "ADD COLUMN \"title_len\" integer GENERATED ALWAYS AS (length(title)) STORED"));
+    }
+
+    #[test]
+    fn create_table_inlines_non_fk_constraints_and_defers_fks() {
+        let mut constraints = BTreeMap::new();
+        constraints.insert("c_pkey".into(), Constraint { name: "c_pkey".into(), kind: ConstraintKind::PrimaryKey, def: "PRIMARY KEY (id)".into() });
+        constraints.insert("c_fk".into(), Constraint { name: "c_fk".into(), kind: ConstraintKind::ForeignKey, def: "FOREIGN KEY (p) REFERENCES public.p(id)".into() });
+        let table = Table {
+            columns: vec![Column { name: "id".into(), type_sql: "bigint".into(), not_null: true, default: None, identity: None, generated: None, is_serial: false, collation: None }],
+            constraints,
+            indexes: BTreeMap::new(),
+            partition_by: None,
+            rls_enabled: false,
+            rls_forced: false,
+            policies: BTreeMap::new(),
+        };
+        let plan = plan_of(vec![Change::CreateTable { table: QName::new("public", "c"), def: table }]);
+        let sql = emit(&plan, &EmitOptions::default()).sql;
+        let create = pos(&sql, "CREATE TABLE IF NOT EXISTS \"public\".\"c\"");
+        let fk = pos(&sql, "ADD CONSTRAINT \"c_fk\"");
+        assert!(sql[create..fk].contains("CONSTRAINT \"c_pkey\" PRIMARY KEY (id)"), "PK inline in CREATE TABLE");
+        assert!(!sql[create..fk].contains("c_fk\" FOREIGN KEY") || fk > create, "FK deferred to FK phase");
+        // FK on a brand-new (empty) table is single-step: no NOT VALID.
+        assert!(!sql.contains("\"c_fk\" FOREIGN KEY (p) REFERENCES public.p(id) NOT VALID"));
+    }
+
+    #[test]
+    fn empty_diff_of_identical_synthetic_catalogs_is_stable() {
+        let cat = Catalog::empty_with_schemas(["public".into()]);
+        let script = emit(&diff(&cat, &cat.clone()), &EmitOptions::default());
+        assert_eq!(script.change_count, 0);
+        assert_eq!(script.destructive_count, 0);
     }
 }

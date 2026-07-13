@@ -689,3 +689,173 @@ mod tests {
         assert!(matches!(plan.changes.as_slice(), [Change::SetDefault { expr, .. }] if expr == "42"));
     }
 }
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+
+    fn cat() -> Catalog {
+        Catalog::empty_with_schemas(["public".into()])
+    }
+
+    fn col(name: &str, ty: &str) -> Column {
+        Column {
+            name: name.into(),
+            type_sql: ty.into(),
+            not_null: false,
+            default: None,
+            identity: None,
+            generated: None,
+            is_serial: false,
+            collation: None,
+        }
+    }
+
+    fn table(columns: Vec<Column>) -> Table {
+        Table {
+            columns,
+            constraints: Default::default(),
+            indexes: Default::default(),
+            partition_by: None,
+            rls_enabled: false,
+            rls_forced: false,
+            policies: Default::default(),
+        }
+    }
+
+    fn one_table_pair(s_col: Column, t_col: Column) -> Plan {
+        let (mut s, mut t) = (cat(), cat());
+        s.tables.insert(QName::new("public", "t"), table(vec![s_col]));
+        t.tables.insert(QName::new("public", "t"), table(vec![t_col]));
+        diff(&s, &t)
+    }
+
+    #[test]
+    fn identity_add_drop_and_kind_change() {
+        let mut with_identity = col("id", "bigint");
+        with_identity.identity = Some(IdentityKind::Always);
+        let plain = col("id", "bigint");
+
+        let plan = one_table_pair(with_identity.clone(), plain.clone());
+        assert!(matches!(plan.changes.as_slice(), [Change::AddIdentity { kind: IdentityKind::Always, .. }]));
+
+        let plan = one_table_pair(plain, with_identity.clone());
+        assert!(matches!(plan.changes.as_slice(), [Change::DropIdentity { .. }]));
+
+        let mut by_default = with_identity.clone();
+        by_default.identity = Some(IdentityKind::ByDefault);
+        let plan = one_table_pair(by_default, with_identity);
+        assert!(matches!(plan.changes.as_slice(), [Change::SetIdentityKind { kind: IdentityKind::ByDefault, .. }]));
+    }
+
+    #[test]
+    fn generated_expression_change_is_a_lone_rebuild() {
+        let mut a = col("len", "integer");
+        a.generated = Some("length(title)".into());
+        a.not_null = true; // must NOT produce a separate SetNotNull
+        let mut b = col("len", "integer");
+        b.generated = Some("char_length(title)".into());
+        let plan = one_table_pair(a, b);
+        assert!(matches!(plan.changes.as_slice(), [Change::RegenerateColumn { .. }]));
+    }
+
+    #[test]
+    fn serial_transitions() {
+        let mut serial = col("id", "integer");
+        serial.is_serial = true;
+        serial.default = Some("nextval('public.t_id_seq'::regclass)".into());
+        let plain = col("id", "integer");
+
+        let plan = one_table_pair(serial.clone(), plain.clone());
+        assert!(matches!(plan.changes.as_slice(), [Change::MakeSerial { .. }]));
+
+        let plan = one_table_pair(plain, serial);
+        assert!(plan.changes.iter().any(|c| matches!(c, Change::DropSerial { .. })));
+        assert_eq!(plan.destructive_count(), 1, "sequence drop loses the counter");
+    }
+
+    #[test]
+    fn type_change_emits_alter_with_from_to() {
+        let plan = one_table_pair(col("n", "bigint"), col("n", "integer"));
+        match plan.changes.as_slice() {
+            [Change::AlterColumnType { from, to, .. }] => {
+                assert_eq!(from, "integer");
+                assert_eq!(to, "bigint");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn view_trigger_policy_changes_are_replace_pairs() {
+        let (mut s, mut t) = (cat(), cat());
+        let q = QName::new("public", "v");
+        s.views.insert(q.clone(), View { materialized: false, def: "SELECT 1".into() });
+        t.views.insert(q.clone(), View { materialized: false, def: "SELECT 2".into() });
+        s.triggers.insert("public.t.trg".into(), Trigger { table: QName::new("public", "t"), name: "trg".into(), def: "A".into() });
+        t.triggers.insert("public.t.trg".into(), Trigger { table: QName::new("public", "t"), name: "trg".into(), def: "B".into() });
+        let plan = diff(&s, &t);
+        assert_eq!(plan.changes.len(), 4);
+        assert_eq!(plan.destructive_count(), 0, "replace pairs are not destructive");
+        assert!(plan.changes.iter().any(|c| matches!(c, Change::DropView { replaced: true, .. })));
+        assert!(plan.changes.iter().any(|c| matches!(c, Change::DropTrigger { replaced: true, .. })));
+    }
+
+    #[test]
+    fn rls_toggles_and_extension_lifecycle() {
+        let (mut s, mut t) = (cat(), cat());
+        let q = QName::new("public", "t");
+        let mut st = table(vec![col("id", "integer")]);
+        st.rls_enabled = true;
+        st.rls_forced = true;
+        let tt = table(vec![col("id", "integer")]);
+        s.tables.insert(q.clone(), st);
+        t.tables.insert(q, tt);
+        s.extensions.insert("pgcrypto".into());
+        t.extensions.insert("uuid-ossp".into());
+        let plan = diff(&s, &t);
+        assert!(plan.changes.iter().any(|c| matches!(c, Change::EnableRls { .. })));
+        assert!(plan.changes.iter().any(|c| matches!(c, Change::ForceRls { .. })));
+        assert!(plan.changes.iter().any(|c| matches!(c, Change::CreateExtension { name } if name == "pgcrypto")));
+        assert!(plan.changes.iter().any(|c| matches!(c, Change::DropExtension { name } if name == "uuid-ossp")));
+    }
+
+    #[test]
+    fn partition_strategy_mismatch_short_circuits_to_rebuild() {
+        let (mut s, mut t) = (cat(), cat());
+        let q = QName::new("public", "events");
+        let mut st = table(vec![col("id", "bigint"), col("extra", "text")]);
+        st.partition_by = Some("RANGE (id)".into());
+        let tt = table(vec![col("id", "bigint")]); // column drift must NOT appear
+        s.tables.insert(q.clone(), st);
+        t.tables.insert(q, tt);
+        let plan = diff(&s, &t);
+        assert_eq!(plan.changes.len(), 2, "rebuild pair only: {:?}", plan.changes);
+        assert!(matches!(plan.changes[0], Change::DropTable { .. }));
+        assert!(matches!(plan.changes[1], Change::CreateTable { .. }));
+    }
+
+    #[test]
+    fn target_only_schema_is_dropped_but_public_never_is() {
+        let mut s = cat();
+        let mut t = cat();
+        t.schemas.insert("legacy".into());
+        s.schemas.insert("public".into());
+        let plan = diff(&s, &t);
+        assert!(matches!(plan.changes.as_slice(), [Change::DropSchema { name }] if name == "legacy"));
+
+        // public on target-only side is never dropped
+        let s2 = Catalog::default();
+        let plan = diff(&s2, &cat());
+        assert!(plan.changes.iter().all(|c| !matches!(c, Change::DropSchema { .. })));
+    }
+
+    #[test]
+    fn is_subsequence_edges() {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(is_subsequence(&v(&[]), &v(&["a"])));
+        assert!(is_subsequence(&v(&["a", "c"]), &v(&["a", "b", "c"])));
+        assert!(!is_subsequence(&v(&["c", "a"]), &v(&["a", "b", "c"])));
+        assert!(!is_subsequence(&v(&["a", "a"]), &v(&["a", "b"])));
+    }
+}

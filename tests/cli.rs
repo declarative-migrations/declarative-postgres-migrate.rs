@@ -234,3 +234,116 @@ fn bootstrap_emits_full_ddl_without_target() {
     assert!(sql.contains("CREATE TABLE IF NOT EXISTS \"public\".\"widgets\""));
     assert!(sql.contains("widgets_name_idx"));
 }
+
+/// verify must exit 3 when an external checker disagrees, even though dpm
+/// itself converged.
+#[test]
+fn verify_exits_3_when_external_check_disagrees() {
+    let Some(admin) = admin_url() else { return };
+    let source_sql = scratch("v3.sql");
+    std::fs::write(&source_sql, CLI_SOURCE).unwrap();
+
+    // `false` exits nonzero => disagreement.
+    let out = dpm()
+        .args(["verify", "--source"])
+        .arg(&source_sql)
+        .args(["--shadow", &admin, "--allow-destructive-sql"])
+        .args(["--target-sql"])
+        .arg(&source_sql) // identical sides: dpm converges trivially
+        .args(["--external-check", "false"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("DISAGREED"));
+
+    // Sanity: with an agreeing checker the same invocation exits 0.
+    let out = dpm()
+        .args(["verify", "--source"])
+        .arg(&source_sql)
+        .args(["--shadow", &admin, "--allow-destructive-sql"])
+        .args(["--target-sql"])
+        .arg(&source_sql)
+        .args(["--external-check", "true"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+}
+
+/// apply without --yes must prompt; anything but literal "yes" aborts with
+/// exit 1 and writes nothing.
+#[test]
+fn apply_interactive_abort_leaves_target_untouched() {
+    use std::io::Write as _;
+    let Some(admin) = admin_url() else { return };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let target = rt.block_on(async {
+        let db = dpm::source::ShadowDb::create(&admin, false).await.unwrap();
+        db.apply_sql(CLI_TARGET).await.unwrap();
+        db
+    });
+    let source_sql = scratch("abort.sql");
+    std::fs::write(&source_sql, CLI_SOURCE).unwrap();
+
+    for answer in ["no\n", "y\n", ""] {
+        let mut child = dpm()
+            .args(["apply", "--source"])
+            .arg(&source_sql)
+            .args(["--target", &target.url, "--shadow", &admin])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(answer.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "answer {answer:?} must abort");
+        assert!(stderr(&out).contains("aborted"), "answer {answer:?}: {}", stderr(&out));
+    }
+
+    // Nothing was applied: the price column from the source must not exist.
+    let has_price = rt.block_on(async {
+        let mut conn = dpm::introspect::connect(&target.url).await.unwrap();
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.columns WHERE table_name='widgets' AND column_name='price'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        n
+    });
+    assert_eq!(has_price, 0, "aborted apply must not modify the target");
+    rt.block_on(target.drop_db());
+}
+
+/// --schemas narrows the CLI diff exactly like the library option.
+#[test]
+fn schemas_flag_scopes_the_cli_diff() {
+    let Some(admin) = admin_url() else { return };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (a, b) = rt.block_on(async {
+        let a = dpm::source::ShadowDb::create(&admin, false).await.unwrap();
+        let b = dpm::source::ShadowDb::create(&admin, false).await.unwrap();
+        a.apply_sql("CREATE SCHEMA keep; CREATE TABLE keep.t (id int PRIMARY KEY); CREATE TABLE public.drift (id int);").await.unwrap();
+        b.apply_sql("CREATE SCHEMA keep; CREATE TABLE keep.t (id int PRIMARY KEY);").await.unwrap();
+        (a, b)
+    });
+
+    // Unscoped: drift exists -> exit 2.
+    let out = dpm()
+        .args(["diff", "--fail-on-diff", "--source", &a.url, "--target", &b.url])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+
+    // Scoped to `keep`: identical -> exit 0.
+    let out = dpm()
+        .args(["diff", "--fail-on-diff", "--schemas", "keep", "--source", &a.url, "--target", &b.url])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+
+    rt.block_on(async {
+        a.drop_db().await;
+        b.drop_db().await;
+    });
+}

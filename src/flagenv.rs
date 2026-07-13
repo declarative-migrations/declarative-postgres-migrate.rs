@@ -368,3 +368,59 @@ type = "integer"
         assert_eq!(resolved.get("DPM_ALLOW_DESTRUCTIVE").as_deref(), Some("false"));
     }
 }
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// The shipped .cli-flags.toml must parse, and its contract must be
+    /// internally consistent: no duplicate env keys, aliases, or shorts.
+    #[test]
+    fn embedded_cli_flags_contract_is_consistent() {
+        let parsed: CliFlagsFile = toml::from_str(EMBEDDED_CLI_FLAGS_TOML).expect("embedded .cli-flags.toml parses");
+        assert!(parsed.flags.len() >= 25, "expected a rich contract, got {}", parsed.flags.len());
+
+        let mut envs = HashSet::new();
+        let mut aliases = HashSet::new();
+        let mut shorts = HashSet::new();
+        for (key, spec) in &parsed.flags {
+            assert!(envs.insert(spec.env.clone()), "duplicate env {}", spec.env);
+            assert!(
+                spec.env.starts_with("DPM_") || spec.env.ends_with("_URL") || spec.env.ends_with("_FILE") || spec.env.ends_with("_JSON"),
+                "unconventional env name {} for flag {key}",
+                spec.env
+            );
+            for a in std::iter::once(key).chain(spec.aliases.iter()) {
+                assert!(aliases.insert(a.clone()), "alias {a:?} claimed twice");
+            }
+            if let Some(s) = &spec.short {
+                assert!(shorts.insert(s.clone()), "short -{s} claimed twice");
+                assert_eq!(s.len(), 1, "short -{s} must be one char");
+            }
+            assert!(matches!(spec.r#type.as_str(), "string" | "bool" | "integer" | "json"), "bad type for {key}");
+            assert!(spec.help.is_some(), "flag {key} has no help text");
+        }
+    }
+
+    #[test]
+    fn help_table_lists_every_flag_and_env() {
+        let config = load_config().unwrap();
+        let table = help_table(&config);
+        for (key, spec) in &config.flags {
+            assert!(table.contains(&format!("--{key}")), "help table missing --{key}");
+            assert!(table.contains(&spec.env), "help table missing env {}", spec.env);
+        }
+    }
+
+    #[test]
+    fn get_first_prefers_earlier_keys() {
+        let config = load_config().unwrap();
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("TARGET_DATABASE_URL".to_string(), "postgres://t".to_string());
+        overrides.insert("DATABASE_URL".to_string(), "postgres://d".to_string());
+        let r = Resolved::new(&config, overrides);
+        assert_eq!(r.get_first(&["TARGET_DATABASE_URL", "DATABASE_URL"]).as_deref(), Some("postgres://t"));
+        assert_eq!(r.get_first(&["NOPE_XYZ_123", "DATABASE_URL"]).as_deref(), Some("postgres://d"));
+    }
+}

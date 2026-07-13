@@ -334,3 +334,49 @@ SELECT 1;
         assert!(!is_role_dependent_statement("ALTER TABLE t ADD COLUMN owner_to text"));
     }
 }
+
+#[cfg(test)]
+mod splitter_edge_tests {
+    use super::*;
+
+    #[test]
+    fn empty_and_comment_only_inputs_yield_no_statements() {
+        assert!(split_statements("").is_empty());
+        assert!(split_statements("   \n\t\n").is_empty());
+        assert!(split_statements("-- just a comment\n/* and a block */\n").is_empty());
+    }
+
+    #[test]
+    fn trailing_statement_without_semicolon_is_kept() {
+        let stmts = split_statements("SELECT 1;\nSELECT 2");
+        assert_eq!(stmts, vec!["SELECT 1".to_string(), "SELECT 2".to_string()]);
+    }
+
+    #[test]
+    fn unterminated_dollar_quote_does_not_panic_or_split() {
+        let stmts = split_statements("CREATE FUNCTION f() AS $x$ BEGIN; never closed");
+        assert_eq!(stmts.len(), 1);
+    }
+
+    #[test]
+    fn quoted_identifiers_with_semicolons_do_not_split() {
+        let stmts = split_statements("CREATE TABLE \"we;ird\" (id int);SELECT 1;");
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("we;ird"));
+    }
+
+    #[test]
+    fn meta_strip_preserves_backslash_lines_inside_strings() {
+        let sql = "INSERT INTO t VALUES ('line1\n\\. not a meta terminator\nline3');\n\\.\n";
+        let cleaned = strip_psql_meta_commands(sql);
+        assert!(cleaned.contains("\\. not a meta terminator"), "inside string must survive");
+        assert!(!cleaned.trim_end().ends_with("\\."), "top-level \\. removed");
+    }
+
+    #[test]
+    fn role_statement_detection_is_not_overeager() {
+        assert!(!is_role_dependent_statement("CREATE TABLE grants (id int)"));
+        assert!(!is_role_dependent_statement("COMMENT ON TABLE t IS 'GRANT nothing'"));
+        assert!(is_role_dependent_statement("\n  GRANT SELECT ON t TO r"));
+    }
+}
