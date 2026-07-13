@@ -524,6 +524,63 @@ async fn cmd_dump(r: &Resolved) -> Result<i32> {
     Ok(0)
 }
 
+fn check_selection(r: &Resolved) -> dpm::crosscheck::CheckSelection {
+    dpm::crosscheck::CheckSelection {
+        migra: r.get_bool("DPM_CROSS_CHECK_MIGRA"),
+        pgdiff: r.get_bool("DPM_CROSS_CHECK_PGDIFF"),
+        atlas: r.get_bool("DPM_CROSS_CHECK_ATLAS"),
+        pg_schema_diff: r.get_bool("DPM_CROSS_CHECK_PG_SCHEMA_DIFF"),
+        liquibase: r.get_bool("DPM_CROSS_CHECK_LIQUIBASE"),
+        apgdiff: r.get_bool("DPM_CROSS_CHECK_APGDIFF"),
+        flyway: r.get_bool("DPM_CROSS_CHECK_FLYWAY"),
+        all: r.get_bool("DPM_CROSS_CHECK_ALL"),
+    }
+}
+
+fn check_bins(r: &Resolved) -> dpm::crosscheck::Bins {
+    let get = |key: &str, default: &str| r.get(key).unwrap_or_else(|| default.into());
+    dpm::crosscheck::Bins {
+        migra: get("DPM_MIGRA_BIN", "migra"),
+        pgdiff: get("DPM_PGDIFF_BIN", "pgdiff"),
+        atlas: get("DPM_ATLAS_BIN", "atlas"),
+        pg_schema_diff: get("DPM_PG_SCHEMA_DIFF_BIN", "pg-schema-diff"),
+        liquibase: get("DPM_LIQUIBASE_BIN", "liquibase"),
+        apgdiff: get("DPM_APGDIFF_BIN", "apgdiff"),
+        flyway: get("DPM_FLYWAY_BIN", "flyway"),
+        pg_dump: get("DPM_PG_DUMP_BIN", "pg_dump"),
+    }
+}
+
+/// AI discrepancy scan over the assembled cross-check reports. Returns
+/// Some(approved) when the scan ran.
+async fn maybe_ai_discrepancy_scan(
+    r: &Resolved,
+    converged: bool,
+    residual_sql: Option<&str>,
+    checks: &[dpm::crosscheck::CheckReport],
+) -> Result<Option<bool>> {
+    if !r.get_bool("DPM_CROSS_CHECK_AI") {
+        return Ok(None);
+    }
+    let tool = r.get("DPM_AI_TOOL").unwrap_or_else(|| "claude".to_string());
+    let custom = r.get("DPM_AI_CMD");
+    let transport = ai::Transport::parse(&r.get("DPM_AI_TRANSPORT").unwrap_or_else(|| "auto".into()))?;
+    let model = r.get("DPM_AI_MODEL");
+    let reports: Vec<(String, bool, String, Option<String>)> = checks
+        .iter()
+        .map(|c| (c.name.clone(), c.agreed, c.output.clone(), c.error.clone()))
+        .collect();
+    let payload = ai::build_discrepancy_payload(converged, residual_sql, &reports);
+    eprintln!("dpm: ai discrepancy scan via {tool} ...");
+    let outcome = ai::run_payload(&tool, custom.as_deref(), transport, model.as_deref(), &payload, r.get_bool("DPM_VERBOSE")).await?;
+    match (&outcome.approved, &outcome.verdict) {
+        (true, Some(v)) => eprintln!("dpm: ai discrepancy scan: {v}"),
+        (_, Some(v)) => eprintln!("dpm: ai discrepancy scan REJECTED: {v}\n{}", outcome.transcript),
+        (_, None) => eprintln!("dpm: ai discrepancy scan returned no parseable verdict (treated as rejection)"),
+    }
+    Ok(Some(outcome.approved))
+}
+
 async fn cmd_verify(r: &Resolved) -> Result<i32> {
     let shadow = r
         .get("SHADOW_DATABASE_URL")
@@ -536,8 +593,6 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
         _ => None,
     };
     let external = r.get("DPM_EXTERNAL_CHECK");
-    let migra_bin = r.get("DPM_MIGRA_BIN").unwrap_or_else(|| "migra".into());
-    let pgdiff_bin = r.get("DPM_PGDIFF_BIN").unwrap_or_else(|| "pgdiff".into());
 
     let outcome = verify(VerifyParams {
         source: &inputs.source_cat,
@@ -546,10 +601,8 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
         source_url_for_external: source_url.as_deref(),
         allow_destructive: policy.sql,
         external_check: external.as_deref(),
-        cross_check_migra: r.get_bool("DPM_CROSS_CHECK_MIGRA"),
-        cross_check_pgdiff: r.get_bool("DPM_CROSS_CHECK_PGDIFF"),
-        migra_bin: &migra_bin,
-        pgdiff_bin: &pgdiff_bin,
+        checks: check_selection(r),
+        bins: check_bins(r),
         keep_shadow: r.get_bool("DPM_KEEP_SHADOW"),
         verbose: r.get_bool("DPM_VERBOSE"),
         introspect: &opts,
