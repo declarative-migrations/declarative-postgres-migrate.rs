@@ -106,7 +106,10 @@ Why not pgroll? It's a zero-downtime rollout orchestrator with its own migration
 
 ### AI review — claude / codex / chatgpt / gemini
 
-`dpm review` (or `--ai-review` on `diff`, `apply`, and `verify`) sends a self-contained payload — reviewer instructions, the destructive-consent policy in force, the JSON change plan, and the full SQL — to a coding-agent CLI in non-interactive mode and parses a machine verdict:
+`dpm review` (or `--ai-review` on `diff`, `apply`, and `verify`) sends a self-contained payload — reviewer instructions, the destructive-consent policy in force, the JSON change plan, and the full SQL — to an AI reviewer and parses a machine verdict. Two transports, chosen by `--ai-transport` (`DPM_AI_TRANSPORT`, default `auto`):
+
+- **`api`** — direct HTTP to the provider, preferred when a key is present: Anthropic Messages API (`ANTHROPIC_API_KEY`, model `claude-opus-4-8`, adaptive thinking, safety refusals fail closed), OpenAI chat completions (`OPENAI_API_KEY`, `gpt-5.1`), Gemini generateContent (`GEMINI_API_KEY`/`GOOGLE_API_KEY`, `gemini-2.5-pro`). Override the model with `--ai-model`; one automatic retry on 429/5xx.
+- **`cli`** — drive the installed agent CLI non-interactively (below). `auto` picks `api` when the provider's key env var is set, else `cli`.
 
 ```
 dpm review --source schema.sql --target "$DATABASE_URL" --shadow "$SHADOW_DATABASE_URL"   # claude by default
