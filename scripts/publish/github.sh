@@ -19,9 +19,14 @@ fi
 outdir="target/release-artifacts/$tag"
 rm -rf "$outdir"; mkdir -p "$outdir"
 
+built_any=false
 for target in "${targets[@]}"; do
   echo "==> building $target"
-  cargo build --release --target "$target"
+  if ! cargo build --release --target "$target"; then
+    echo "==> SKIPPING $target (no std for this target on this toolchain — use rustup to add it)"
+    continue
+  fi
+  built_any=true
   staging=$(mktemp -d)
   cp "target/$target/release/dpm" "$staging/"
   cp readme.md LICENSE .cli-flags.toml "$staging/"
@@ -30,6 +35,7 @@ for target in "${targets[@]}"; do
   (cd "$outdir" && shasum -a 256 "$asset" > "$asset.sha256")
   rm -rf "$staging"
 done
+[ "$built_any" = true ] || { echo "no targets built"; exit 1; }
 
 echo "==> creating GitHub release $tag"
 if gh release view "$tag" >/dev/null 2>&1; then
@@ -41,7 +47,7 @@ else
 
 Install:
 \`\`\`
-curl -fsSL https://raw.githubusercontent.com/ORESoftware/declarative-postgres-migrate.rs/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/declarative-migrations/declarative-postgres-migrate.rs/main/scripts/install.sh | bash
 \`\`\`"
 fi
 gh release view "$tag" --json assets -q '.assets[].name'

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # dpm installer:
-#   curl -fsSL https://raw.githubusercontent.com/ORESoftware/declarative-postgres-migrate.rs/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/declarative-migrations/declarative-postgres-migrate.rs/main/scripts/install.sh | bash
 # Downloads the latest GitHub release binary for this OS/arch; falls back to
 # `cargo install --git` when no prebuilt binary matches.
 set -euo pipefail
 
-REPO="ORESoftware/declarative-postgres-migrate.rs"
+REPO="declarative-migrations/declarative-postgres-migrate.rs"
 BIN="dpm"
 INSTALL_DIR="${DPM_INSTALL_DIR:-}"
 if [ -z "$INSTALL_DIR" ]; then
@@ -30,7 +30,9 @@ if [ -n "$target" ] && curl -fsSL -o "$tmp/$asset" "$url"; then
   tar -xzf "$tmp/$asset" -C "$tmp"
   # Verify checksum when published alongside the asset
   if curl -fsSL -o "$tmp/$asset.sha256" "$url.sha256" 2>/dev/null; then
-    (cd "$tmp" && shasum -a 256 -c "$asset.sha256")
+    if command -v shasum >/dev/null; then (cd "$tmp" && shasum -a 256 -c "$asset.sha256")
+    elif command -v sha256sum >/dev/null; then (cd "$tmp" && sha256sum -c "$asset.sha256")
+    fi
   fi
   install -m 0755 "$tmp/$BIN" "$INSTALL_DIR/$BIN"
 else
