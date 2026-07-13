@@ -12,10 +12,9 @@
 //!    - migra / pgdiff first-party drivers (`--cross-check-with-migra`,
 //!      `--cross-check-with-pgdiff`),
 //!    - any custom command template (`--external-check 'cmd {target} {source}'`,
-//!      empty stdout + exit 0 = agreement).
-//!    When the source is a .sql file or catalog dump (no live URL), a second
-//!    throwaway "source replica" is materialized so the external tools still
-//!    have two live databases to compare.
+//!      empty stdout + exit 0 = agreement). When the source is a .sql file or
+//!      catalog dump (no live URL), a second throwaway "source replica" is
+//!      materialized so the external tools still have two live databases.
 //!
 //! The real target is only ever read.
 
