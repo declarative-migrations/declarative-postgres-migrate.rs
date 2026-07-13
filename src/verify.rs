@@ -54,10 +54,9 @@ pub struct VerifyParams<'a> {
     pub allow_destructive: bool,
     /// Custom cross-check command template ({source}/{target} placeholders).
     pub external_check: Option<&'a str>,
-    pub cross_check_migra: bool,
-    pub cross_check_pgdiff: bool,
-    pub migra_bin: &'a str,
-    pub pgdiff_bin: &'a str,
+    /// Which of the seven first-party cross-checkers to run.
+    pub checks: crosscheck::CheckSelection,
+    pub bins: crosscheck::Bins,
     pub keep_shadow: bool,
     pub verbose: bool,
     pub introspect: &'a IntrospectOptions,
