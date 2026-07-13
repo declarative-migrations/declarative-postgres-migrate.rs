@@ -48,6 +48,19 @@ All nine pairings (db↔db, sql↔db, db↔sql, sql↔sql, json↔db, …) are s
 
 pg_dump compatibility: psql meta-commands (`\restrict`, `\unrestrict`, `\connect`, `\.` — including the 2025 security-release `\restrict` headers) are stripped during materialization, and role-dependent statements (`GRANT`/`REVOKE`/`ALTER … OWNER TO`/`SET ROLE`) are skipped, since dpm does not diff ownership/grants and a fresh shadow database lacks production roles. Dumps made with `--no-owner --no-privileges` are cleanest, but ordinary schema-only dumps work.
 
+### ORM-agnostic by construction
+
+Every ORM can either dump its schema to SQL or apply it to a database — and once it's SQL or a live database, dpm doesn't care who authored it. The Postgres catalogs are the neutral interchange format:
+
+| ORM | Get a dpm-consumable source |
+|---|---|
+| Drizzle | `drizzle-kit export` → `schema.sql`, or point `--source` at the dev database `drizzle-kit push` maintains |
+| Prisma | `prisma migrate diff --from-empty --to-schema-datamodel schema.prisma --script` → `schema.sql` |
+| SeaORM / sqlx / ent / peewee / ActiveRecord / Django | run migrations against a scratch database, then `--source postgres://scratch` (or `pg_dump -s` it) |
+| Raw SQL | the file *is* the source |
+
+So "diff my Drizzle app's schema against the SeaORM service's database" is just `dpm diff --source drizzle.sql --target postgres://…` — the tool never parses ORM code.
+
 ## Commands
 
 ```
