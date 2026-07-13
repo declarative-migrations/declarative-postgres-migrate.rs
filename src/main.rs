@@ -429,6 +429,62 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
             residual_real.len()
         );
     }
+
+    // Optional independent cross-checks of the freshly migrated target.
+    let want_migra = r.get_bool("DPM_CROSS_CHECK_MIGRA");
+    let want_pgdiff = r.get_bool("DPM_CROSS_CHECK_PGDIFF");
+    if want_migra || want_pgdiff {
+        let source_url = match source_spec(r)? {
+            SideSpec::Url(u) => Some(u),
+            _ => None,
+        };
+        // File-based sources get a temporary replica when a shadow server is
+        // available, so the external tools have two live databases.
+        let mut source_replica = None;
+        let compare_url = match source_url {
+            Some(u) => Some(u),
+            None => match r.get("SHADOW_DATABASE_URL") {
+                Some(shadow) => {
+                    let db = dpm::verify::materialize_catalog(
+                        "source",
+                        &inputs.source_cat,
+                        &shadow,
+                        &opts,
+                        r.get_bool("DPM_VERBOSE"),
+                    )
+                    .await?;
+                    let url = db.url.clone();
+                    source_replica = Some(db);
+                    Some(url)
+                }
+                None => {
+                    eprintln!(
+                        "dpm: skipping cross-checks: source is not a live URL and no --shadow \
+                         server was given to materialize it"
+                    );
+                    None
+                }
+            },
+        };
+        if let Some(compare_url) = compare_url {
+            let mut checks = Vec::new();
+            if want_migra {
+                let bin = r.get("DPM_MIGRA_BIN").unwrap_or_else(|| "migra".into());
+                checks.push(dpm::crosscheck::run_migra(&bin, target_url, &compare_url));
+            }
+            if want_pgdiff {
+                let bin = r.get("DPM_PGDIFF_BIN").unwrap_or_else(|| "pgdiff".into());
+                checks.push(dpm::crosscheck::run_pgdiff(&bin, target_url, &compare_url));
+            }
+            report_checks(&checks);
+            if let Some(db) = source_replica {
+                db.drop_db().await;
+            }
+            if !checks.iter().all(|c| c.agreed) {
+                return Ok(3);
+            }
+        }
+    }
     Ok(0)
 }
 
