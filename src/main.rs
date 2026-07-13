@@ -352,7 +352,7 @@ async fn cmd_diff(r: &Resolved, bootstrap: bool) -> Result<i32> {
     }
     summarize(&script);
 
-    if let Some(outcome) = maybe_ai_review(r, &plan, &script, &inputs, policy, false)? {
+    if let Some(outcome) = maybe_ai_review(r, &plan, &script, &inputs, policy, false).await? {
         if !outcome.approved && ai_strict(r) {
             return Ok(4);
         }
@@ -398,7 +398,7 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
     }
 
     // AI review runs BEFORE anything touches the database.
-    if let Some(outcome) = maybe_ai_review(r, &plan, &script, &inputs, policy, false)? {
+    if let Some(outcome) = maybe_ai_review(r, &plan, &script, &inputs, policy, false).await? {
         if !outcome.approved {
             if ai_strict(r) {
                 eprintln!("dpm: aborting apply (AI reviewer rejected; use --ai-strict=false to override)");
@@ -586,7 +586,7 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
                 target_desc: Some(inputs.target_desc.clone()),
             },
         );
-        if let Some(review) = maybe_ai_review(r, &plan, &script, &inputs, policy, false)? {
+        if let Some(review) = maybe_ai_review(r, &plan, &script, &inputs, policy, false).await? {
             ai_ok = review.approved || !ai_strict(r);
         }
     }
@@ -621,7 +621,7 @@ async fn cmd_review(r: &Resolved) -> Result<i32> {
     }
     summarize(&script);
 
-    let outcome = maybe_ai_review(r, &plan, &script, &inputs, policy, true)?
+    let outcome = maybe_ai_review(r, &plan, &script, &inputs, policy, true).await?
         .expect("review command forces AI review");
     println!("{}", outcome.transcript.trim_end());
     if outcome.approved {

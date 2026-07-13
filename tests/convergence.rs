@@ -388,6 +388,102 @@ GRANT ALL ON TABLE public.things TO some_app_role;
     live.drop_db().await;
 }
 
+/// Cross-check plumbing with stub binaries (always runs); the real-tool test
+/// below exercises actual migra/pgdiff when installed.
+#[tokio::test]
+async fn verify_runs_cross_checks_with_stub_tools() {
+    let Some(admin) = admin_url() else { return };
+    let (source_db, target_db) = setup_pair(&admin, RICH_SCHEMA, DIVERGENT_SCHEMA).await;
+    let source = introspect_url(&source_db.url, &opts()).await.unwrap();
+    let target = introspect_url(&target_db.url, &opts()).await.unwrap();
+
+    // Stub migra: exits 0 with empty stdout = agreement.
+    let dir = scratch_path("");
+    let stub = dir.join("stub-migra");
+    std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let outcome = dpm::verify::verify(dpm::verify::VerifyParams {
+        source: &source,
+        target: &target,
+        shadow_server_url: &admin,
+        source_url_for_external: Some(&source_db.url),
+        allow_destructive: true,
+        external_check: None,
+        cross_check_migra: true,
+        cross_check_pgdiff: false,
+        migra_bin: stub.to_str().unwrap(),
+        pgdiff_bin: "pgdiff",
+        keep_shadow: false,
+        verbose: false,
+        introspect: &opts(),
+    })
+    .await
+    .expect("verify with stub cross-check");
+    assert!(outcome.converged);
+    assert_eq!(outcome.checks.len(), 1);
+    assert!(outcome.checks[0].agreed, "{:?}", outcome.checks[0]);
+
+    source_db.drop_db().await;
+    target_db.drop_db().await;
+}
+
+/// Real migra / pgdiff cross-validation — dpm's own second-class-citizen
+/// dependencies. Skips per-tool when not installed (scripts/install-crosscheckers.sh).
+#[tokio::test]
+async fn real_migra_and_pgdiff_agree_after_migration() {
+    let Some(admin) = admin_url() else { return };
+    let has = |bin: &str| {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {bin}"))
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    let (has_migra, has_pgdiff) = (has("migra"), has("pgdiff"));
+    if !has_migra && !has_pgdiff {
+        eprintln!("skipping: neither migra nor pgdiff installed");
+        return;
+    }
+
+    let (source_db, target_db) = setup_pair(&admin, RICH_SCHEMA, DIVERGENT_SCHEMA).await;
+    let source = introspect_url(&source_db.url, &opts()).await.unwrap();
+    let target = introspect_url(&target_db.url, &opts()).await.unwrap();
+
+    let outcome = dpm::verify::verify(dpm::verify::VerifyParams {
+        source: &source,
+        target: &target,
+        shadow_server_url: &admin,
+        source_url_for_external: Some(&source_db.url),
+        allow_destructive: true,
+        external_check: None,
+        cross_check_migra: has_migra,
+        cross_check_pgdiff: has_pgdiff,
+        migra_bin: "migra",
+        pgdiff_bin: "pgdiff",
+        keep_shadow: false,
+        verbose: false,
+        introspect: &opts(),
+    })
+    .await
+    .expect("verify with real cross-checks");
+    assert!(outcome.converged, "dpm itself must converge");
+    for check in &outcome.checks {
+        assert!(
+            check.agreed,
+            "{} disagreed with dpm:\nerror: {:?}\noutput:\n{}",
+            check.name, check.error, check.output
+        );
+    }
+
+    source_db.drop_db().await;
+    target_db.drop_db().await;
+}
+
 /// The destructive two-consent model: --allow-destructive-sql controls
 /// generation; without --allow-destructive-ops the CLI apply path must refuse
 /// to execute live destructive SQL (exercised at the library level here via
