@@ -464,6 +464,71 @@ pub fn run_liquibase(bin: &str, migrated_url: &str, source_url: &str) -> CheckRe
     }
 }
 
+/// Parse `liquibase diff` output into real violations. Format:
+/// ```text
+/// Missing Table(s): NONE
+/// Changed Column(s):
+///      public.users.bio
+///           order changed from '4' to '5'
+/// ```
+/// Filtered as expected-noise (not violations):
+/// - "Changed Catalog(s)" — the two sides are different databases by
+///   construction, so the catalog NAME always differs.
+/// - Column entries whose only changes are `order changed from ...` — dpm
+///   deliberately does not enforce column ordinals (converged databases may
+///   disagree after historic ADD COLUMNs).
+fn liquibase_violations(stdout: &str) -> Vec<String> {
+    #[derive(Default)]
+    struct Entry {
+        object: String,
+        details: Vec<String>,
+    }
+    let mut violations: Vec<String> = Vec::new();
+    let mut category: Option<String> = None;
+    let mut entry: Option<Entry> = None;
+
+    let flush = |category: &Option<String>, entry: &mut Option<Entry>, violations: &mut Vec<String>| {
+        if let (Some(cat), Some(e)) = (category, entry.take()) {
+            let order_only = !e.details.is_empty()
+                && e.details.iter().all(|d| d.contains("order changed from"));
+            if cat.starts_with("Changed Column(s)") && order_only {
+                return; // ordinal drift is by-design
+            }
+            violations.push(format!("{cat} {}", e.object));
+            for d in &e.details {
+                violations.push(format!("    {d}"));
+            }
+        }
+    };
+
+    for line in stdout.lines() {
+        let trimmed = line.trim_end();
+        let is_category = trimmed.starts_with("Missing ")
+            || trimmed.starts_with("Unexpected ")
+            || trimmed.starts_with("Changed ");
+        if is_category {
+            flush(&category, &mut entry, &mut violations);
+            let noise = trimmed.ends_with("NONE")
+                || trimmed.ends_with("EQUAL")
+                || trimmed.starts_with("Changed Catalog(s)");
+            category = if noise { None } else { Some(trimmed.trim_end_matches(':').to_string()) };
+        } else if category.is_some() && line.starts_with(' ') && !line.trim().is_empty() {
+            let depth = line.len() - line.trim_start().len();
+            if depth <= 6 {
+                flush(&category, &mut entry, &mut violations);
+                entry = Some(Entry { object: line.trim().to_string(), details: Vec::new() });
+            } else if let Some(e) = entry.as_mut() {
+                e.details.push(line.trim().to_string());
+            }
+        } else if !line.starts_with(' ') {
+            flush(&category, &mut entry, &mut violations);
+            category = None;
+        }
+    }
+    flush(&category, &mut entry, &mut violations);
+    violations
+}
+
 // ---------------------------------------------------------------------------
 // apgdiff
 // ---------------------------------------------------------------------------
