@@ -351,8 +351,8 @@ pub fn run_atlas(bin: &str, migrated_url: &str, source_url: &str) -> CheckReport
     let command = format!(
         "{} schema diff --from {} --to {}",
         shell_quote(bin),
-        shell_quote(&normalize_pg_scheme(migrated_url)),
-        shell_quote(&normalize_pg_scheme(source_url))
+        shell_quote(&ensure_sslmode(migrated_url)),
+        shell_quote(&ensure_sslmode(source_url))
     );
     match run_shell(&command, &[]) {
         Ok((success, stdout, stderr)) => {
@@ -388,8 +388,8 @@ pub fn run_pg_schema_diff(bin: &str, _pg_dump: &str, migrated_url: &str, source_
     let command = format!(
         "{} plan --from-dsn {} --to-dsn {}",
         shell_quote(bin),
-        shell_quote(&normalize_pg_scheme(migrated_url)),
-        shell_quote(&normalize_pg_scheme(source_url))
+        shell_quote(&ensure_sslmode(migrated_url)),
+        shell_quote(&ensure_sslmode(source_url))
     );
     match run_shell(&command, &[]) {
         Ok((success, stdout, stderr)) => {
@@ -451,26 +451,7 @@ pub fn run_liquibase(bin: &str, migrated_url: &str, source_url: &str) -> CheckRe
                     format!("liquibase failed: {}", if stderr.trim().is_empty() { stdout } else { stderr }),
                 );
             }
-            // Category lines look like "Missing Table(s): NONE" or list
-            // entries indented below "Changed Column(s):".
-            let mut violations = Vec::new();
-            let mut in_bad_section = false;
-            for line in stdout.lines() {
-                let trimmed = line.trim_end();
-                let is_category = trimmed.starts_with("Missing ")
-                    || trimmed.starts_with("Unexpected ")
-                    || trimmed.starts_with("Changed ");
-                if is_category {
-                    in_bad_section = !trimmed.ends_with("NONE");
-                    if in_bad_section {
-                        violations.push(trimmed.to_string());
-                    }
-                } else if in_bad_section && line.starts_with(' ') && !line.trim().is_empty() {
-                    violations.push(line.to_string());
-                } else if !line.starts_with(' ') {
-                    in_bad_section = false;
-                }
-            }
+            let violations = liquibase_violations(&stdout);
             CheckReport {
                 name: name.into(),
                 command,
