@@ -463,6 +463,8 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
         _ => None,
     };
     let external = r.get("DPM_EXTERNAL_CHECK");
+    let migra_bin = r.get("DPM_MIGRA_BIN").unwrap_or_else(|| "migra".into());
+    let pgdiff_bin = r.get("DPM_PGDIFF_BIN").unwrap_or_else(|| "pgdiff".into());
 
     let outcome = verify(VerifyParams {
         source: &inputs.source_cat,
@@ -471,6 +473,10 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
         source_url_for_external: source_url.as_deref(),
         allow_destructive: policy.sql,
         external_check: external.as_deref(),
+        cross_check_migra: r.get_bool("DPM_CROSS_CHECK_MIGRA"),
+        cross_check_pgdiff: r.get_bool("DPM_CROSS_CHECK_PGDIFF"),
+        migra_bin: &migra_bin,
+        pgdiff_bin: &pgdiff_bin,
         keep_shadow: r.get_bool("DPM_KEEP_SHADOW"),
         verbose: r.get_bool("DPM_VERBOSE"),
         introspect: &opts,
@@ -493,13 +499,7 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
             eprintln!("--- residual diff ---\n{sql}");
         }
     }
-    if let Some((cmd, agreed, stdout)) = &outcome.external {
-        if *agreed {
-            eprintln!("dpm: external check agreed: {cmd}");
-        } else {
-            eprintln!("dpm: external check DISAGREED: {cmd}\n{stdout}");
-        }
-    }
+    report_checks(&outcome.checks);
 
     // AI review of the (now convergence-proven) migration.
     let mut ai_ok = true;
