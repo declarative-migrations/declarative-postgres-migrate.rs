@@ -448,9 +448,13 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
     }
 
     // Optional independent cross-checks of the freshly migrated target.
-    let want_migra = r.get_bool("DPM_CROSS_CHECK_MIGRA");
-    let want_pgdiff = r.get_bool("DPM_CROSS_CHECK_PGDIFF");
-    if want_migra || want_pgdiff {
+    // (flyway is verify-only: it validates the script on a replica, and the
+    // script has already run here.)
+    let selection = check_selection(r);
+    if selection.any() {
+        if selection.flyway {
+            eprintln!("dpm: note: --cross-check-with-flyway applies to `dpm verify` only (script already applied)");
+        }
         let source_url = match source_spec(r)? {
             SideSpec::Url(u) => Some(u),
             _ => None,
@@ -484,21 +488,24 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
             },
         };
         if let Some(compare_url) = compare_url {
-            let mut checks = Vec::new();
-            if want_migra {
-                let bin = r.get("DPM_MIGRA_BIN").unwrap_or_else(|| "migra".into());
-                checks.push(dpm::crosscheck::run_migra(&bin, target_url, &compare_url));
-            }
-            if want_pgdiff {
-                let bin = r.get("DPM_PGDIFF_BIN").unwrap_or_else(|| "pgdiff".into());
-                checks.push(dpm::crosscheck::run_pgdiff(&bin, target_url, &compare_url));
-            }
+            let checks = dpm::crosscheck::run_diff_checks(&selection, &check_bins(r), target_url, &compare_url);
             report_checks(&checks);
+            let scan_ok = maybe_ai_discrepancy_scan(
+                r,
+                residual_real.is_empty(),
+                None,
+                &checks,
+            )
+            .await?
+            .unwrap_or(true);
             if let Some(db) = source_replica {
                 db.drop_db().await;
             }
             if !checks.iter().all(|c| c.agreed) {
                 return Ok(3);
+            }
+            if !scan_ok && ai_strict(r) {
+                return Ok(4);
             }
         }
     }
