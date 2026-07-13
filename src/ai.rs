@@ -240,6 +240,21 @@ pub async fn run_review(
     req: &ReviewRequest,
     verbose: bool,
 ) -> Result<ReviewOutcome> {
+    let payload = build_payload(req);
+    run_payload(tool, custom_cmd, transport, model_override, &payload, verbose).await
+}
+
+/// Send an arbitrary payload (which must instruct the DPM_VERDICT protocol)
+/// through the configured reviewer. Used by the migration review above and by
+/// the cross-check discrepancy scan.
+pub async fn run_payload(
+    tool: &str,
+    custom_cmd: Option<&str>,
+    transport: Transport,
+    model_override: Option<&str>,
+    payload: &str,
+    verbose: bool,
+) -> Result<ReviewOutcome> {
     let provider = if custom_cmd.is_some() { Provider::Custom } else { provider_for_tool(tool)? };
     let env_lookup = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let key = api_key_for(provider, &env_lookup);
@@ -258,7 +273,6 @@ pub async fn run_review(
         Transport::Auto => key.is_some() && provider != Provider::Custom,
     };
 
-    let payload = build_payload(req);
     if use_api {
         let model = model_override
             .filter(|m| !m.is_empty())
@@ -266,12 +280,62 @@ pub async fn run_review(
             .unwrap_or_else(|| default_model(provider).to_string());
         let key = key.expect("checked above");
         if verbose {
-            eprintln!("dpm: ai review via {tool} HTTP API (model {model})");
+            eprintln!("dpm: ai call via {tool} HTTP API (model {model})");
         }
-        run_review_api(provider, &key, &model, &payload).await
+        run_review_api(provider, &key, &model, payload).await
     } else {
-        run_review_cli(tool, custom_cmd, &payload, req.total_changes, verbose)
+        run_review_cli(tool, custom_cmd, payload, payload.len(), verbose)
     }
+}
+
+/// Payload for the cross-check discrepancy scan: given dpm's own convergence
+/// result and every external tool's report, ask an AI to hunt for
+/// inconsistencies (tools disagreeing with each other, residuals dpm may
+/// have misclassified, suspicious tool errors).
+pub fn build_discrepancy_payload(
+    converged: bool,
+    residual_sql: Option<&str>,
+    reports: &[(String, bool, String, Option<String>)],
+) -> String {
+    let mut tool_sections = String::new();
+    for (name, agreed, output, error) in reports {
+        tool_sections.push_str(&format!(
+            "\n--- {name} (agreed: {agreed}) ---\n{}{}\n",
+            if output.is_empty() { "(no residual output)" } else { output },
+            error.as_ref().map(|e| format!("\n[tool error: {e}]")).unwrap_or_default(),
+        ));
+    }
+    format!(
+        r#"You are auditing the cross-validation results of a PostgreSQL schema migration
+produced by declarative-postgres-migrate (dpm). dpm applied its migration to a replica
+and re-checked convergence itself; several independent schema-diff tools then compared
+the migrated replica against the desired source.
+
+Your job: scan for DISCREPANCIES.
+1. Do the tools agree with each other and with dpm's own convergence result?
+2. If a tool reports residual differences, are they REAL schema drift (dpm bug),
+   known blind spots or noise of that tool (e.g. atlas OSS not seeing views/functions,
+   pgdiff not comparing triggers, dump-format chatter), or an environment/tool error?
+3. Do any tool errors look like they are masking a real disagreement?
+
+dpm's own result: converged = {converged}
+dpm residual (empty means none):
+{residual}
+
+External tool reports:
+{tools}
+
+OUTPUT FORMAT (mandatory)
+- Brief findings, most severe first; classify each residual as real-drift / tool-blind-spot / tool-error.
+- Then, as the FINAL line, exactly one verdict:
+  DPM_VERDICT: APPROVE            (results are consistent; no evidence of real drift)
+  or
+  DPM_VERDICT: REJECT <one-line reason>   (evidence of real drift or unresolvable inconsistency)
+"#,
+        converged = converged,
+        residual = residual_sql.unwrap_or("(none)"),
+        tools = tool_sections,
+    )
 }
 
 // ---------------------------------------------------------------------------
