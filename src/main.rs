@@ -55,8 +55,15 @@ DESTRUCTIVE CHANGES (two separate consents)
   --allow-destructive-ops   actually execute destructive statements during `dpm apply`
   --allow-destructive       legacy shorthand for both
 
+CROSS-CHECKS (independent diff engines validate dpm's result; verify + apply)
+  --cross-check-with-migra    run migra after migrating; agreement = no remaining diff
+  --cross-check-with-pgdiff   run pgdiff (joncrlsn) across all schema aspects
+  --external-check 'cmd {target} {source}'   any custom checker (empty stdout = agreement)
+  Install the tools: scripts/install-crosscheckers.sh
+
 EXIT CODES
-  0 success · 1 error · 2 differences found (--fail-on-diff) · 3 verify failed to converge
+  0 success · 1 error · 2 differences found (--fail-on-diff)
+  3 verify/apply not converged or a cross-check disagreed
   4 AI reviewer rejected the migration (with --ai-strict, the default)
 ";
 
@@ -266,7 +273,7 @@ fn render(r: &Resolved, inputs: &DiffInputs, allow_destructive_sql: bool) -> (Pl
 
 /// Run the configured AI reviewer over a generated migration. Returns None
 /// when AI review is not enabled.
-fn maybe_ai_review(
+async fn maybe_ai_review(
     r: &Resolved,
     plan: &Plan,
     script: &Script,
@@ -279,6 +286,8 @@ fn maybe_ai_review(
     }
     let tool = r.get("DPM_AI_TOOL").unwrap_or_else(|| "claude".to_string());
     let custom = r.get("DPM_AI_CMD");
+    let transport = ai::Transport::parse(&r.get("DPM_AI_TRANSPORT").unwrap_or_else(|| "auto".into()))?;
+    let model = r.get("DPM_AI_MODEL");
     let req = ReviewRequest {
         sql: script.sql.clone(),
         plan_json: serde_json::to_string_pretty(&plan.changes)?,
@@ -292,7 +301,15 @@ fn maybe_ai_review(
         manual_changes: script.manual_count,
     };
     eprintln!("dpm: ai review via {tool} ...");
-    let outcome = ai::run_review(&tool, custom.as_deref(), &req, r.get_bool("DPM_VERBOSE"))?;
+    let outcome = ai::run_review(
+        &tool,
+        custom.as_deref(),
+        transport,
+        model.as_deref(),
+        &req,
+        r.get_bool("DPM_VERBOSE"),
+    )
+    .await?;
     match (&outcome.approved, &outcome.verdict) {
         (true, Some(v)) => eprintln!("dpm: ai review: {v}"),
         (_, Some(v)) => eprintln!("dpm: ai review REJECTED: {v}"),
@@ -335,7 +352,7 @@ async fn cmd_diff(r: &Resolved, bootstrap: bool) -> Result<i32> {
     }
     summarize(&script);
 
-    if let Some(outcome) = maybe_ai_review(r, &plan, &script, &inputs, policy, false)? {
+    if let Some(outcome) = maybe_ai_review(r, &plan, &script, &inputs, policy, false).await? {
         if !outcome.approved && ai_strict(r) {
             return Ok(4);
         }
@@ -381,7 +398,7 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
     }
 
     // AI review runs BEFORE anything touches the database.
-    if let Some(outcome) = maybe_ai_review(r, &plan, &script, &inputs, policy, false)? {
+    if let Some(outcome) = maybe_ai_review(r, &plan, &script, &inputs, policy, false).await? {
         if !outcome.approved {
             if ai_strict(r) {
                 eprintln!("dpm: aborting apply (AI reviewer rejected; use --ai-strict=false to override)");
@@ -429,6 +446,69 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
             residual_real.len()
         );
     }
+
+    // Optional independent cross-checks of the freshly migrated target.
+    // (flyway is verify-only: it validates the script on a replica, and the
+    // script has already run here.)
+    let selection = check_selection(r);
+    if selection.any() {
+        if selection.flyway {
+            eprintln!("dpm: note: --cross-check-with-flyway applies to `dpm verify` only (script already applied)");
+        }
+        let source_url = match source_spec(r)? {
+            SideSpec::Url(u) => Some(u),
+            _ => None,
+        };
+        // File-based sources get a temporary replica when a shadow server is
+        // available, so the external tools have two live databases.
+        let mut source_replica = None;
+        let compare_url = match source_url {
+            Some(u) => Some(u),
+            None => match r.get("SHADOW_DATABASE_URL") {
+                Some(shadow) => {
+                    let db = dpm::verify::materialize_catalog(
+                        "source",
+                        &inputs.source_cat,
+                        &shadow,
+                        &opts,
+                        r.get_bool("DPM_VERBOSE"),
+                    )
+                    .await?;
+                    let url = db.url.clone();
+                    source_replica = Some(db);
+                    Some(url)
+                }
+                None => {
+                    eprintln!(
+                        "dpm: skipping cross-checks: source is not a live URL and no --shadow \
+                         server was given to materialize it"
+                    );
+                    None
+                }
+            },
+        };
+        if let Some(compare_url) = compare_url {
+            let checks = dpm::crosscheck::run_diff_checks(&selection, &check_bins(r), target_url, &compare_url);
+            report_checks(&checks);
+            let scan_ok = maybe_ai_discrepancy_scan(
+                r,
+                residual_real.is_empty(),
+                None,
+                &checks,
+            )
+            .await?
+            .unwrap_or(true);
+            if let Some(db) = source_replica {
+                db.drop_db().await;
+            }
+            if !checks.iter().all(|c| c.agreed) {
+                return Ok(3);
+            }
+            if !scan_ok && ai_strict(r) {
+                return Ok(4);
+            }
+        }
+    }
     Ok(0)
 }
 
@@ -451,6 +531,63 @@ async fn cmd_dump(r: &Resolved) -> Result<i32> {
     Ok(0)
 }
 
+fn check_selection(r: &Resolved) -> dpm::crosscheck::CheckSelection {
+    dpm::crosscheck::CheckSelection {
+        migra: r.get_bool("DPM_CROSS_CHECK_MIGRA"),
+        pgdiff: r.get_bool("DPM_CROSS_CHECK_PGDIFF"),
+        atlas: r.get_bool("DPM_CROSS_CHECK_ATLAS"),
+        pg_schema_diff: r.get_bool("DPM_CROSS_CHECK_PG_SCHEMA_DIFF"),
+        liquibase: r.get_bool("DPM_CROSS_CHECK_LIQUIBASE"),
+        apgdiff: r.get_bool("DPM_CROSS_CHECK_APGDIFF"),
+        flyway: r.get_bool("DPM_CROSS_CHECK_FLYWAY"),
+        all: r.get_bool("DPM_CROSS_CHECK_ALL"),
+    }
+}
+
+fn check_bins(r: &Resolved) -> dpm::crosscheck::Bins {
+    let get = |key: &str, default: &str| r.get(key).unwrap_or_else(|| default.into());
+    dpm::crosscheck::Bins {
+        migra: get("DPM_MIGRA_BIN", "migra"),
+        pgdiff: get("DPM_PGDIFF_BIN", "pgdiff"),
+        atlas: get("DPM_ATLAS_BIN", "atlas"),
+        pg_schema_diff: get("DPM_PG_SCHEMA_DIFF_BIN", "pg-schema-diff"),
+        liquibase: get("DPM_LIQUIBASE_BIN", "liquibase"),
+        apgdiff: get("DPM_APGDIFF_BIN", "apgdiff"),
+        flyway: get("DPM_FLYWAY_BIN", "flyway"),
+        pg_dump: get("DPM_PG_DUMP_BIN", "pg_dump"),
+    }
+}
+
+/// AI discrepancy scan over the assembled cross-check reports. Returns
+/// Some(approved) when the scan ran.
+async fn maybe_ai_discrepancy_scan(
+    r: &Resolved,
+    converged: bool,
+    residual_sql: Option<&str>,
+    checks: &[dpm::crosscheck::CheckReport],
+) -> Result<Option<bool>> {
+    if !r.get_bool("DPM_CROSS_CHECK_AI") {
+        return Ok(None);
+    }
+    let tool = r.get("DPM_AI_TOOL").unwrap_or_else(|| "claude".to_string());
+    let custom = r.get("DPM_AI_CMD");
+    let transport = ai::Transport::parse(&r.get("DPM_AI_TRANSPORT").unwrap_or_else(|| "auto".into()))?;
+    let model = r.get("DPM_AI_MODEL");
+    let reports: Vec<(String, bool, String, Option<String>)> = checks
+        .iter()
+        .map(|c| (c.name.clone(), c.agreed, c.output.clone(), c.error.clone()))
+        .collect();
+    let payload = ai::build_discrepancy_payload(converged, residual_sql, &reports);
+    eprintln!("dpm: ai discrepancy scan via {tool} ...");
+    let outcome = ai::run_payload(&tool, custom.as_deref(), transport, model.as_deref(), &payload, r.get_bool("DPM_VERBOSE")).await?;
+    match (&outcome.approved, &outcome.verdict) {
+        (true, Some(v)) => eprintln!("dpm: ai discrepancy scan: {v}"),
+        (_, Some(v)) => eprintln!("dpm: ai discrepancy scan REJECTED: {v}\n{}", outcome.transcript),
+        (_, None) => eprintln!("dpm: ai discrepancy scan returned no parseable verdict (treated as rejection)"),
+    }
+    Ok(Some(outcome.approved))
+}
+
 async fn cmd_verify(r: &Resolved) -> Result<i32> {
     let shadow = r
         .get("SHADOW_DATABASE_URL")
@@ -471,6 +608,8 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
         source_url_for_external: source_url.as_deref(),
         allow_destructive: policy.sql,
         external_check: external.as_deref(),
+        checks: check_selection(r),
+        bins: check_bins(r),
         keep_shadow: r.get_bool("DPM_KEEP_SHADOW"),
         verbose: r.get_bool("DPM_VERBOSE"),
         introspect: &opts,
@@ -493,16 +632,17 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
             eprintln!("--- residual diff ---\n{sql}");
         }
     }
-    if let Some((cmd, agreed, stdout)) = &outcome.external {
-        if *agreed {
-            eprintln!("dpm: external check agreed: {cmd}");
-        } else {
-            eprintln!("dpm: external check DISAGREED: {cmd}\n{stdout}");
-        }
+    report_checks(&outcome.checks);
+
+    // AI discrepancy scan over the cross-check reports.
+    let mut ai_ok = true;
+    if let Some(approved) =
+        maybe_ai_discrepancy_scan(r, outcome.converged, outcome.residual_sql.as_deref(), &outcome.checks).await?
+    {
+        ai_ok &= approved || !ai_strict(r);
     }
 
     // AI review of the (now convergence-proven) migration.
-    let mut ai_ok = true;
     {
         let plan = diff(&inputs.source_cat, &inputs.target_cat);
         let script = emit(
@@ -513,16 +653,28 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
                 target_desc: Some(inputs.target_desc.clone()),
             },
         );
-        if let Some(review) = maybe_ai_review(r, &plan, &script, &inputs, policy, false)? {
-            ai_ok = review.approved || !ai_strict(r);
+        if let Some(review) = maybe_ai_review(r, &plan, &script, &inputs, policy, false).await? {
+            ai_ok &= review.approved || !ai_strict(r);
         }
     }
 
-    let external_ok = outcome.external.as_ref().map(|(_, ok, _)| *ok).unwrap_or(true);
     if !ai_ok {
         return Ok(4);
     }
-    Ok(if outcome.converged && external_ok { 0 } else { 3 })
+    Ok(if outcome.converged && outcome.all_checks_agreed() { 0 } else { 3 })
+}
+
+fn report_checks(checks: &[dpm::crosscheck::CheckReport]) {
+    for c in checks {
+        match (&c.error, c.agreed) {
+            (Some(err), _) => eprintln!("dpm: cross-check {} ERROR: {err}", c.name),
+            (None, true) => eprintln!("dpm: cross-check {} agreed (no remaining differences)", c.name),
+            (None, false) => eprintln!(
+                "dpm: cross-check {} DISAGREED — it still sees differences:\n{}",
+                c.name, c.output
+            ),
+        }
+    }
 }
 
 async fn cmd_review(r: &Resolved) -> Result<i32> {
@@ -536,7 +688,7 @@ async fn cmd_review(r: &Resolved) -> Result<i32> {
     }
     summarize(&script);
 
-    let outcome = maybe_ai_review(r, &plan, &script, &inputs, policy, true)?
+    let outcome = maybe_ai_review(r, &plan, &script, &inputs, policy, true).await?
         .expect("review command forces AI review");
     println!("{}", outcome.transcript.trim_end());
     if outcome.approved {

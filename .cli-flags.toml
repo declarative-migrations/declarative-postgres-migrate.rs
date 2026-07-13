@@ -127,7 +127,126 @@ help = "Append advisory comments for foreign keys lacking a supporting index."
 env = "DPM_EXTERNAL_CHECK"
 aliases = ["external-check", "external-cmd"]
 type = "string"
-help = "Cross-validation command template for verify, e.g. 'migra {target} {source}'. Empty output = agreement."
+help = "Custom cross-validation command template, e.g. 'mytool {target} {source}'. Empty output + exit 0 = agreement."
+
+[flags.cross-check-with-migra]
+env = "DPM_CROSS_CHECK_MIGRA"
+aliases = ["cross-check-with-migra", "cross-check-migra"]
+type = "bool"
+default = "false"
+help = "After migrating, cross-check the result against the source with migra (must be installed; see scripts/install-crosscheckers.sh)."
+
+[flags.cross-check-with-pgdiff]
+env = "DPM_CROSS_CHECK_PGDIFF"
+aliases = ["cross-check-with-pgdiff", "cross-check-pgdiff"]
+type = "bool"
+default = "false"
+help = "After migrating, cross-check the result against the source with pgdiff (joncrlsn/pgdiff; see scripts/install-crosscheckers.sh)."
+
+[flags.cross-check-with-atlas]
+env = "DPM_CROSS_CHECK_ATLAS"
+aliases = ["cross-check-with-atlas", "cross-check-atlas"]
+type = "bool"
+default = "false"
+help = "Cross-check with atlas (ariga): `atlas schema diff` between migrated and source must be empty."
+
+[flags.cross-check-with-pg-schema-diff]
+env = "DPM_CROSS_CHECK_PG_SCHEMA_DIFF"
+aliases = ["cross-check-with-pg-schema-diff", "cross-check-pg-schema-diff"]
+type = "bool"
+default = "false"
+help = "Cross-check with stripe/pg-schema-diff: plan between migrated and source DSNs must be empty."
+
+[flags.cross-check-with-liquibase]
+env = "DPM_CROSS_CHECK_LIQUIBASE"
+aliases = ["cross-check-with-liquibase", "cross-check-liquibase"]
+type = "bool"
+default = "false"
+help = "Cross-check with liquibase diff: every Missing/Unexpected/Changed category must be NONE."
+
+[flags.cross-check-with-apgdiff]
+env = "DPM_CROSS_CHECK_APGDIFF"
+aliases = ["cross-check-with-apgdiff", "cross-check-apgdiff"]
+type = "bool"
+default = "false"
+help = "Cross-check with apgdiff: diff of pg_dump --schema-only outputs must be empty."
+
+[flags.cross-check-with-flyway]
+env = "DPM_CROSS_CHECK_FLYWAY"
+aliases = ["cross-check-with-flyway", "cross-check-flyway"]
+type = "bool"
+default = "false"
+help = "Runner validation (verify only): dpm's script must apply cleanly under flyway on a fresh target replica."
+
+[flags.cross-check-all]
+env = "DPM_CROSS_CHECK_ALL"
+aliases = ["cross-check-all"]
+type = "bool"
+default = "false"
+help = "Run every cross-checker that is installed (missing tools are skipped, not failed)."
+
+[flags.cross-check-with-ai]
+env = "DPM_CROSS_CHECK_AI"
+aliases = ["cross-check-with-ai", "cross-check-ai"]
+type = "bool"
+default = "false"
+help = "AI discrepancy scan over all cross-check reports: classifies residuals as real drift vs tool blind spots."
+
+[flags.migra-bin]
+env = "DPM_MIGRA_BIN"
+aliases = ["migra-bin"]
+type = "string"
+default = "migra"
+help = "Path/name of the migra binary."
+
+[flags.pgdiff-bin]
+env = "DPM_PGDIFF_BIN"
+aliases = ["pgdiff-bin"]
+type = "string"
+default = "pgdiff"
+help = "Path/name of the pgdiff binary."
+
+[flags.atlas-bin]
+env = "DPM_ATLAS_BIN"
+aliases = ["atlas-bin"]
+type = "string"
+default = "atlas"
+help = "Path/name of the atlas binary."
+
+[flags.pg-schema-diff-bin]
+env = "DPM_PG_SCHEMA_DIFF_BIN"
+aliases = ["pg-schema-diff-bin"]
+type = "string"
+default = "pg-schema-diff"
+help = "Path/name of the pg-schema-diff binary."
+
+[flags.liquibase-bin]
+env = "DPM_LIQUIBASE_BIN"
+aliases = ["liquibase-bin"]
+type = "string"
+default = "liquibase"
+help = "Path/name of the liquibase binary."
+
+[flags.apgdiff-bin]
+env = "DPM_APGDIFF_BIN"
+aliases = ["apgdiff-bin"]
+type = "string"
+default = "apgdiff"
+help = "Path/name of the apgdiff binary."
+
+[flags.flyway-bin]
+env = "DPM_FLYWAY_BIN"
+aliases = ["flyway-bin"]
+type = "string"
+default = "flyway"
+help = "Path/name of the flyway binary."
+
+[flags.pg-dump-bin]
+env = "DPM_PG_DUMP_BIN"
+aliases = ["pg-dump-bin"]
+type = "string"
+default = "pg_dump"
+help = "Path/name of pg_dump (used by the apgdiff cross-check)."
 
 [flags.keep-shadow]
 env = "DPM_KEEP_SHADOW"
@@ -163,6 +282,19 @@ env = "DPM_AI_CMD"
 aliases = ["ai-cmd"]
 type = "string"
 help = "Custom AI review command template; {file} expands to the review-payload path, e.g. 'my-llm --prompt-file {file}'."
+
+[flags.ai-transport]
+env = "DPM_AI_TRANSPORT"
+aliases = ["ai-transport"]
+type = "string"
+default = "auto"
+help = "How to reach the AI reviewer: auto (API when the provider key env var is set, else CLI) | api | cli."
+
+[flags.ai-model]
+env = "DPM_AI_MODEL"
+aliases = ["ai-model"]
+type = "string"
+help = "Model for the API transport (defaults: claude-opus-4-8 / gpt-5.1 / gemini-2.5-pro)."
 
 [flags.ai-strict]
 env = "DPM_AI_STRICT"
