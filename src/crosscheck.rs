@@ -148,8 +148,8 @@ pub fn run_migra(bin: &str, migrated_url: &str, source_url: &str) -> CheckReport
     let command = format!(
         "{} --unsafe {} {}",
         shell_quote(bin),
-        shell_quote(migrated_url),
-        shell_quote(source_url)
+        shell_quote(&normalize_pg_scheme(migrated_url)),
+        shell_quote(&normalize_pg_scheme(source_url))
     );
     match run_shell(&command, &[]) {
         Ok((success, stdout, stderr)) => {
