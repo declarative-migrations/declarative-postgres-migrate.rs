@@ -362,49 +362,27 @@ pub fn run_atlas(bin: &str, migrated_url: &str, source_url: &str) -> CheckReport
 // stripe pg-schema-diff
 // ---------------------------------------------------------------------------
 
-/// pg-schema-diff plans from a live DSN to a schema-dir of desired DDL. We
-/// dump the SOURCE with `pg_dump -s` into a dir and plan the MIGRATED
-/// database against it; an empty plan = agreement. Needs a scratch database
-/// on the migrated side's server for its own shadow processing (--temp-db-dsn
-/// avoided by letting it use the target connection's temp schema; current CLI
-/// creates temp objects itself).
-pub fn run_pg_schema_diff(bin: &str, pg_dump: &str, migrated_url: &str, source_url: &str) -> CheckReport {
+/// pg-schema-diff plans directly between two DSNs:
+/// `pg-schema-diff plan --from-dsn <migrated> --to-dsn <source>`.
+/// An empty plan = agreement. Plan validation (its own shadow processing)
+/// runs against the from-side connection automatically.
+pub fn run_pg_schema_diff(bin: &str, _pg_dump: &str, migrated_url: &str, source_url: &str) -> CheckReport {
     let name = "pg-schema-diff";
     if !binary_exists(bin) {
         return CheckReport::missing(name, bin, "go install github.com/stripe/pg-schema-diff/cmd/pg-schema-diff@latest");
     }
-    if !binary_exists(pg_dump) {
-        return CheckReport::error(name, bin.into(), format!("{pg_dump} (pg_dump) not found on PATH"));
-    }
-    let dir = match scratch_dir("psd") {
-        Ok(d) => d,
-        Err(e) => return CheckReport::error(name, bin.into(), format!("{e:#}")),
-    };
-    let schema_file = dir.join("source-schema.sql");
-    let dump_cmd = format!(
-        "{} --schema-only --no-owner --no-privileges {} > {}",
-        shell_quote(pg_dump),
-        shell_quote(&normalize_pg_scheme(source_url)),
-        shell_quote(&schema_file.display().to_string())
-    );
-    if let Err(e) = run_shell(&dump_cmd, &[]).and_then(|(ok, _, err)| {
-        if ok { Ok(()) } else { anyhow::bail!("pg_dump failed: {err}") }
-    }) {
-        return CheckReport::error(name, dump_cmd, format!("{e:#}"));
-    }
-
     let command = format!(
-        "{} plan --dsn {} --schema-dir {}",
+        "{} plan --from-dsn {} --to-dsn {}",
         shell_quote(bin),
         shell_quote(&normalize_pg_scheme(migrated_url)),
-        shell_quote(&dir.display().to_string())
+        shell_quote(&normalize_pg_scheme(source_url))
     );
-    let report = match run_shell(&command, &[]) {
+    match run_shell(&command, &[]) {
         Ok((success, stdout, stderr)) => {
             let out = stdout.trim().to_string();
-            let empty_plan = out.to_ascii_lowercase().contains("schema matches expected")
-                || out.to_ascii_lowercase().contains("no changes")
-                || out.is_empty();
+            let lower = out.to_ascii_lowercase();
+            let empty_plan =
+                out.is_empty() || lower.contains("schema matches expected") || lower.contains("no changes");
             if success && empty_plan {
                 CheckReport { name: name.into(), command, agreed: true, output: String::new(), error: None }
             } else if success {
@@ -414,9 +392,7 @@ pub fn run_pg_schema_diff(bin: &str, pg_dump: &str, migrated_url: &str, source_u
             }
         }
         Err(e) => CheckReport::error(name, command, format!("{e:#}")),
-    };
-    let _ = std::fs::remove_dir_all(&dir);
-    report
+    }
 }
 
 // ---------------------------------------------------------------------------
