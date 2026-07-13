@@ -84,6 +84,26 @@ dpm help        # flag/env reference (generated from .cli-flags.toml)
 
 Exit codes: `0` verified · `3` not converged (CI-friendly), and `dpm diff --fail-on-diff` exits `2` on drift like `git diff --exit-code`.
 
+### Seven cross-checkers — second-class citizens
+
+dpm never asks you to take its word for it: seven independent tools can countersign every migration, and dpm's own test matrix runs **all of them against ten schema fixtures** (`matrix_*` tests). Six are diff-agreement checkers (after migrating, they must see zero remaining difference between the migrated database and the source); flyway is a runner-validation check (dpm's script must apply cleanly as `V1__dpm_migration.sql` under a standard migration runner on a fresh target replica).
+
+| flag | tool | contract |
+|---|---|---|
+| `--cross-check-with-migra` | [migra](https://github.com/djrobstep/migra) | `migra --unsafe migrated source` prints nothing |
+| `--cross-check-with-pgdiff` | [pgdiff](https://github.com/joncrlsn/pgdiff) | no SQL across SEQUENCE/TABLE/COLUMN/VIEW/INDEX/FOREIGN_KEY aspects |
+| `--cross-check-with-atlas` | [atlas](https://atlasgo.io) | `atlas schema diff` reports schemas synced (OSS sees the relational core; views/functions are Pro) |
+| `--cross-check-with-pg-schema-diff` | [stripe/pg-schema-diff](https://github.com/stripe/pg-schema-diff) | `plan --from-dsn migrated --to-dsn source` is empty |
+| `--cross-check-with-liquibase` | [liquibase](https://www.liquibase.com) OSS `diff` | every Missing/Unexpected/Changed category is NONE (catalog-name and column-order noise filtered — dpm doesn't enforce ordinals by design) |
+| `--cross-check-with-apgdiff` | [apgdiff](https://github.com/fordfrog/apgdiff) | empty diff between `pg_dump -s` outputs (dpm strips the 2025 `\restrict` headers apgdiff can't parse) |
+| `--cross-check-with-flyway` | [flyway](https://flywaydb.org) | script applies cleanly under `flyway migrate -baselineOnMigrate=true` (verify only) |
+| `--cross-check-all` | | every *installed* tool; missing ones are skipped (an individually requested missing tool is a failure) |
+| `--cross-check-with-ai` | | AI discrepancy scan over all reports: classifies residuals as real drift vs tool blind spots vs tool errors, same `DPM_VERDICT` protocol |
+
+Cross-checks run in `verify` (against the shadow replica) and `apply` (against the freshly migrated target). Binaries resolve from PATH or `DPM_<TOOL>_BIN`; install all seven with `scripts/install-crosscheckers.sh`. Any check disagreeing exits `3`.
+
+Why not pgroll? It's a zero-downtime rollout orchestrator with its own migration format, not a differ — there's no "do these two databases match" question to ask it. See [docs/beyond-just-schema-migrations.md](docs/beyond-just-schema-migrations.md), where it fits the future data-migration phase.
+
 ### AI review — claude / codex / chatgpt / gemini
 
 `dpm review` (or `--ai-review` on `diff`, `apply`, and `verify`) sends a self-contained payload — reviewer instructions, the destructive-consent policy in force, the JSON change plan, and the full SQL — to a coding-agent CLI in non-interactive mode and parses a machine verdict:
