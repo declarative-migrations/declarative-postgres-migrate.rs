@@ -2,6 +2,23 @@
 
 Declarative, **ORM-agnostic** Postgres schema migration, in Rust — a library with a CLI on top.
 
+## Install
+
+```sh
+# curl (prebuilt binary from the latest GitHub release; cargo fallback)
+curl -fsSL https://raw.githubusercontent.com/ORESoftware/declarative-postgres-migrate.rs/main/scripts/install.sh | bash
+
+# Homebrew
+brew install oresoftware/tap/dpm
+
+# From source
+cargo install --git https://github.com/ORESoftware/declarative-postgres-migrate.rs
+
+# Optional: the seven cross-check tools (migra, pgdiff, atlas, pg-schema-diff,
+# liquibase, apgdiff, flyway)
+scripts/install-crosscheckers.sh
+```
+
 The core idea: **the Postgres system catalogs are the neutral interchange format.** It doesn't matter whether a schema was authored by Prisma, Drizzle, SeaORM, ent, peewee, or raw SQL — once it's in a database, `pg_catalog` describes it canonically. `dpm` introspects two states, diffs the catalogs, and emits ordered, reviewable SQL that converges the target onto the source:
 
 ```
