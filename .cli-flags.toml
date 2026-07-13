@@ -127,7 +127,35 @@ help = "Append advisory comments for foreign keys lacking a supporting index."
 env = "DPM_EXTERNAL_CHECK"
 aliases = ["external-check", "external-cmd"]
 type = "string"
-help = "Cross-validation command template for verify, e.g. 'migra {target} {source}'. Empty output = agreement."
+help = "Custom cross-validation command template, e.g. 'mytool {target} {source}'. Empty output + exit 0 = agreement."
+
+[flags.cross-check-with-migra]
+env = "DPM_CROSS_CHECK_MIGRA"
+aliases = ["cross-check-with-migra", "cross-check-migra"]
+type = "bool"
+default = "false"
+help = "After migrating, cross-check the result against the source with migra (must be installed; see scripts/install-crosscheckers.sh)."
+
+[flags.cross-check-with-pgdiff]
+env = "DPM_CROSS_CHECK_PGDIFF"
+aliases = ["cross-check-with-pgdiff", "cross-check-pgdiff"]
+type = "bool"
+default = "false"
+help = "After migrating, cross-check the result against the source with pgdiff (joncrlsn/pgdiff; see scripts/install-crosscheckers.sh)."
+
+[flags.migra-bin]
+env = "DPM_MIGRA_BIN"
+aliases = ["migra-bin"]
+type = "string"
+default = "migra"
+help = "Path/name of the migra binary."
+
+[flags.pgdiff-bin]
+env = "DPM_PGDIFF_BIN"
+aliases = ["pgdiff-bin"]
+type = "string"
+default = "pgdiff"
+help = "Path/name of the pgdiff binary."
 
 [flags.keep-shadow]
 env = "DPM_KEEP_SHADOW"
