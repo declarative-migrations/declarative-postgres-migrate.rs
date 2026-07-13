@@ -192,6 +192,19 @@ aliases = ["ai-cmd"]
 type = "string"
 help = "Custom AI review command template; {file} expands to the review-payload path, e.g. 'my-llm --prompt-file {file}'."
 
+[flags.ai-transport]
+env = "DPM_AI_TRANSPORT"
+aliases = ["ai-transport"]
+type = "string"
+default = "auto"
+help = "How to reach the AI reviewer: auto (API when the provider key env var is set, else CLI) | api | cli."
+
+[flags.ai-model]
+env = "DPM_AI_MODEL"
+aliases = ["ai-model"]
+type = "string"
+help = "Model for the API transport (defaults: claude-opus-4-8 / gpt-5.1 / gemini-2.5-pro)."
+
 [flags.ai-strict]
 env = "DPM_AI_STRICT"
 aliases = ["ai-strict"]
