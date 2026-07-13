@@ -518,11 +518,23 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
         }
     }
 
-    let external_ok = outcome.external.as_ref().map(|(_, ok, _)| *ok).unwrap_or(true);
     if !ai_ok {
         return Ok(4);
     }
-    Ok(if outcome.converged && external_ok { 0 } else { 3 })
+    Ok(if outcome.converged && outcome.all_checks_agreed() { 0 } else { 3 })
+}
+
+fn report_checks(checks: &[dpm::crosscheck::CheckReport]) {
+    for c in checks {
+        match (&c.error, c.agreed) {
+            (Some(err), _) => eprintln!("dpm: cross-check {} ERROR: {err}", c.name),
+            (None, true) => eprintln!("dpm: cross-check {} agreed (no remaining differences)", c.name),
+            (None, false) => eprintln!(
+                "dpm: cross-check {} DISAGREED — it still sees differences:\n{}",
+                c.name, c.output
+            ),
+        }
+    }
 }
 
 async fn cmd_review(r: &Resolved) -> Result<i32> {
