@@ -165,8 +165,7 @@ async fn run_on_replica(p: &VerifyParams<'_>, migration_sql: &str, replica: &Sha
 
     // External / cross-checks: need a live URL for the source side.
     let mut checks: Vec<CheckReport> = Vec::new();
-    let wants_external =
-        p.external_check.is_some() || p.cross_check_migra || p.cross_check_pgdiff;
+    let wants_external = p.external_check.is_some() || p.checks.any();
     if wants_external {
         // Own the materialized replica (if any) so it outlives the URL.
         let mut source_replica: Option<ShadowDb> = None;
@@ -194,12 +193,31 @@ async fn run_on_replica(p: &VerifyParams<'_>, migration_sql: &str, replica: &Sha
         };
 
         if let Some(source_url) = &source_url {
-            if p.cross_check_migra {
-                checks.push(crosscheck::run_migra(p.migra_bin, &replica.url, source_url));
+            // Diff-agreement checkers compare the migrated replica to the source.
+            checks.extend(crosscheck::run_diff_checks(&p.checks, &p.bins, &replica.url, source_url));
+
+            // flyway validates the SCRIPT under a standard runner against a
+            // fresh replica of the ORIGINAL target.
+            let want_flyway = p.checks.flyway
+                || (p.checks.all && crosscheck::binary_exists(&p.bins.flyway));
+            if want_flyway {
+                match materialize_catalog("flyway-target", p.target, p.shadow_server_url, p.introspect, p.verbose)
+                    .await
+                {
+                    Ok(db) => {
+                        checks.push(crosscheck::run_flyway(&p.bins.flyway, &db.url, migration_sql));
+                        db.drop_db().await;
+                    }
+                    Err(e) => checks.push(CheckReport {
+                        name: "flyway".into(),
+                        command: String::new(),
+                        agreed: false,
+                        output: String::new(),
+                        error: Some(format!("flyway replica setup failed: {e:#}")),
+                    }),
+                }
             }
-            if p.cross_check_pgdiff {
-                checks.push(crosscheck::run_pgdiff(p.pgdiff_bin, &replica.url, source_url));
-            }
+
             if let Some(template) = p.external_check {
                 let cmd = template.replace("{source}", source_url).replace("{target}", &replica.url);
                 let output = std::process::Command::new("sh")
