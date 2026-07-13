@@ -230,8 +230,11 @@ fn libpq_env(parts: &UrlParts) -> Vec<(String, String)> {
     env
 }
 
+static SCRATCH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn scratch_dir(label: &str) -> Result<std::path::PathBuf> {
-    let dir = std::env::temp_dir().join(format!("dpm-crosscheck-{label}-{}", std::process::id()));
+    let n = SCRATCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("dpm-crosscheck-{label}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -557,6 +560,13 @@ pub fn run_apgdiff(bin: &str, pg_dump: &str, migrated_url: &str, source_url: &st
             &[],
         )
         .and_then(|(ok, _, err)| if ok { Ok(()) } else { anyhow::bail!("pg_dump failed: {err}") })
+        .and_then(|_| {
+            // apgdiff predates the psql \restrict/\unrestrict dump headers
+            // (2025 security releases) and cannot parse them.
+            let text = std::fs::read_to_string(file)?;
+            std::fs::write(file, crate::apply::strip_psql_meta_commands(&text))?;
+            Ok(())
+        })
     };
     let migrated_file = dir.join("migrated.sql");
     let source_file = dir.join("source.sql");
@@ -625,7 +635,7 @@ pub fn run_flyway(bin: &str, replica_url: &str, migration_sql: &str) -> CheckRep
     );
     let command = format!(
         "{bin} -url={url} -user={user} -password={pw} -locations=filesystem:{dir} \
-         -mixed=true -validateMigrationNaming=true migrate",
+         -mixed=true -baselineOnMigrate=true -validateMigrationNaming=true migrate",
         bin = shell_quote(bin),
         url = shell_quote(&jdbc),
         user = shell_quote(&parts.user),

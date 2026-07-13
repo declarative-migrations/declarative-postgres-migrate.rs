@@ -584,6 +584,14 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
                 &[format!("DROP EXTENSION IF EXISTS {};", quote_ident(name))],
                 true,
             ),
+            Change::DropSchema { name } => e.change(
+                &format!(
+                    "drop schema: {name}\n\
+                     Plain DROP (no CASCADE): fails if objects outside dpm's scope remain inside."
+                ),
+                &[format!("DROP SCHEMA IF EXISTS {};", quote_ident(name))],
+                true,
+            ),
             _ => {}
         }
     }

@@ -16,6 +16,9 @@ use crate::model::*;
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Change {
     CreateSchema { name: String },
+    /// Target-only schema, dropped WITHOUT CASCADE: if out-of-scope objects
+    /// remain inside, the apply fails loudly instead of destroying them.
+    DropSchema { name: String },
     CreateExtension { name: String },
     DropExtension { name: String },
 
@@ -85,7 +88,8 @@ impl Change {
     /// script.
     pub fn is_destructive(&self) -> bool {
         match self {
-            Change::DropExtension { .. }
+            Change::DropSchema { .. }
+            | Change::DropExtension { .. }
             | Change::DropEnum { .. }
             | Change::EnumNeedsRebuild { .. }
             | Change::DropSequence { .. }
@@ -143,7 +147,9 @@ pub fn diff(source: &Catalog, target: &Catalog) -> Plan {
 
 fn diff_schemas(source: &Catalog, target: &Catalog, plan: &mut Plan) {
     // Schemas that hold desired objects but don't exist on the target are
-    // created. Schemas are never dropped: they may hold out-of-scope objects.
+    // created. Target-only schemas are dropped (destructive, gated) WITHOUT
+    // CASCADE — convergence requires their removal, but anything out of
+    // dpm's scope left inside makes the apply fail rather than vanish.
     for schema in &source.schemas {
         let target_has = target.schemas.contains(schema);
         let source_uses = source.tables.keys().any(|q| &q.schema == schema)
@@ -154,6 +160,11 @@ fn diff_schemas(source: &Catalog, target: &Catalog, plan: &mut Plan) {
             || schema != "public";
         if !target_has && source_uses {
             plan.changes.push(Change::CreateSchema { name: schema.clone() });
+        }
+    }
+    for schema in &target.schemas {
+        if schema != "public" && !source.schemas.contains(schema) {
+            plan.changes.push(Change::DropSchema { name: schema.clone() });
         }
     }
 }
