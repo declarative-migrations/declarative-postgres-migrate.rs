@@ -273,7 +273,7 @@ fn render(r: &Resolved, inputs: &DiffInputs, allow_destructive_sql: bool) -> (Pl
 
 /// Run the configured AI reviewer over a generated migration. Returns None
 /// when AI review is not enabled.
-fn maybe_ai_review(
+async fn maybe_ai_review(
     r: &Resolved,
     plan: &Plan,
     script: &Script,
@@ -286,6 +286,8 @@ fn maybe_ai_review(
     }
     let tool = r.get("DPM_AI_TOOL").unwrap_or_else(|| "claude".to_string());
     let custom = r.get("DPM_AI_CMD");
+    let transport = ai::Transport::parse(&r.get("DPM_AI_TRANSPORT").unwrap_or_else(|| "auto".into()))?;
+    let model = r.get("DPM_AI_MODEL");
     let req = ReviewRequest {
         sql: script.sql.clone(),
         plan_json: serde_json::to_string_pretty(&plan.changes)?,
@@ -299,7 +301,15 @@ fn maybe_ai_review(
         manual_changes: script.manual_count,
     };
     eprintln!("dpm: ai review via {tool} ...");
-    let outcome = ai::run_review(&tool, custom.as_deref(), &req, r.get_bool("DPM_VERBOSE"))?;
+    let outcome = ai::run_review(
+        &tool,
+        custom.as_deref(),
+        transport,
+        model.as_deref(),
+        &req,
+        r.get_bool("DPM_VERBOSE"),
+    )
+    .await?;
     match (&outcome.approved, &outcome.verdict) {
         (true, Some(v)) => eprintln!("dpm: ai review: {v}"),
         (_, Some(v)) => eprintln!("dpm: ai review REJECTED: {v}"),
