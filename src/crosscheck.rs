@@ -208,6 +208,20 @@ pub fn normalize_pg_scheme(url: &str) -> String {
     }
 }
 
+/// Go's lib/pq (atlas, pg-schema-diff) defaults to REQUIRING SSL; local and
+/// shadow servers usually don't speak it. Make the libpq default explicit
+/// when the URL doesn't already choose one.
+pub fn ensure_sslmode(url: &str) -> String {
+    let url = normalize_pg_scheme(url);
+    if url.contains("sslmode=") {
+        url
+    } else if url.contains('?') {
+        format!("{url}&sslmode=disable")
+    } else {
+        format!("{url}?sslmode=disable")
+    }
+}
+
 fn libpq_env(parts: &UrlParts) -> Vec<(String, String)> {
     let mut env = vec![("PGSSLMODE".to_string(), parts.sslmode.clone())];
     if let Some(pw) = &parts.password {

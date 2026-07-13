@@ -238,10 +238,8 @@ async fn verify_reports_convergence() {
         source_url_for_external: Some(&source_db.url),
         allow_destructive: true,
         external_check: None,
-        cross_check_migra: false,
-        cross_check_pgdiff: false,
-        migra_bin: "migra",
-        pgdiff_bin: "pgdiff",
+        checks: Default::default(),
+        bins: Default::default(),
         keep_shadow: false,
         verbose: false,
         introspect: &opts(),
@@ -392,102 +390,6 @@ GRANT ALL ON TABLE public.things TO some_app_role;
     live.drop_db().await;
 }
 
-/// Cross-check plumbing with stub binaries (always runs); the real-tool test
-/// below exercises actual migra/pgdiff when installed.
-#[tokio::test]
-async fn verify_runs_cross_checks_with_stub_tools() {
-    let Some(admin) = admin_url() else { return };
-    let (source_db, target_db) = setup_pair(&admin, RICH_SCHEMA, DIVERGENT_SCHEMA).await;
-    let source = introspect_url(&source_db.url, &opts()).await.unwrap();
-    let target = introspect_url(&target_db.url, &opts()).await.unwrap();
-
-    // Stub migra: exits 0 with empty stdout = agreement.
-    let dir = scratch_path("");
-    let stub = dir.join("stub-migra");
-    std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    let outcome = dpm::verify::verify(dpm::verify::VerifyParams {
-        source: &source,
-        target: &target,
-        shadow_server_url: &admin,
-        source_url_for_external: Some(&source_db.url),
-        allow_destructive: true,
-        external_check: None,
-        cross_check_migra: true,
-        cross_check_pgdiff: false,
-        migra_bin: stub.to_str().unwrap(),
-        pgdiff_bin: "pgdiff",
-        keep_shadow: false,
-        verbose: false,
-        introspect: &opts(),
-    })
-    .await
-    .expect("verify with stub cross-check");
-    assert!(outcome.converged);
-    assert_eq!(outcome.checks.len(), 1);
-    assert!(outcome.checks[0].agreed, "{:?}", outcome.checks[0]);
-
-    source_db.drop_db().await;
-    target_db.drop_db().await;
-}
-
-/// Real migra / pgdiff cross-validation — dpm's own second-class-citizen
-/// dependencies. Skips per-tool when not installed (scripts/install-crosscheckers.sh).
-#[tokio::test]
-async fn real_migra_and_pgdiff_agree_after_migration() {
-    let Some(admin) = admin_url() else { return };
-    let has = |bin: &str| {
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("command -v {bin}"))
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    };
-    let (has_migra, has_pgdiff) = (has("migra"), has("pgdiff"));
-    if !has_migra && !has_pgdiff {
-        eprintln!("skipping: neither migra nor pgdiff installed");
-        return;
-    }
-
-    let (source_db, target_db) = setup_pair(&admin, RICH_SCHEMA, DIVERGENT_SCHEMA).await;
-    let source = introspect_url(&source_db.url, &opts()).await.unwrap();
-    let target = introspect_url(&target_db.url, &opts()).await.unwrap();
-
-    let outcome = dpm::verify::verify(dpm::verify::VerifyParams {
-        source: &source,
-        target: &target,
-        shadow_server_url: &admin,
-        source_url_for_external: Some(&source_db.url),
-        allow_destructive: true,
-        external_check: None,
-        cross_check_migra: has_migra,
-        cross_check_pgdiff: has_pgdiff,
-        migra_bin: "migra",
-        pgdiff_bin: "pgdiff",
-        keep_shadow: false,
-        verbose: false,
-        introspect: &opts(),
-    })
-    .await
-    .expect("verify with real cross-checks");
-    assert!(outcome.converged, "dpm itself must converge");
-    for check in &outcome.checks {
-        assert!(
-            check.agreed,
-            "{} disagreed with dpm:\nerror: {:?}\noutput:\n{}",
-            check.name, check.error, check.output
-        );
-    }
-
-    source_db.drop_db().await;
-    target_db.drop_db().await;
-}
-
 /// The destructive two-consent model: --allow-destructive-sql controls
 /// generation; without --allow-destructive-ops the CLI apply path must refuse
 /// to execute live destructive SQL (exercised at the library level here via
@@ -513,4 +415,184 @@ async fn destructive_counts_drive_the_two_consent_gate() {
 
     source_db.drop_db().await;
     target_db.drop_db().await;
+}
+
+// ===========================================================================
+// Cross-checker matrix: every fixture pair is verified by dpm AND by every
+// installed external tool (migra, pgdiff, atlas, pg-schema-diff, liquibase,
+// apgdiff, flyway). Missing tools are skipped by --cross-check-all
+// semantics, so the matrix degrades gracefully on machines without them.
+// ===========================================================================
+
+async fn verify_with_all_checkers(admin: &str, label: &str, source_sql: &str, target_sql: &str) {
+    let (source_db, target_db) = setup_pair(admin, source_sql, target_sql).await;
+    let source = introspect_url(&source_db.url, &opts()).await.unwrap();
+    let target = introspect_url(&target_db.url, &opts()).await.unwrap();
+
+    let outcome = dpm::verify::verify(dpm::verify::VerifyParams {
+        source: &source,
+        target: &target,
+        shadow_server_url: admin,
+        source_url_for_external: Some(&source_db.url),
+        allow_destructive: true,
+        external_check: None,
+        checks: dpm::crosscheck::CheckSelection { all: true, ..Default::default() },
+        bins: Default::default(),
+        keep_shadow: false,
+        verbose: false,
+        introspect: &opts(),
+    })
+    .await
+    .unwrap_or_else(|e| panic!("[{label}] verify failed: {e:#}"));
+
+    assert!(
+        outcome.converged,
+        "[{label}] dpm did not converge:\n{}",
+        outcome.residual_sql.as_deref().unwrap_or("")
+    );
+    let ran: Vec<&str> = outcome.checks.iter().map(|c| c.name.as_str()).collect();
+    eprintln!("[{label}] cross-checkers ran: {ran:?}");
+    for check in &outcome.checks {
+        assert!(
+            check.agreed,
+            "[{label}] {} disagreed with dpm:\nerror: {:?}\noutput:\n{}\ncommand: {}",
+            check.name, check.error, check.output, check.command
+        );
+    }
+
+    source_db.drop_db().await;
+    target_db.drop_db().await;
+}
+
+#[tokio::test]
+async fn matrix_divergent_all_checkers() {
+    let Some(admin) = admin_url() else { return };
+    verify_with_all_checkers(&admin, "divergent", RICH_SCHEMA, DIVERGENT_SCHEMA).await;
+}
+
+#[tokio::test]
+async fn matrix_bootstrap_all_checkers() {
+    let Some(admin) = admin_url() else { return };
+    verify_with_all_checkers(&admin, "bootstrap", RICH_SCHEMA, "").await;
+}
+
+#[tokio::test]
+async fn matrix_teardown_all_checkers() {
+    let Some(admin) = admin_url() else { return };
+    verify_with_all_checkers(&admin, "teardown", "", RICH_SCHEMA).await;
+}
+
+#[tokio::test]
+async fn matrix_enum_evolution() {
+    let Some(admin) = admin_url() else { return };
+    verify_with_all_checkers(
+        &admin,
+        "enum",
+        "CREATE TYPE level AS ENUM ('low','medium','high','critical');\n\
+         CREATE TABLE alerts (id bigserial PRIMARY KEY, sev level NOT NULL DEFAULT 'low');",
+        "CREATE TYPE level AS ENUM ('low','high');\n\
+         CREATE TABLE alerts (id bigserial PRIMARY KEY, sev level NOT NULL DEFAULT 'high');",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_serial_identity_transitions() {
+    let Some(admin) = admin_url() else { return };
+    verify_with_all_checkers(
+        &admin,
+        "serial-identity",
+        "CREATE TABLE a (id bigserial PRIMARY KEY, n integer NOT NULL DEFAULT 0);\n\
+         CREATE TABLE b (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY);\n\
+         CREATE TABLE c (id integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY);",
+        "CREATE TABLE a (id bigserial PRIMARY KEY);\n\
+         CREATE TABLE b (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY);\n\
+         CREATE TABLE c (id integer PRIMARY KEY);",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_constraint_churn() {
+    let Some(admin) = admin_url() else { return };
+    verify_with_all_checkers(
+        &admin,
+        "constraints",
+        "CREATE TABLE parent (id bigint PRIMARY KEY, code text NOT NULL, CONSTRAINT parent_code_key UNIQUE (code));\n\
+         CREATE TABLE child (id bigserial PRIMARY KEY, parent_id bigint NOT NULL,\n\
+           CONSTRAINT child_parent_fkey FOREIGN KEY (parent_id) REFERENCES parent(id) ON DELETE RESTRICT,\n\
+           CONSTRAINT child_pos CHECK (id > 0));",
+        "CREATE TABLE parent (id bigint PRIMARY KEY, code text NOT NULL);\n\
+         CREATE TABLE child (id bigserial PRIMARY KEY, parent_id bigint NOT NULL,\n\
+           CONSTRAINT child_parent_fkey FOREIGN KEY (parent_id) REFERENCES parent(id) ON DELETE CASCADE,\n\
+           CONSTRAINT child_neg CHECK (id <> 0));",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_index_churn() {
+    let Some(admin) = admin_url() else { return };
+    verify_with_all_checkers(
+        &admin,
+        "indexes",
+        "CREATE TABLE t (id bigserial PRIMARY KEY, email text NOT NULL, org bigint NOT NULL, live boolean NOT NULL DEFAULT true);\n\
+         CREATE UNIQUE INDEX t_email_lower ON t (lower(email));\n\
+         CREATE INDEX t_org_live ON t (org) WHERE live;\n\
+         CREATE INDEX t_org_desc ON t (org DESC NULLS LAST);",
+        "CREATE TABLE t (id bigserial PRIMARY KEY, email text NOT NULL, org bigint NOT NULL, live boolean NOT NULL DEFAULT true);\n\
+         CREATE INDEX t_email_lower ON t (lower(email));\n\
+         CREATE INDEX t_org_live ON t (org) WHERE NOT live;",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_views_functions_triggers() {
+    let Some(admin) = admin_url() else { return };
+    verify_with_all_checkers(
+        &admin,
+        "views-fns-triggers",
+        "CREATE TABLE ev (id bigserial PRIMARY KEY, kind text NOT NULL, at timestamptz NOT NULL DEFAULT now());\n\
+         CREATE VIEW recent AS SELECT id, kind FROM ev WHERE at > now() - interval '1 day';\n\
+         CREATE MATERIALIZED VIEW kinds AS SELECT kind, count(*) n FROM ev GROUP BY kind;\n\
+         CREATE FUNCTION bump() RETURNS trigger AS $f$ BEGIN NEW.at := now(); RETURN NEW; END; $f$ LANGUAGE plpgsql;\n\
+         CREATE TRIGGER ev_bump BEFORE UPDATE ON ev FOR EACH ROW EXECUTE FUNCTION bump();",
+        "CREATE TABLE ev (id bigserial PRIMARY KEY, kind text NOT NULL, at timestamptz NOT NULL DEFAULT now());\n\
+         CREATE VIEW recent AS SELECT id FROM ev;\n\
+         CREATE FUNCTION bump() RETURNS trigger AS $f$ BEGIN NEW.at := clock_timestamp(); RETURN NEW; END; $f$ LANGUAGE plpgsql;",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_rls_policies() {
+    let Some(admin) = admin_url() else { return };
+    verify_with_all_checkers(
+        &admin,
+        "rls",
+        "CREATE TABLE docs (id bigserial PRIMARY KEY, owner text NOT NULL, open boolean NOT NULL DEFAULT false);\n\
+         ALTER TABLE docs ENABLE ROW LEVEL SECURITY;\n\
+         CREATE POLICY docs_read ON docs AS PERMISSIVE FOR SELECT USING (open);\n\
+         CREATE POLICY docs_write ON docs AS RESTRICTIVE FOR UPDATE USING (open) WITH CHECK (open);",
+        "CREATE TABLE docs (id bigserial PRIMARY KEY, owner text NOT NULL, open boolean NOT NULL DEFAULT false);\n\
+         CREATE POLICY docs_read ON docs AS PERMISSIVE FOR SELECT USING (NOT open);",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_multischema() {
+    let Some(admin) = admin_url() else { return };
+    verify_with_all_checkers(
+        &admin,
+        "multischema",
+        "CREATE SCHEMA billing; CREATE SCHEMA audit;\n\
+         CREATE TABLE billing.invoices (id bigserial PRIMARY KEY, total numeric(12,2) NOT NULL DEFAULT 0);\n\
+         CREATE TABLE audit.entries (id bigserial PRIMARY KEY, ref bigint NOT NULL,\n\
+           CONSTRAINT entries_ref_fkey FOREIGN KEY (ref) REFERENCES billing.invoices(id));",
+        "CREATE SCHEMA billing;\n\
+         CREATE TABLE billing.invoices (id bigserial PRIMARY KEY, total numeric(10,2) NOT NULL);",
+    )
+    .await;
 }
