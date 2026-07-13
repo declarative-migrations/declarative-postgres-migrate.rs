@@ -117,6 +117,15 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// SQLAlchemy 2.x (migra's engine) rejects the `postgres://` scheme alias —
+/// it requires `postgresql://`.
+fn normalize_pg_scheme(url: &str) -> String {
+    match url.strip_prefix("postgres://") {
+        Some(rest) => format!("postgresql://{rest}"),
+        None => url.to_string(),
+    }
+}
+
 /// migra: `migra --unsafe <migrated_url> <source_url>` prints the DDL needed
 /// to turn the first database into the second. Empty output + exit 0 means
 /// "already identical" — agreement. Exit 2 with output means differences
