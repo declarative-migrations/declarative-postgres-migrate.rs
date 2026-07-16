@@ -144,8 +144,15 @@ fn opts() -> IntrospectOptions {
     IntrospectOptions::default()
 }
 
-/// Core invariant: migrate target → re-diff → empty plan.
-async fn assert_converges(admin: &str, source_sql: &str, target_sql: &str, label: &str) {
+/// Core invariant: migrate target → re-diff → empty plan. The variant
+/// returning the databases lets behavioral tests execute the migrated objects
+/// before cleanup.
+async fn migrate_and_assert_converges(
+    admin: &str,
+    source_sql: &str,
+    target_sql: &str,
+    label: &str,
+) -> (ShadowDb, ShadowDb, String) {
     let (source_db, target_db) = setup_pair(admin, source_sql, target_sql).await;
 
     let source = introspect_url(&source_db.url, &opts()).await.expect("introspect source");
@@ -168,6 +175,12 @@ async fn assert_converges(admin: &str, source_sql: &str, target_sql: &str, label
         script.sql
     );
 
+    (source_db, target_db, script.sql)
+}
+
+async fn assert_converges(admin: &str, source_sql: &str, target_sql: &str, label: &str) {
+    let (source_db, target_db, _) =
+        migrate_and_assert_converges(admin, source_sql, target_sql, label).await;
     source_db.drop_db().await;
     target_db.drop_db().await;
 }
@@ -545,6 +558,287 @@ async fn matrix_index_churn() {
          CREATE INDEX t_org_live ON t (org) WHERE NOT live;",
     )
     .await;
+}
+
+#[tokio::test]
+async fn postgres_advanced_indexes_converge() {
+    let Some(admin) = admin_url() else { return };
+    let (source_db, target_db, migration) = migrate_and_assert_converges(
+        &admin,
+        "CREATE TABLE search_documents (\
+           id bigint PRIMARY KEY, tenant_id bigint NOT NULL, title text NOT NULL, \
+           payload jsonb NOT NULL, active boolean NOT NULL DEFAULT true); \
+         CREATE INDEX documents_covering_idx ON search_documents (tenant_id, title DESC) \
+           INCLUDE (payload) WHERE active; \
+         CREATE INDEX documents_payload_idx ON search_documents USING gin (payload); \
+         CREATE UNIQUE INDEX documents_title_unique_idx \
+           ON search_documents (tenant_id, lower(title)) WHERE active;",
+        "CREATE TABLE search_documents (\
+           id bigint PRIMARY KEY, tenant_id bigint NOT NULL, title text NOT NULL, \
+           payload jsonb NOT NULL, active boolean NOT NULL DEFAULT true); \
+         CREATE INDEX documents_covering_idx ON search_documents (tenant_id, title); \
+         CREATE INDEX documents_payload_idx ON search_documents (tenant_id); \
+         CREATE INDEX documents_obsolete_idx ON search_documents (active); \
+         CREATE UNIQUE INDEX documents_obsolete_unique_idx ON search_documents (title);",
+        "advanced-indexes",
+    )
+    .await;
+    assert!(
+        migration.contains("DROP INDEX IF EXISTS \"public\".\"documents_obsolete_idx\""),
+        "{migration}"
+    );
+    assert!(
+        migration.contains(
+            "DROP INDEX IF EXISTS \"public\".\"documents_obsolete_unique_idx\""
+        ),
+        "{migration}"
+    );
+    source_db.drop_db().await;
+    target_db.drop_db().await;
+}
+
+#[tokio::test]
+async fn postgres_functions_procedures_and_triggers_converge_and_execute() {
+    let Some(admin) = admin_url() else { return };
+    let source_sql = r#"
+CREATE TABLE accounts (
+  id integer PRIMARY KEY,
+  balance integer NOT NULL,
+  touched boolean NOT NULL DEFAULT false
+);
+CREATE TABLE account_audit (account_id integer NOT NULL, new_balance integer NOT NULL);
+CREATE FUNCTION multiply_values(a integer, b integer) RETURNS integer
+  AS 'SELECT a * b' LANGUAGE SQL IMMUTABLE;
+CREATE PROCEDURE credit_account(account_id integer, amount integer)
+  LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE public.accounts SET balance = balance + amount WHERE accounts.id = account_id;
+END
+$$;
+CREATE FUNCTION audit_account_update() RETURNS trigger AS $$
+BEGIN
+  NEW.touched := true;
+  INSERT INTO public.account_audit(account_id, new_balance) VALUES (NEW.id, NEW.balance);
+  RETURN NEW;
+END
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER accounts_audit BEFORE UPDATE ON accounts
+  FOR EACH ROW EXECUTE FUNCTION audit_account_update();
+ALTER TABLE accounts ENABLE ALWAYS TRIGGER accounts_audit;
+"#;
+    let target_sql = r#"
+CREATE TABLE accounts (
+  id integer PRIMARY KEY,
+  balance integer NOT NULL,
+  touched boolean NOT NULL DEFAULT false
+);
+CREATE TABLE account_audit (account_id integer NOT NULL, new_balance integer NOT NULL);
+CREATE FUNCTION multiply_values(a integer, b integer) RETURNS integer
+  AS 'SELECT a + b' LANGUAGE SQL IMMUTABLE;
+CREATE PROCEDURE credit_account(account_id integer, amount integer)
+  LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE public.accounts SET balance = balance - amount WHERE accounts.id = account_id;
+END
+$$;
+CREATE PROCEDURE "obsolete account job"() LANGUAGE SQL AS 'SELECT 1';
+CREATE FUNCTION audit_account_update() RETURNS trigger AS $$
+BEGIN
+  NEW.touched := false;
+  RETURN NEW;
+END
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER accounts_audit BEFORE UPDATE ON accounts
+  FOR EACH ROW EXECUTE FUNCTION audit_account_update();
+ALTER TABLE accounts DISABLE TRIGGER accounts_audit;
+"#;
+    let (source_db, target_db, migration) =
+        migrate_and_assert_converges(&admin, source_sql, target_sql, "routines-triggers").await;
+    assert!(migration.contains("CREATE OR REPLACE FUNCTION"), "{migration}");
+    assert!(migration.contains("CREATE OR REPLACE PROCEDURE"), "{migration}");
+    assert!(
+        migration.contains("DROP PROCEDURE IF EXISTS \"public\".\"obsolete account job\"()"),
+        "{migration}"
+    );
+    assert!(
+        migration.contains("ENABLE ALWAYS TRIGGER \"accounts_audit\""),
+        "{migration}"
+    );
+
+    let mut conn = dpm::introspect::connect(&target_db.url).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO public.accounts (id, balance) VALUES (1, 10); \
+         CALL public.credit_account(1, 5);",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("execute migrated PostgreSQL procedure and trigger");
+    let behavior: (i32, bool, i32, i64) = sqlx::query_as(
+        "SELECT a.balance, a.touched, public.multiply_values(3, 4), count(au.account_id) \
+           FROM public.accounts a \
+           LEFT JOIN public.account_audit au ON au.account_id = a.id \
+          WHERE a.id = 1 \
+          GROUP BY a.balance, a.touched",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(behavior, (15, true, 12, 1));
+
+    source_db.drop_db().await;
+    target_db.drop_db().await;
+}
+
+#[tokio::test]
+async fn postgres_routine_options_bootstrap_json_and_teardown() {
+    let Some(admin) = admin_url() else { return };
+    let schema = r#"
+CREATE FUNCTION public.secure_greeting(prefix text DEFAULT 'hello')
+  RETURNS text IMMUTABLE SECURITY DEFINER LANGUAGE SQL
+  AS 'SELECT prefix || ''!''';
+CREATE PROCEDURE public.double_value(INOUT value integer, OUT doubled integer)
+  SECURITY DEFINER LANGUAGE plpgsql AS $$
+BEGIN
+  doubled := value * 2;
+  value := value + 1;
+END
+$$;
+"#;
+
+    let (source_db, target_db, migration) =
+        migrate_and_assert_converges(&admin, schema, "", "routine-options-bootstrap").await;
+    assert!(migration.contains("SECURITY DEFINER"), "{migration}");
+    assert!(migration.contains("DEFAULT 'hello'::text"), "{migration}");
+    assert!(migration.contains("INOUT value integer"), "{migration}");
+
+    let source_catalog = introspect_url(&source_db.url, &IntrospectOptions::default())
+        .await
+        .unwrap();
+    let json = serde_json::to_string_pretty(&source_catalog).unwrap();
+    let round_trip: dpm::model::Catalog = serde_json::from_str(&json).unwrap();
+    assert!(
+        diff(&source_catalog, &round_trip).is_empty(),
+        "PostgreSQL routine catalog JSON must round-trip"
+    );
+
+    let mut conn = dpm::introspect::connect(&target_db.url).await.unwrap();
+    let greeting: String = sqlx::query_scalar("SELECT public.secure_greeting()")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    let values: (i32, i32) = sqlx::query_as("CALL public.double_value(3, NULL)")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(greeting, "hello!");
+    assert_eq!(values, (4, 6));
+
+    source_db.drop_db().await;
+    target_db.drop_db().await;
+    assert_converges(&admin, "", schema, "routine-options-teardown").await;
+}
+
+#[tokio::test]
+async fn postgres_multiple_conditional_triggers_converge_and_execute() {
+    let Some(admin) = admin_url() else { return };
+    let source_sql = r#"
+CREATE TABLE public.events (id integer PRIMARY KEY, value integer NOT NULL);
+CREATE TABLE public.event_audit (event_id integer NOT NULL, observed_value integer NOT NULL);
+CREATE FUNCTION public.normalize_event() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.value < 0 THEN
+    NEW.value := 0;
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE FUNCTION public.audit_event() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO public.event_audit(event_id, observed_value) VALUES (NEW.id, NEW.value);
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER events_normalize BEFORE INSERT OR UPDATE ON public.events
+  FOR EACH ROW EXECUTE FUNCTION public.normalize_event();
+CREATE TRIGGER events_audit_insert AFTER INSERT ON public.events
+  FOR EACH ROW WHEN (NEW.value > 10)
+  EXECUTE FUNCTION public.audit_event();
+CREATE TRIGGER events_audit_update AFTER UPDATE ON public.events
+  FOR EACH ROW WHEN (NEW.value > 20)
+  EXECUTE FUNCTION public.audit_event();
+"#;
+    let target_sql = r#"
+CREATE TABLE public.events (id integer PRIMARY KEY, value integer NOT NULL);
+CREATE TABLE public.event_audit (event_id integer NOT NULL, observed_value integer NOT NULL);
+CREATE FUNCTION public.normalize_event() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.value < 0 THEN
+    NEW.value := 99;
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE FUNCTION public.audit_event() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO public.event_audit(event_id, observed_value) VALUES (NEW.id, -1);
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER events_normalize BEFORE INSERT OR UPDATE ON public.events
+  FOR EACH ROW EXECUTE FUNCTION public.normalize_event();
+CREATE TRIGGER events_audit_insert AFTER INSERT ON public.events
+  FOR EACH ROW WHEN (NEW.value > 10)
+  EXECUTE FUNCTION public.audit_event();
+CREATE TRIGGER events_audit_update AFTER UPDATE ON public.events
+  FOR EACH ROW WHEN (NEW.value > 20)
+  EXECUTE FUNCTION public.audit_event();
+CREATE TRIGGER events_audit_obsolete AFTER INSERT ON public.events
+  FOR EACH ROW WHEN (NEW.value > 1000)
+  EXECUTE FUNCTION public.audit_event();
+"#;
+
+    let (source_db, target_db, migration) = migrate_and_assert_converges(
+        &admin,
+        source_sql,
+        target_sql,
+        "multiple-conditional-triggers",
+    )
+    .await;
+    assert!(
+        migration.contains("DROP TRIGGER IF EXISTS \"events_audit_obsolete\""),
+        "{migration}"
+    );
+    assert!(migration.contains("CREATE OR REPLACE FUNCTION"), "{migration}");
+
+    let mut conn = dpm::introspect::connect(&target_db.url).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO public.events (id, value) VALUES (1, -5), (2, 15), (3, 25); \
+         UPDATE public.events SET value = 30 WHERE id = 2; \
+         UPDATE public.events SET value = -7 WHERE id = 1;",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("execute migrated PostgreSQL conditional triggers");
+    let values: (i32, i32, i32) = sqlx::query_as(
+        "SELECT max(value) FILTER (WHERE id = 1), \
+                max(value) FILTER (WHERE id = 2), \
+                max(value) FILTER (WHERE id = 3) \
+           FROM public.events",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    let audit: (i64, i64) = sqlx::query_as(
+        "SELECT count(*), sum(observed_value)::bigint FROM public.event_audit",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(values, (0, 30, 25));
+    assert_eq!(audit, (3, 70));
+
+    source_db.drop_db().await;
+    target_db.drop_db().await;
 }
 
 #[tokio::test]

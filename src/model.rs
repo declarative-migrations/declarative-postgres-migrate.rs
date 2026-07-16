@@ -16,6 +16,27 @@ use serde::{Deserialize, Serialize};
 
 pub const CATALOG_FORMAT_VERSION: u32 = 1;
 
+/// The server family that produced a catalog.  CockroachDB speaks the
+/// PostgreSQL wire protocol, but its catalog and DDL capabilities are not a
+/// byte-for-byte PostgreSQL implementation.  Keeping this on the snapshot
+/// prevents migrations from silently mixing the two dialects.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseFlavor {
+    #[default]
+    Postgres,
+    Cockroach,
+}
+
+impl DatabaseFlavor {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Postgres => "PostgreSQL",
+            Self::Cockroach => "CockroachDB",
+        }
+    }
+}
+
 /// Schema-qualified object name. Ordered so BTreeMap iteration (and therefore
 /// emitted SQL) is deterministic.
 ///
@@ -130,6 +151,11 @@ pub struct Column {
     pub is_serial: bool,
     /// Non-default collation, schema-qualified (e.g. `pg_catalog."C"`).
     pub collation: Option<String>,
+    /// CockroachDB column visibility.  Its implicit primary-key `rowid` is
+    /// hidden, and user columns may be declared `NOT VISIBLE`. PostgreSQL
+    /// catalogs deserialize this as `false`.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 impl Column {
@@ -142,6 +168,7 @@ impl Column {
             && self.generated == other.generated
             && self.is_serial == other.is_serial
             && self.collation == other.collation
+            && self.hidden == other.hidden
             && (self.is_serial || self.default == other.default)
     }
 }
@@ -246,19 +273,116 @@ pub struct Sequence {
     pub cycle: bool,
 }
 
+/// The two routine kinds managed through `pg_proc`.  Keeping the kind in the
+/// catalog matters at drop time: PostgreSQL and CockroachDB both require
+/// `DROP PROCEDURE` for procedures rather than accepting `DROP FUNCTION`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutineKind {
+    #[default]
+    Function,
+    Procedure,
+}
+
+impl RoutineKind {
+    pub fn from_prokind(value: &str) -> Option<Self> {
+        match value {
+            "f" => Some(Self::Function),
+            "p" => Some(Self::Procedure),
+            _ => None,
+        }
+    }
+
+    pub fn sql(self) -> &'static str {
+        match self {
+            Self::Function => "FUNCTION",
+            Self::Procedure => "PROCEDURE",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Procedure => "procedure",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Function {
     /// `name(identity args)` — uniquely identifies an overload within a schema.
     pub signature: String,
+    /// Raw routine name and canonical identity arguments are stored
+    /// separately so DROP statements can quote hostile identifiers safely.
+    /// Legacy catalogs fall back to their historical `signature` field.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub identity_arguments: String,
+    /// Old catalog JSON predates procedure-aware drops and therefore
+    /// deserializes as a function.
+    #[serde(default)]
+    pub kind: RoutineKind,
     /// Full `pg_get_functiondef(oid)` text (a complete
     /// `CREATE OR REPLACE FUNCTION|PROCEDURE ...` statement).
     pub def: String,
+}
+
+impl Function {
+    pub fn drop_signature_sql(&self) -> String {
+        if self.name.is_empty() {
+            self.signature.clone()
+        } else {
+            format!(
+                "{}({})",
+                quote_ident(&self.name),
+                self.identity_arguments
+            )
+        }
+    }
+}
+
+/// Trigger firing mode. CockroachDB exposes the `Origin`/`Disabled` subset;
+/// PostgreSQL additionally supports replica-only and always-fire modes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerMode {
+    #[default]
+    Origin,
+    Disabled,
+    Replica,
+    Always,
+}
+
+impl TriggerMode {
+    pub fn from_postgres(value: &str) -> Option<Self> {
+        match value {
+            "O" => Some(Self::Origin),
+            "D" => Some(Self::Disabled),
+            "R" => Some(Self::Replica),
+            "A" => Some(Self::Always),
+            _ => None,
+        }
+    }
+
+    pub fn alter_sql(self) -> &'static str {
+        match self {
+            Self::Origin => "ENABLE TRIGGER",
+            Self::Disabled => "DISABLE TRIGGER",
+            Self::Replica => "ENABLE REPLICA TRIGGER",
+            Self::Always => "ENABLE ALWAYS TRIGGER",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trigger {
     pub table: QName,
     pub name: String,
+    /// Old catalog JSON predates trigger-state introspection and defaults to
+    /// the normal enabled/origin mode.
+    #[serde(default)]
+    pub mode: TriggerMode,
     /// Full `pg_get_triggerdef(oid)` text (a complete CREATE TRIGGER statement).
     pub def: String,
 }
@@ -272,6 +396,10 @@ pub struct Catalog {
     /// `server_version_num` at introspection time; 0 for synthetic catalogs.
     #[serde(default)]
     pub server_version_num: i32,
+    /// Server family at introspection time.  Old catalog dumps predate this
+    /// field and intentionally deserialize as PostgreSQL for compatibility.
+    #[serde(default)]
+    pub database_flavor: DatabaseFlavor,
     /// The schemas this snapshot covers (diff scope).
     pub schemas: BTreeSet<String>,
     pub extensions: BTreeSet<String>,
@@ -327,6 +455,37 @@ mod tests {
     }
 
     #[test]
+    fn legacy_routine_json_defaults_to_function() {
+        let routine: Function = serde_json::from_str(
+            r#"{"signature":"f(integer)","def":"CREATE FUNCTION f(integer) RETURNS integer LANGUAGE SQL AS 'SELECT 1'"}"#,
+        )
+        .unwrap();
+        assert_eq!(routine.kind, RoutineKind::Function);
+        assert_eq!(routine.drop_signature_sql(), "f(integer)");
+    }
+
+    #[test]
+    fn routine_drop_signature_quotes_hostile_name() {
+        let routine = Function {
+            signature: "do work(integer)".into(),
+            name: "do work".into(),
+            identity_arguments: "integer".into(),
+            kind: RoutineKind::Procedure,
+            def: String::new(),
+        };
+        assert_eq!(routine.drop_signature_sql(), "\"do work\"(integer)");
+    }
+
+    #[test]
+    fn legacy_trigger_json_defaults_to_enabled_origin_mode() {
+        let trigger: Trigger = serde_json::from_str(
+            r#"{"table":"\"public\".\"t\"","name":"trg","def":"CREATE TRIGGER trg BEFORE INSERT ON public.t EXECUTE FUNCTION public.f()"}"#,
+        )
+        .unwrap();
+        assert_eq!(trigger.mode, TriggerMode::Origin);
+    }
+
+    #[test]
     fn serial_columns_ignore_default_text() {
         let a = Column {
             name: "id".into(),
@@ -337,6 +496,7 @@ mod tests {
             generated: None,
             is_serial: true,
             collation: None,
+            hidden: false,
         };
         let mut b = a.clone();
         b.default = Some("nextval('public.renamed_seq'::regclass)".into());
@@ -352,6 +512,22 @@ mod tests {
         let json = serde_json::to_string(&cat).unwrap();
         let back: Catalog = serde_json::from_str(&json).unwrap();
         assert_eq!(cat, back);
+    }
+
+    #[test]
+    fn legacy_column_json_defaults_to_visible() {
+        let json = serde_json::json!({
+            "name": "id",
+            "type_sql": "bigint",
+            "not_null": true,
+            "default": null,
+            "identity": null,
+            "generated": null,
+            "is_serial": false,
+            "collation": null
+        });
+        let column: Column = serde_json::from_value(json).unwrap();
+        assert!(!column.hidden);
     }
 
     #[test]

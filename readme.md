@@ -1,6 +1,6 @@
 # declarative-postgres-migrate (`dpm`)
 
-Declarative, **ORM-agnostic** Postgres schema migration, in Rust — a library with a CLI on top.
+Declarative, **ORM-agnostic** PostgreSQL and CockroachDB schema migration, in Rust — a library with a CLI on top.
 
 ## Install
 
@@ -25,7 +25,26 @@ The core idea: **the Postgres system catalogs are the neutral interchange format
 dpm diff --source postgres://…/desired --target postgres://…/live
 ```
 
-Because both sides are deparsed *by the server itself* (`pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_viewdef`, `pg_get_functiondef`, `format_type`, all with `search_path = ''`), comparison is exact string equality — no regex normalization of hand-written SQL against Postgres' re-serialized forms (the failure mode that makes schema-file-vs-catalog differs so hairy).
+Because both sides are deparsed *by the server itself* (`pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_viewdef`, `pg_get_functiondef`, CockroachDB's `SHOW CREATE`, and `format_type`, all with `search_path = ''`), comparison is exact string equality — no regex normalization of hand-written SQL against a server's re-serialized forms (the failure mode that makes schema-file-vs-catalog diffs so hairy).
+
+## PostgreSQL and CockroachDB
+
+Both engines are first-class `dpm` targets and use the same `postgres://` / `postgresql://` URL forms. DPM identifies the server from its version banner, stores that dialect in catalog dumps, marks generated SQL with the selected dialect, and refuses a PostgreSQL↔CockroachDB diff rather than emitting misleading SQL.
+
+CockroachDB coverage is exercised against a real server and includes schemas, enums, standalone sequences, tables and columns (including identity, computed, and `VISIBLE` / `NOT VISIBLE` columns), defaults, primary/unique/check/foreign-key constraints, advanced indexes (covering, partial, expression, unique, and inverted/GIN), row-level security policies, views, SQL/PLpgSQL functions, stored procedures, and row-level triggers. Implicit hidden `rowid` primary keys remain hidden when bootstrapped. DPM uses CockroachDB's `SHOW CREATE` surface for procedures and triggers where v25.2's PostgreSQL compatibility catalog has no equivalent deparser. Function changes automatically cycle triggers before replacement because CockroachDB does not permit replacing a trigger function while a trigger depends on it. Cockroach's deparsers include the current database in definitions; DPM removes only that catalog-specific qualifier outside quoted string literals so independently-created source and target databases compare and replay correctly.
+
+CockroachDB's own trigger feature set is narrower than PostgreSQL's: v25.2 supports enabled row-level `BEFORE`/`AFTER` triggers but not trigger enable/disable state, statement-level, `INSTEAD OF`, `TRUNCATE`, `REFERENCING`, or `UPDATE OF column` triggers. DPM manages the trigger DDL each engine accepts; it does not translate an unsupported PostgreSQL trigger into a different CockroachDB behavior.
+
+```sh
+# Requires Docker; starts a disposable CockroachDB v25.2.4 single-node server.
+scripts/test-cockroach.sh
+
+# Or point the integration suite at a CockroachDB admin database directly.
+DPM_TEST_COCKROACH_DATABASE_URL='postgresql://root@localhost:26257/defaultdb?sslmode=disable' \
+  cargo test --test cockroach
+```
+
+The optional external cross-checkers are PostgreSQL tools. For CockroachDB, `dpm apply` still runs its built-in post-apply re-diff and `dpm verify` still performs its shadow-replay convergence proof, but rejects a request for those PostgreSQL-only external checks.
 
 ## The three source/target kinds — every combination works
 
@@ -129,7 +148,7 @@ Built-in templates: `claude -p < {file}`, `codex exec - < {file}`, `gemini < {fi
 ## Safety model (house rules)
 
 - **Reviewable SQL only.** `dpm diff` prints SQL; it never executes. `dpm apply` requires an interactive `yes` or an explicit `--yes`.
-- **Destructive changes need two separate consents.** Drops of tables, columns, enums, sequences, functions, standalone views/triggers/policies, and integrity-weakening drops (PK/unique/exclusion constraints, unique indexes) are:
+- **Destructive changes need two separate consents.** Drops of tables, columns, enums, sequences, functions/procedures, standalone views/triggers/policies, and integrity-weakening drops (PK/unique/exclusion constraints, unique indexes) are:
   1. emitted **commented out** unless `--allow-destructive-sql` (`DPM_ALLOW_DESTRUCTIVE_SQL`) — the consent to *generate* destructive SQL;
   2. refused at execution time by `dpm apply` unless `--allow-destructive-ops` (`DPM_ALLOW_DESTRUCTIVE_OPS`) — the consent to *run* it. A script containing live destructive statements without ops-consent aborts before any statement executes.
   `--allow-destructive` remains as legacy shorthand for both. Replacement drops (drop + recreate in the same script) are not considered destructive.
@@ -140,7 +159,7 @@ Built-in templates: `claude -p < {file}`, `codex exec - < {file}`, `gemini < {fi
 
 ## What's covered
 
-Schemas, extensions (as units — extension-owned objects are excluded via `pg_depend`), enums (create/append/positioned insert via `ADD VALUE BEFORE`), tables (incl. partitioned parents), columns (types, defaults, `NOT NULL`, collations, `serial`/`bigserial` detection, `GENERATED … AS IDENTITY` both kinds, `GENERATED … STORED`), PK/unique/check/FK/exclusion constraints, free-standing indexes (partial, expression, `DESC`, any access method — full `pg_get_indexdef` fidelity), standalone sequences, views, materialized views, functions & procedures, triggers, **row-level security + policies** (Supabase-critical).
+Schemas, extensions (as units — extension-owned objects are excluded via `pg_depend`), enums (create/append/positioned insert via `ADD VALUE BEFORE`), tables (incl. partitioned parents), columns (types, defaults, `NOT NULL`, collations, `serial`/`bigserial` detection, `GENERATED … AS IDENTITY` both kinds, `GENERATED … STORED`), PK/unique/check/FK/exclusion constraints, free-standing indexes (covering, partial, expression, descending, unique, GIN/inverted, and other server-supported access methods), standalone sequences, views, materialized views, SQL/PLpgSQL functions and stored procedures (including overloads), triggers (including PostgreSQL enabled/disabled and `REPLICA`/`ALWAYS` modes), **row-level security + policies** (Supabase-critical).
 
 Known limitations (deliberate v1 scope): no `COMMENT ON`, no grants/ownership/roles (policies reference roles by name; the role must exist), no domains, no partition child management, no aggregate/window functions, identity sequence options aren't diffed, column *order* isn't enforced, cross-view dependency ordering is name-order (a changed view stack with inter-dependencies may need manual ordering), and type changes that require an FK drop/re-add on *other* tables aren't cascaded automatically. **Data migrations are out of scope for now** — the JSON plan format is the seam where a data-migration phase will slot in later.
 
