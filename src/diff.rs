@@ -42,6 +42,9 @@ pub enum Change {
     AlterColumnType { table: QName, column: String, from: String, to: String, collation: Option<String> },
     SetNotNull { table: QName, column: String },
     DropNotNull { table: QName, column: String },
+    /// CockroachDB `VISIBLE` / `NOT VISIBLE`; PostgreSQL columns are always
+    /// represented as visible.
+    SetColumnVisibility { table: QName, column: String, hidden: bool },
     SetDefault { table: QName, column: String, expr: String },
     DropDefault { table: QName, column: String },
     /// Convert a plain column into a serial-style column: create the owned
@@ -73,12 +76,20 @@ pub enum Change {
     CreateView { view: QName, materialized: bool, def: String },
     DropView { view: QName, materialized: bool, replaced: bool },
 
-    /// `def` is a complete CREATE OR REPLACE FUNCTION/PROCEDURE statement.
-    CreateFunction { key: String, def: String, replacing: bool },
-    DropFunction { key: String, schema: String, signature: String },
+    /// `def` is a complete CREATE FUNCTION/PROCEDURE statement. The emitter
+    /// adds `OR REPLACE` when the server's deparser omits it.
+    CreateFunction { key: String, kind: RoutineKind, def: String, replacing: bool },
+    DropFunction {
+        key: String,
+        schema: String,
+        signature: String,
+        kind: RoutineKind,
+        replaced: bool,
+    },
 
     CreateTrigger { key: String, table: QName, def: String },
     DropTrigger { table: QName, name: String, replaced: bool },
+    SetTriggerMode { table: QName, name: String, mode: TriggerMode },
 }
 
 impl Change {
@@ -96,8 +107,8 @@ impl Change {
             | Change::DropTable { .. }
             | Change::DropColumn { .. }
             | Change::DropSerial { .. }
-            | Change::RegenerateColumn { .. }
-            | Change::DropFunction { .. } => true,
+            | Change::RegenerateColumn { .. } => true,
+            Change::DropFunction { replaced, .. } => !replaced,
             Change::DropConstraint { kind, replaced, .. } => !replaced && kind.drop_is_destructive(),
             Change::DropIndex { unique, replaced, .. } => !replaced && *unique,
             Change::DropView { replaced, .. } => !replaced,
@@ -140,7 +151,17 @@ pub fn diff(source: &Catalog, target: &Catalog) -> Plan {
     diff_tables(source, target, &mut plan);
     diff_views(source, target, &mut plan);
     diff_functions(source, target, &mut plan);
-    diff_triggers(source, target, &mut plan);
+    // CockroachDB cannot CREATE OR REPLACE a trigger function while a trigger
+    // still depends on it. Conservatively cycle triggers around any changed
+    // function; PostgreSQL can replace in place and does not need this.
+    let cycle_cockroach_triggers = source.database_flavor == DatabaseFlavor::Cockroach
+        && source.functions.iter().any(|(key, source_fn)| {
+            source_fn.kind == RoutineKind::Function
+                && target.functions.get(key).is_some_and(|target_fn| {
+                    target_fn.kind == RoutineKind::Function && target_fn.def != source_fn.def
+                })
+        });
+    diff_triggers(source, target, &mut plan, cycle_cockroach_triggers);
 
     plan
 }
@@ -460,6 +481,14 @@ fn diff_one_column(q: &QName, s: &Column, t: &Column, plan: &mut Plan) {
         (true, false) => plan.changes.push(Change::DropNotNull { table: q.clone(), column: col }),
         _ => {}
     }
+
+    if s.hidden != t.hidden {
+        plan.changes.push(Change::SetColumnVisibility {
+            table: q.clone(),
+            column: s.name.clone(),
+            hidden: s.hidden,
+        });
+    }
 }
 
 fn diff_views(source: &Catalog, target: &Catalog, plan: &mut Plan) {
@@ -501,15 +530,33 @@ fn diff_functions(source: &Catalog, target: &Catalog, plan: &mut Plan) {
         match target.functions.get(key) {
             None => plan.changes.push(Change::CreateFunction {
                 key: key.clone(),
+                kind: s_fn.kind,
                 def: s_fn.def.clone(),
                 replacing: false,
             }),
-            Some(t_fn) if t_fn.def == s_fn.def => {}
-            Some(_) => plan.changes.push(Change::CreateFunction {
+            Some(t_fn) if t_fn.kind == s_fn.kind && t_fn.def == s_fn.def => {}
+            Some(t_fn) if t_fn.kind == s_fn.kind => plan.changes.push(Change::CreateFunction {
                 key: key.clone(),
+                kind: s_fn.kind,
                 def: s_fn.def.clone(),
                 replacing: true,
             }),
+            Some(t_fn) => {
+                let schema = key.split('.').next().unwrap_or("public").to_string();
+                plan.changes.push(Change::DropFunction {
+                    key: key.clone(),
+                    schema,
+                    signature: t_fn.drop_signature_sql(),
+                    kind: t_fn.kind,
+                    replaced: true,
+                });
+                plan.changes.push(Change::CreateFunction {
+                    key: key.clone(),
+                    kind: s_fn.kind,
+                    def: s_fn.def.clone(),
+                    replacing: false,
+                });
+            }
         }
     }
     for (key, t_fn) in &target.functions {
@@ -518,21 +565,40 @@ fn diff_functions(source: &Catalog, target: &Catalog, plan: &mut Plan) {
             plan.changes.push(Change::DropFunction {
                 key: key.clone(),
                 schema,
-                signature: t_fn.signature.clone(),
+                signature: t_fn.drop_signature_sql(),
+                kind: t_fn.kind,
+                replaced: false,
             });
         }
     }
 }
 
-fn diff_triggers(source: &Catalog, target: &Catalog, plan: &mut Plan) {
+fn diff_triggers(source: &Catalog, target: &Catalog, plan: &mut Plan, force_replace: bool) {
     for (key, s_trg) in &source.triggers {
         match target.triggers.get(key) {
-            None => plan.changes.push(Change::CreateTrigger {
-                key: key.clone(),
-                table: s_trg.table.clone(),
-                def: s_trg.def.clone(),
-            }),
-            Some(t_trg) if t_trg.def == s_trg.def => {}
+            None => {
+                plan.changes.push(Change::CreateTrigger {
+                    key: key.clone(),
+                    table: s_trg.table.clone(),
+                    def: s_trg.def.clone(),
+                });
+                if s_trg.mode != TriggerMode::Origin {
+                    plan.changes.push(Change::SetTriggerMode {
+                        table: s_trg.table.clone(),
+                        name: s_trg.name.clone(),
+                        mode: s_trg.mode,
+                    });
+                }
+            }
+            Some(t_trg) if t_trg.def == s_trg.def && !force_replace => {
+                if t_trg.mode != s_trg.mode {
+                    plan.changes.push(Change::SetTriggerMode {
+                        table: s_trg.table.clone(),
+                        name: s_trg.name.clone(),
+                        mode: s_trg.mode,
+                    });
+                }
+            }
             Some(t_trg) => {
                 plan.changes.push(Change::DropTrigger {
                     table: t_trg.table.clone(),
@@ -544,6 +610,13 @@ fn diff_triggers(source: &Catalog, target: &Catalog, plan: &mut Plan) {
                     table: s_trg.table.clone(),
                     def: s_trg.def.clone(),
                 });
+                if s_trg.mode != TriggerMode::Origin {
+                    plan.changes.push(Change::SetTriggerMode {
+                        table: s_trg.table.clone(),
+                        name: s_trg.name.clone(),
+                        mode: s_trg.mode,
+                    });
+                }
             }
         }
     }
@@ -572,6 +645,7 @@ mod tests {
             generated: None,
             is_serial: false,
             collation: None,
+            hidden: false,
         }
     }
 
@@ -708,6 +782,7 @@ mod transition_tests {
             generated: None,
             is_serial: false,
             collation: None,
+            hidden: false,
         }
     }
 
@@ -792,8 +867,8 @@ mod transition_tests {
         let q = QName::new("public", "v");
         s.views.insert(q.clone(), View { materialized: false, def: "SELECT 1".into() });
         t.views.insert(q.clone(), View { materialized: false, def: "SELECT 2".into() });
-        s.triggers.insert("public.t.trg".into(), Trigger { table: QName::new("public", "t"), name: "trg".into(), def: "A".into() });
-        t.triggers.insert("public.t.trg".into(), Trigger { table: QName::new("public", "t"), name: "trg".into(), def: "B".into() });
+        s.triggers.insert("public.t.trg".into(), Trigger { table: QName::new("public", "t"), name: "trg".into(), mode: TriggerMode::Origin, def: "A".into() });
+        t.triggers.insert("public.t.trg".into(), Trigger { table: QName::new("public", "t"), name: "trg".into(), mode: TriggerMode::Origin, def: "B".into() });
         let plan = diff(&s, &t);
         assert_eq!(plan.changes.len(), 4);
         assert_eq!(plan.destructive_count(), 0, "replace pairs are not destructive");

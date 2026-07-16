@@ -22,7 +22,7 @@ use dpm::diff::{diff, Plan};
 use dpm::emit::{emit, EmitOptions, Script};
 use dpm::flagenv::{self, Resolved};
 use dpm::introspect::IntrospectOptions;
-use dpm::model::Catalog;
+use dpm::model::{Catalog, DatabaseFlavor};
 use dpm::source::{resolve, ResolveContext, SideSpec};
 use dpm::verify::{verify, VerifyParams};
 
@@ -86,14 +86,14 @@ fn run() -> Result<i32> {
     };
 
     let config = flagenv::load_config()?;
+    if command == "version" || rest.iter().any(|a| a == "--version") {
+        println!("dpm {}", env!("CARGO_PKG_VERSION"));
+        return Ok(0);
+    }
     if command == "help" || rest.iter().any(|a| a == "--help" || a == "-h") {
         print!("{USAGE}");
         println!("FLAGS (flags-2-env contract; flag > env > default)");
         print!("{}", flagenv::help_table(&config));
-        return Ok(0);
-    }
-    if command == "version" || rest.iter().any(|a| a == "--version") {
-        println!("dpm {}", env!("CARGO_PKG_VERSION"));
         return Ok(0);
     }
 
@@ -245,6 +245,19 @@ async fn load_sides(r: &Resolved, bootstrap: bool) -> Result<DiffInputs> {
         let cat = resolve(&target, &ctx).await.context("loading target")?;
         (cat, target.describe())
     };
+    // Catalog syntax is only comparable within one server family.  A JSON
+    // dump records the family too, so this also prevents a stale PostgreSQL
+    // snapshot from being applied to CockroachDB (or the reverse).
+    if source_cat.server_version_num != 0
+        && target_cat.server_version_num != 0
+        && source_cat.database_flavor != target_cat.database_flavor
+    {
+        bail!(
+            "source is {} but target is {}; dpm does not generate cross-dialect migrations",
+            source_cat.database_flavor.label(),
+            target_cat.database_flavor.label()
+        );
+    }
     Ok(DiffInputs { source_cat, target_cat, source_desc: source.describe(), target_desc })
 }
 
@@ -255,6 +268,7 @@ fn render(r: &Resolved, inputs: &DiffInputs, allow_destructive_sql: bool) -> (Pl
         &plan,
         &EmitOptions {
             allow_destructive: allow_destructive_sql,
+            database_flavor: inputs.source_cat.database_flavor,
             source_desc: Some(inputs.source_desc.clone()),
             target_desc: Some(inputs.target_desc.clone()),
         },
@@ -370,6 +384,11 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
     };
     let inputs = load_sides(r, false).await?;
     let policy = destructive_policy(r);
+    if inputs.source_cat.database_flavor == DatabaseFlavor::Cockroach && check_selection(r).any() {
+        bail!(
+            "the bundled cross-checkers are PostgreSQL-only; CockroachDB apply still performs dpm's post-apply convergence check"
+        );
+    }
     let (plan, script, text) = render(r, &inputs, policy.sql);
 
     if plan.is_empty() {
@@ -521,7 +540,9 @@ async fn cmd_dump(r: &Resolved) -> Result<i32> {
         bail!("dump needs a live database URL");
     };
     let opts = introspect_options(r);
-    let cat = dpm::introspect::introspect_url(&url, &opts).await?;
+    let cat = dpm::introspect::introspect_url(&url, &opts)
+        .await
+        .context("introspecting database for dump")?;
     eprintln!(
         "dpm: dumped {} object(s) across schemas: {}",
         cat.object_count(),
@@ -595,6 +616,14 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
     let inputs = load_sides(r, false).await?;
     let opts = introspect_options(r);
     let policy = destructive_policy(r);
+    let checks = check_selection(r);
+    if inputs.source_cat.database_flavor == DatabaseFlavor::Cockroach
+        && (checks.any() || r.get("DPM_EXTERNAL_CHECK").is_some())
+    {
+        bail!(
+            "external cross-checkers are PostgreSQL-only; CockroachDB verify uses dpm's shadow-replay convergence proof"
+        );
+    }
     let source_url = match source_spec(r)? {
         SideSpec::Url(u) => Some(u),
         _ => None,
@@ -608,7 +637,7 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
         source_url_for_external: source_url.as_deref(),
         allow_destructive: policy.sql,
         external_check: external.as_deref(),
-        checks: check_selection(r),
+        checks,
         bins: check_bins(r),
         keep_shadow: r.get_bool("DPM_KEEP_SHADOW"),
         verbose: r.get_bool("DPM_VERBOSE"),
@@ -649,6 +678,7 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
             &plan,
             &EmitOptions {
                 allow_destructive: policy.sql,
+                database_flavor: inputs.source_cat.database_flavor,
                 source_desc: Some(inputs.source_desc.clone()),
                 target_desc: Some(inputs.target_desc.clone()),
             },

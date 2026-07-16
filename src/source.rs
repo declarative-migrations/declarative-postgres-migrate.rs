@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use sqlx::Connection;
 
 use crate::introspect::{self, IntrospectOptions};
-use crate::model::Catalog;
+use crate::model::{Catalog, DatabaseFlavor};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SideSpec {
@@ -98,6 +98,7 @@ pub struct ShadowDb {
     pub url: String,
     admin_url: String,
     pub db_name: String,
+    database_flavor: DatabaseFlavor,
     verbose: bool,
 }
 
@@ -115,6 +116,7 @@ impl ShadowDb {
                     introspect::redact_url(shadow_server_url)
                 )
             })?;
+        let database_flavor = introspect::detect_database_flavor(&mut admin).await?;
         sqlx::raw_sql(&format!("CREATE DATABASE {}", crate::model::quote_ident(&db_name)))
             .execute(&mut admin)
             .await
@@ -124,7 +126,7 @@ impl ShadowDb {
         if verbose {
             eprintln!("dpm: created shadow database {db_name}");
         }
-        Ok(Self { url, admin_url: shadow_server_url.to_string(), db_name, verbose })
+        Ok(Self { url, admin_url: shadow_server_url.to_string(), db_name, database_flavor, verbose })
     }
 
     /// Apply schema SQL to the shadow database. Tolerates `pg_dump
@@ -155,20 +157,34 @@ impl ShadowDb {
 
     pub async fn drop_db(self) {
         if let Ok(mut admin) = sqlx::postgres::PgConnection::connect(&self.admin_url).await {
-            let stmt = format!(
-                "DROP DATABASE IF EXISTS {} WITH (FORCE)",
-                crate::model::quote_ident(&self.db_name)
-            );
-            if sqlx::raw_sql(&stmt).execute(&mut admin).await.is_err() {
-                // FORCE needs PG 13+; retry plain.
-                let stmt = format!("DROP DATABASE IF EXISTS {}", crate::model::quote_ident(&self.db_name));
+            if self.database_flavor == DatabaseFlavor::Cockroach {
+                // CockroachDB databases are non-empty after materialization;
+                // CASCADE is its supported cleanup syntax.
+                let stmt = format!(
+                    "DROP DATABASE IF EXISTS {} CASCADE",
+                    crate::model::quote_ident(&self.db_name)
+                );
                 let _ = sqlx::raw_sql(&stmt).execute(&mut admin).await;
+            } else {
+                let stmt = format!(
+                    "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+                    crate::model::quote_ident(&self.db_name)
+                );
+                if sqlx::raw_sql(&stmt).execute(&mut admin).await.is_err() {
+                    // FORCE needs PG 13+; retry plain.
+                    let stmt = format!("DROP DATABASE IF EXISTS {}", crate::model::quote_ident(&self.db_name));
+                    let _ = sqlx::raw_sql(&stmt).execute(&mut admin).await;
+                }
             }
             if self.verbose {
                 eprintln!("dpm: dropped shadow database {}", self.db_name);
             }
             let _ = admin.close().await;
         }
+    }
+
+    pub fn database_flavor(&self) -> DatabaseFlavor {
+        self.database_flavor
     }
 
     pub fn into_kept(self) {}

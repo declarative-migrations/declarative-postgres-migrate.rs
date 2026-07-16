@@ -1,8 +1,8 @@
 //! # declarative-postgres-migrate (dpm)
 //!
-//! ORM-agnostic, declarative Postgres schema migration. The core idea: the
-//! Postgres system catalogs are the neutral interchange format — it doesn't
-//! matter whether a schema was authored by Prisma, Drizzle, SeaORM, ent,
+//! ORM-agnostic, declarative PostgreSQL and CockroachDB schema migration. The
+//! core idea: each server's compatible catalog is the neutral interchange
+//! format — it doesn't matter whether a schema was authored by Prisma, Drizzle, SeaORM, ent,
 //! peewee, or raw SQL. dpm introspects two states (live database, saved
 //! catalog dump, or a `.sql` file materialized via a shadow database),
 //! diffs the catalogs, and emits ordered, reviewable SQL that converges the
@@ -36,4 +36,4 @@ pub mod verify;
 pub use diff::{diff, Change, Plan};
 pub use emit::{emit, EmitOptions, Script};
 pub use introspect::{introspect_url, IntrospectOptions};
-pub use model::Catalog;
+pub use model::{Catalog, DatabaseFlavor, RoutineKind, TriggerMode};

@@ -3,11 +3,25 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
   schedule:
     - cron: "0 6 * * 1" # weekly full cross-checker matrix
 
 jobs:
   test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: unit tests
+        run: cargo test --lib
+      - name: splitter property tests
+        run: cargo test --test fuzz_splitter
+
+  postgres:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -24,12 +38,62 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: unit + integration tests
+      - name: PostgreSQL convergence tests
         env:
           DPM_TEST_DATABASE_URL: postgres://postgres@localhost:5432/postgres
-        run: cargo test -- --test-threads=4
+        run: cargo test --test convergence -- --test-threads=4
+
+  cli:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: CLI contracts and PostgreSQL lifecycle
+        env:
+          DPM_TEST_DATABASE_URL: postgres://postgres@localhost:5432/postgres
+        run: cargo test --test cli -- --test-threads=1
+
+  cockroach:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start CockroachDB v25.2.4
+        run: >-
+          docker run --detach --name dpm-cockroach
+          --publish 26257:26257 --publish 8080:8080
+          cockroachdb/cockroach:v25.2.4 start-single-node --insecure
+      - name: Wait for CockroachDB
+        run: |
+          for attempt in {1..60}; do
+            if docker exec dpm-cockroach cockroach sql \
+              --insecure --host=localhost:26257 --execute='SELECT 1' >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs dpm-cockroach
+          exit 1
+      - name: CockroachDB convergence and CLI tests
+        env:
+          DPM_TEST_COCKROACH_DATABASE_URL: postgresql://root@localhost:26257/defaultdb?sslmode=disable
+        run: cargo test --test cockroach -- --test-threads=1
+      - name: CockroachDB logs on failure
+        if: failure()
+        run: docker logs dpm-cockroach
 
   crosscheck-matrix:
     # The full 7-tool countersigning matrix: every fixture verified by
