@@ -32,7 +32,9 @@ use anyhow::{Context, Result};
 use sqlx::Connection;
 
 use crate::introspect;
-use crate::model::{quote_ident, quote_literal, Catalog, ConstraintKind, DatabaseFlavor, QName, Table};
+use crate::model::{
+    quote_ident, quote_literal, Catalog, ConstraintKind, DatabaseFlavor, QName, Table,
+};
 use crate::source::ShadowDb;
 
 /// Rewrite every CHECK-constraint def and index def in `catalogs` to its
@@ -48,7 +50,9 @@ pub async fn canonicalize_defs(
     let has_work = catalogs.iter().any(|c| {
         c.tables.values().any(|t| {
             !t.indexes.is_empty()
-                || t.constraints.values().any(|k| k.kind == ConstraintKind::Check)
+                || t.constraints
+                    .values()
+                    .any(|k| k.kind == ConstraintKind::Check)
         })
     });
     if !has_work {
@@ -56,7 +60,10 @@ pub async fn canonicalize_defs(
     }
     // CockroachDB catalogs deparse through SHOW CREATE and have their own
     // normalization rules; scratch-table DDL below is PostgreSQL-shaped.
-    if catalogs.iter().any(|c| c.database_flavor != DatabaseFlavor::Postgres) {
+    if catalogs
+        .iter()
+        .any(|c| c.database_flavor != DatabaseFlavor::Postgres)
+    {
         return Ok(());
     }
 
@@ -89,18 +96,27 @@ async fn canonicalize_on(
     // any def they break simply stays un-canonicalized.
     for catalog in catalogs.iter() {
         for schema in &catalog.schemas {
-            let _ = sqlx::raw_sql(&format!("CREATE SCHEMA IF NOT EXISTS {}", quote_ident(schema)))
-                .execute(&mut conn)
-                .await;
+            let _ = sqlx::raw_sql(&format!(
+                "CREATE SCHEMA IF NOT EXISTS {}",
+                quote_ident(schema)
+            ))
+            .execute(&mut conn)
+            .await;
         }
         for ext in &catalog.extensions {
-            let _ = sqlx::raw_sql(&format!("CREATE EXTENSION IF NOT EXISTS {}", quote_ident(ext)))
-                .execute(&mut conn)
-                .await;
+            let _ = sqlx::raw_sql(&format!(
+                "CREATE EXTENSION IF NOT EXISTS {}",
+                quote_ident(ext)
+            ))
+            .execute(&mut conn)
+            .await;
         }
         for (qname, labels) in &catalog.enums {
-            let labels_sql =
-                labels.iter().map(|l| quote_literal(l)).collect::<Vec<_>>().join(", ");
+            let labels_sql = labels
+                .iter()
+                .map(|l| quote_literal(l))
+                .collect::<Vec<_>>()
+                .join(", ");
             let _ = sqlx::raw_sql(&format!(
                 "CREATE TYPE {}.{} AS ENUM ({labels_sql})",
                 quote_ident(&qname.schema),
@@ -203,7 +219,11 @@ async fn canonicalize_on(
 }
 
 fn qualified(qname: &QName) -> String {
-    format!("{}.{}", quote_ident(&qname.schema), quote_ident(&qname.name))
+    format!(
+        "{}.{}",
+        quote_ident(&qname.schema),
+        quote_ident(&qname.name)
+    )
 }
 
 /// Create an empty, constraint-free copy of the table under its real name
@@ -245,10 +265,12 @@ async fn round_trip_check(
     def: &str,
 ) -> Result<String> {
     let target = qualified(qname);
-    sqlx::raw_sql(&format!("ALTER TABLE {target} ADD CONSTRAINT _dpm_canon_check {def}"))
-        .execute(&mut *conn)
-        .await
-        .context("ADD CONSTRAINT failed")?;
+    sqlx::raw_sql(&format!(
+        "ALTER TABLE {target} ADD CONSTRAINT _dpm_canon_check {def}"
+    ))
+    .execute(&mut *conn)
+    .await
+    .context("ADD CONSTRAINT failed")?;
     let row: (String,) = sqlx::query_as(
         "SELECT pg_catalog.pg_get_constraintdef(oid) FROM pg_catalog.pg_constraint \
          WHERE conname = '_dpm_canon_check' AND conrelid = ($1::text)::regclass",
@@ -257,10 +279,12 @@ async fn round_trip_check(
     .fetch_one(&mut *conn)
     .await
     .context("reading back canonical constraint def")?;
-    sqlx::raw_sql(&format!("ALTER TABLE {target} DROP CONSTRAINT _dpm_canon_check"))
-        .execute(&mut *conn)
-        .await
-        .context("DROP CONSTRAINT failed")?;
+    sqlx::raw_sql(&format!(
+        "ALTER TABLE {target} DROP CONSTRAINT _dpm_canon_check"
+    ))
+    .execute(&mut *conn)
+    .await
+    .context("DROP CONSTRAINT failed")?;
     Ok(row.0)
 }
 
@@ -271,7 +295,10 @@ async fn round_trip_index(
     qname: &QName,
     def: &str,
 ) -> Result<String> {
-    sqlx::raw_sql(def).execute(&mut *conn).await.context("CREATE INDEX failed")?;
+    sqlx::raw_sql(def)
+        .execute(&mut *conn)
+        .await
+        .context("CREATE INDEX failed")?;
     let row: (String, String) = sqlx::query_as(
         "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname), \
                 pg_catalog.pg_get_indexdef(i.indexrelid) \
@@ -298,7 +325,12 @@ fn column_signature(table: &Table) -> String {
         .columns
         .iter()
         .map(|c| {
-            format!("{}\u{1}{}\u{1}{}", c.name, c.type_sql, c.collation.as_deref().unwrap_or(""))
+            format!(
+                "{}\u{1}{}\u{1}{}",
+                c.name,
+                c.type_sql,
+                c.collation.as_deref().unwrap_or("")
+            )
         })
         .collect();
     parts.sort();

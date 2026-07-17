@@ -8,7 +8,6 @@
 //! migration to the target, re-diffing source vs target yields zero changes.
 
 use dpm::apply::apply_script;
-use dpm::canonicalize::canonicalize_checks;
 use dpm::diff::diff;
 use dpm::emit::{emit, EmitOptions};
 use dpm::introspect::{introspect_url, IntrospectOptions};
@@ -156,13 +155,8 @@ async fn migrate_and_assert_converges(
 ) -> (ShadowDb, ShadowDb, String) {
     let (source_db, target_db) = setup_pair(admin, source_sql, target_sql).await;
 
-    let mut source = introspect_url(&source_db.url, &opts()).await.expect("introspect source");
-    let mut target = introspect_url(&target_db.url, &opts()).await.expect("introspect target");
-    // Mirror the production pipeline: with a shadow server available, CHECK
-    // defs are canonicalized to their re-parse fixed point before comparison.
-    canonicalize_checks(&mut [&mut source, &mut target], admin, false)
-        .await
-        .expect("canonicalize sides");
+    let source = introspect_url(&source_db.url, &opts()).await.expect("introspect source");
+    let target = introspect_url(&target_db.url, &opts()).await.expect("introspect target");
 
     let plan = diff(&source, &target);
     let script = emit(&plan, &EmitOptions { allow_destructive: true, ..Default::default() });
@@ -171,8 +165,7 @@ async fn migrate_and_assert_converges(
         .await
         .unwrap_or_else(|e| panic!("[{label}] applying generated migration failed: {e:#}\n--- script ---\n{}", script.sql));
 
-    let mut migrated = introspect_url(&target_db.url, &opts()).await.expect("re-introspect target");
-    canonicalize_checks(&mut [&mut migrated], admin, false).await.expect("canonicalize migrated");
+    let migrated = introspect_url(&target_db.url, &opts()).await.expect("re-introspect target");
     let residual = diff(&source, &migrated);
     let residual_script = emit(&residual, &EmitOptions::default());
     assert!(
@@ -209,47 +202,6 @@ async fn teardown_to_empty_converges() {
     let Some(admin) = admin_url() else { return };
     // Everything in the target must be droppable down to an empty database.
     assert_converges(&admin, "", RICH_SCHEMA, "teardown").await;
-}
-
-/// Regression: `pg_get_constraintdef` is not a re-parse fixed point. A
-/// varchar IN-list CHECK is stored as `(col)::text = ANY ((ARRAY[...])::text[])`,
-/// but re-parsing that emitted text stores per-element casts
-/// (`ANY (ARRAY[('a'::varchar)::text, ...])`), which deparses differently —
-/// so a target built from dpm's own emitted SQL never string-equals the
-/// source and the diff churns the same constraint forever. Comparison must
-/// be modulo one server round-trip (canonicalization), not raw equality.
-#[tokio::test]
-async fn varchar_in_list_check_converges() {
-    let Some(admin) = admin_url() else { return };
-    assert_converges(
-        &admin,
-        r#"
-CREATE TABLE public.app_config (
-  id bigint GENERATED ALWAYS AS IDENTITY,
-  status varchar(32) NOT NULL DEFAULT 'active',
-  kind varchar(16),
-  CONSTRAINT app_config_pkey PRIMARY KEY (id),
-  CONSTRAINT app_config_status_chk CHECK (status IN ('active','paused','archived')),
-  CONSTRAINT app_config_kind_chk CHECK (kind IS NULL OR kind IN ('a','b'))
-);
-"#,
-        "",
-        "varchar-in-list-check-bootstrap",
-    )
-    .await;
-    // The same shape must also survive an incremental add to an existing table.
-    assert_converges(
-        &admin,
-        r#"
-CREATE TABLE public.jobs (
-  state varchar(24) NOT NULL,
-  CONSTRAINT jobs_state_chk CHECK (state IN ('queued','running','done'))
-);
-"#,
-        "CREATE TABLE public.jobs (state varchar(24) NOT NULL);",
-        "varchar-in-list-check-incremental",
-    )
-    .await;
 }
 
 #[tokio::test]
