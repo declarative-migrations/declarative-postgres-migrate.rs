@@ -8,6 +8,7 @@
 //! migration to the target, re-diffing source vs target yields zero changes.
 
 use dpm::apply::apply_script;
+use dpm::canonicalize::canonicalize_checks;
 use dpm::diff::diff;
 use dpm::emit::{emit, EmitOptions};
 use dpm::introspect::{introspect_url, IntrospectOptions};
