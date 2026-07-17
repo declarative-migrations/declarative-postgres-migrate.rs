@@ -468,7 +468,16 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
 
     // Post-apply convergence check against the freshly migrated target.
     let opts = introspect_options(r);
-    let migrated = dpm::introspect::introspect_url(target_url, &opts).await?;
+    let mut migrated = dpm::introspect::introspect_url(target_url, &opts).await?;
+    if let Some(shadow) = r.get("SHADOW_DATABASE_URL") {
+        dpm::canonicalize::canonicalize_checks(
+            &mut [&mut migrated],
+            &shadow,
+            r.get_bool("DPM_VERBOSE"),
+        )
+        .await
+        .context("canonicalizing CHECK constraint definitions on the shadow server")?;
+    }
     let residual = diff(&inputs.source_cat, &migrated);
     let residual_real: Vec<_> = residual.changes.iter().filter(|c| !c.is_manual()).collect();
     if residual_real.is_empty() {
