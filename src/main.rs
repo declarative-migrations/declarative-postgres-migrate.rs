@@ -258,7 +258,21 @@ async fn load_sides(r: &Resolved, bootstrap: bool) -> Result<DiffInputs> {
             target_cat.database_flavor.label()
         );
     }
-    Ok(DiffInputs { source_cat, target_cat, source_desc: source.describe(), target_desc })
+    let mut inputs =
+        DiffInputs { source_cat, target_cat, source_desc: source.describe(), target_desc };
+    // With a shadow server available, normalize CHECK defs to their re-parse
+    // fixed point so string comparison is exact regardless of whether a side
+    // was built from original SQL or from dpm's own emitted deparse.
+    if let Some(shadow) = &ctx.shadow_url {
+        dpm::canonicalize::canonicalize_checks(
+            &mut [&mut inputs.source_cat, &mut inputs.target_cat],
+            shadow,
+            ctx.verbose,
+        )
+        .await
+        .context("canonicalizing CHECK constraint definitions on the shadow server")?;
+    }
+    Ok(inputs)
 }
 
 /// Migration script + optional FK-index advisory block.
