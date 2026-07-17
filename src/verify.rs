@@ -136,13 +136,22 @@ pub async fn materialize_catalog(
         db.drop_db().await;
         return Err(e).with_context(|| format!("bootstrapping the {label} replica on the shadow server failed"));
     }
-    let replica_cat = match introspect::introspect_url(&db.url, opts).await {
+    let mut replica_cat = match introspect::introspect_url(&db.url, opts).await {
         Ok(c) => c,
         Err(e) => {
             db.drop_db().await;
             return Err(e);
         }
     };
+    // The replica was built from dpm's own emitted deparse, so its CHECK and
+    // index defs are the re-parse fixed point; canonicalize before comparing
+    // against the (already canonicalized) catalog.
+    if let Err(e) =
+        crate::canonicalize::canonicalize_defs(&mut [&mut replica_cat], shadow_server_url, verbose).await
+    {
+        db.drop_db().await;
+        return Err(e);
+    }
     let drift = diff(cat, &replica_cat);
     if !drift.is_empty() {
         let drift_sql = emit(
