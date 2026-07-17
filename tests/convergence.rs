@@ -210,6 +210,50 @@ async fn teardown_to_empty_converges() {
     assert_converges(&admin, "", RICH_SCHEMA, "teardown").await;
 }
 
+/// Regression: `pg_get_constraintdef` / `pg_get_indexdef` are not re-parse
+/// fixed points. A varchar IN-list (in a CHECK or a partial-index WHERE) is
+/// stored as `(col)::text = ANY ((ARRAY[...])::text[])`, but re-parsing that
+/// emitted text stores per-element casts (`ANY (ARRAY[('a'::varchar)::text,
+/// ...])`), which deparses differently — so a target built from dpm's own
+/// emitted SQL never string-equals the source and the diff churns the same
+/// objects forever. Comparison must be modulo one server round-trip
+/// (canonicalization), not raw equality.
+#[tokio::test]
+async fn varchar_in_list_check_converges() {
+    let Some(admin) = admin_url() else { return };
+    assert_converges(
+        &admin,
+        r#"
+CREATE TABLE public.app_config (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  status varchar(32) NOT NULL DEFAULT 'active',
+  kind varchar(16),
+  CONSTRAINT app_config_pkey PRIMARY KEY (id),
+  CONSTRAINT app_config_status_chk CHECK (status IN ('active','paused','archived')),
+  CONSTRAINT app_config_kind_chk CHECK (kind IS NULL OR kind IN ('a','b'))
+);
+CREATE INDEX app_config_active_idx ON public.app_config (id) WHERE status IN ('active','paused');
+"#,
+        "",
+        "varchar-in-list-check-bootstrap",
+    )
+    .await;
+    // The same shape must also survive an incremental add to an existing table.
+    assert_converges(
+        &admin,
+        r#"
+CREATE TABLE public.jobs (
+  state varchar(24) NOT NULL,
+  CONSTRAINT jobs_state_chk CHECK (state IN ('queued','running','done'))
+);
+CREATE INDEX jobs_pending_idx ON public.jobs (state) WHERE state IN ('queued','running');
+"#,
+        "CREATE TABLE public.jobs (state varchar(24) NOT NULL);",
+        "varchar-in-list-check-incremental",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn identical_databases_produce_empty_plan() {
     let Some(admin) = admin_url() else { return };
