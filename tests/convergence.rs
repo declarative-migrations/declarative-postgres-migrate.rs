@@ -156,8 +156,13 @@ async fn migrate_and_assert_converges(
 ) -> (ShadowDb, ShadowDb, String) {
     let (source_db, target_db) = setup_pair(admin, source_sql, target_sql).await;
 
-    let source = introspect_url(&source_db.url, &opts()).await.expect("introspect source");
-    let target = introspect_url(&target_db.url, &opts()).await.expect("introspect target");
+    let mut source = introspect_url(&source_db.url, &opts()).await.expect("introspect source");
+    let mut target = introspect_url(&target_db.url, &opts()).await.expect("introspect target");
+    // Mirror the production pipeline: with a shadow server available, CHECK
+    // defs are canonicalized to their re-parse fixed point before comparison.
+    canonicalize_checks(&mut [&mut source, &mut target], admin, false)
+        .await
+        .expect("canonicalize sides");
 
     let plan = diff(&source, &target);
     let script = emit(&plan, &EmitOptions { allow_destructive: true, ..Default::default() });
@@ -166,7 +171,8 @@ async fn migrate_and_assert_converges(
         .await
         .unwrap_or_else(|e| panic!("[{label}] applying generated migration failed: {e:#}\n--- script ---\n{}", script.sql));
 
-    let migrated = introspect_url(&target_db.url, &opts()).await.expect("re-introspect target");
+    let mut migrated = introspect_url(&target_db.url, &opts()).await.expect("re-introspect target");
+    canonicalize_checks(&mut [&mut migrated], admin, false).await.expect("canonicalize migrated");
     let residual = diff(&source, &migrated);
     let residual_script = emit(&residual, &EmitOptions::default());
     assert!(
