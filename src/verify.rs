@@ -211,7 +211,8 @@ async fn run_on_replica(p: &VerifyParams<'_>, migration_sql: &str, replica: &Sha
         .context("applying the generated migration to the replica failed")?;
 
     // Re-diff.
-    let migrated = introspect::introspect_url(&replica.url, p.introspect).await?;
+    let mut migrated = introspect::introspect_url(&replica.url, p.introspect).await?;
+    crate::canonicalize::canonicalize_defs(&mut [&mut migrated], p.shadow_server_url, p.verbose).await?;
     let residual = diff(p.source, &migrated);
     let converged = residual.is_empty();
     let residual_sql = if converged {
