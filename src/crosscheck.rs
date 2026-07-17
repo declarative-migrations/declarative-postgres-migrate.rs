@@ -22,7 +22,7 @@
 //! fresh replica of the target.
 //!
 //! None of these are build dependencies — binaries are located on PATH (or
-//! via DPM_<TOOL>_BIN) at runtime, and `scripts/install-crosscheckers.sh`
+//! via `DPM_<TOOL>_BIN`) at runtime, and `scripts/install-crosscheckers.sh`
 //! installs all seven.
 
 use anyhow::{Context, Result};
@@ -417,7 +417,7 @@ pub fn run_pg_schema_diff(bin: &str, _pg_dump: &str, migrated_url: &str, source_
 // ---------------------------------------------------------------------------
 
 /// liquibase OSS `diff` compares two live databases over JDBC. Agreement =
-/// every "Missing/Unexpected/Changed <object>(s):" category reports NONE.
+/// every `Missing/Unexpected/Changed <object>(s):` category reports NONE.
 pub fn run_liquibase(bin: &str, migrated_url: &str, source_url: &str) -> CheckReport {
     let name = "liquibase";
     if !binary_exists(bin) {
@@ -824,5 +824,66 @@ Unexpected Column(s): \n     public.orders.legacy\nMissing Table(s): NONE
         // a spec of the format we expect and guard the key substrings.
         assert!(transcript.contains("Unexpected Column(s):"));
         assert!(!transcript.contains("Unexpected Column(s): NONE"));
+    }
+}
+
+#[cfg(test)]
+mod parser_tests {
+    use super::*;
+
+    #[test]
+    fn liquibase_all_none_and_catalog_noise_is_agreement() {
+        let out = "\
+Reference Database: a
+Comparison Database: b
+Product Version: EQUAL
+Changed Catalog(s):
+     db_one
+          name changed from 'db_one' to 'db_two'
+Missing Table(s): NONE
+Unexpected Table(s): NONE
+Changed Table(s): NONE
+";
+        assert!(liquibase_violations(out).is_empty());
+    }
+
+    #[test]
+    fn liquibase_order_only_column_changes_are_filtered() {
+        let out = "\
+Changed Column(s):
+     public.users.bio
+          order changed from '4' to '5'
+     public.users.created_at
+          order changed from '5' to '4'
+Missing Column(s): NONE
+";
+        assert!(liquibase_violations(out).is_empty());
+    }
+
+    #[test]
+    fn liquibase_real_changes_survive_filtering() {
+        let out = "\
+Changed Column(s):
+     public.users.bio
+          order changed from '4' to '5'
+     public.users.email
+          type changed from 'varchar(100)' to 'text'
+Missing Table(s):
+     public.orders
+Unexpected Index(s): NONE
+";
+        let v = liquibase_violations(out);
+        let text = v.join("\n");
+        assert!(text.contains("public.users.email"), "{text}");
+        assert!(text.contains("type changed"), "{text}");
+        assert!(text.contains("public.orders"), "{text}");
+        assert!(!text.contains("bio"), "order-only entry must be filtered: {text}");
+    }
+
+    #[test]
+    fn ensure_sslmode_respects_existing_choice_and_query() {
+        assert_eq!(ensure_sslmode("postgres://u@h/db"), "postgresql://u@h/db?sslmode=disable");
+        assert_eq!(ensure_sslmode("postgresql://u@h/db?x=1"), "postgresql://u@h/db?x=1&sslmode=disable");
+        assert_eq!(ensure_sslmode("postgresql://u@h/db?sslmode=require"), "postgresql://u@h/db?sslmode=require");
     }
 }

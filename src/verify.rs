@@ -62,15 +62,36 @@ pub struct VerifyParams<'a> {
 }
 
 pub async fn verify(p: VerifyParams<'_>) -> Result<VerifyOutcome> {
+    if p.source.database_flavor != p.target.database_flavor {
+        bail!(
+            "cannot verify a {} source against a {} target",
+            p.source.database_flavor.label(),
+            p.target.database_flavor.label()
+        );
+    }
     // The migration under test.
     let plan = diff(p.source, p.target);
     let script = emit(
         &plan,
-        &EmitOptions { allow_destructive: p.allow_destructive, source_desc: None, target_desc: None },
+        &EmitOptions {
+            allow_destructive: p.allow_destructive,
+            database_flavor: p.source.database_flavor,
+            source_desc: None,
+            target_desc: None,
+        },
     );
 
     // Replica of the target on the shadow server.
     let replica = ShadowDb::create(p.shadow_server_url, p.verbose).await?;
+    if replica.database_flavor() != p.source.database_flavor {
+        let actual = replica.database_flavor();
+        replica.drop_db().await;
+        bail!(
+            "cannot verify a {} migration on a {} shadow server",
+            p.source.database_flavor.label(),
+            actual.label()
+        );
+    }
     let outcome = run_on_replica(&p, &script.sql, &replica).await;
     if p.keep_shadow {
         eprintln!("dpm: keeping verify replica {}", introspect::redact_url(&replica.url));
@@ -91,10 +112,24 @@ pub async fn materialize_catalog(
     verbose: bool,
 ) -> Result<ShadowDb> {
     let db = ShadowDb::create(shadow_server_url, verbose).await?;
+    if db.database_flavor() != cat.database_flavor {
+        let actual = db.database_flavor();
+        db.drop_db().await;
+        bail!(
+            "cannot materialize a {} catalog on a {} shadow server",
+            cat.database_flavor.label(),
+            actual.label()
+        );
+    }
     let bootstrap_plan = diff(cat, &Catalog::default());
     let bootstrap = emit(
         &bootstrap_plan,
-        &EmitOptions { allow_destructive: true, source_desc: None, target_desc: None },
+        &EmitOptions {
+            allow_destructive: true,
+            database_flavor: cat.database_flavor,
+            source_desc: None,
+            target_desc: None,
+        },
     );
     let applied = crate::apply::apply_script(&db.url, &bootstrap.sql).await;
     if let Err(e) = applied {
@@ -110,7 +145,11 @@ pub async fn materialize_catalog(
     };
     let drift = diff(cat, &replica_cat);
     if !drift.is_empty() {
-        let drift_sql = emit(&drift, &EmitOptions::default()).sql;
+        let drift_sql = emit(
+            &drift,
+            &EmitOptions { database_flavor: cat.database_flavor, ..Default::default() },
+        )
+        .sql;
         db.drop_db().await;
         bail!(
             "shadow replica does not faithfully reproduce the {label} ({} residual changes). \
@@ -129,7 +168,12 @@ async fn run_on_replica(p: &VerifyParams<'_>, migration_sql: &str, replica: &Sha
         let bootstrap_plan = diff(p.target, &Catalog::default());
         let bootstrap = emit(
             &bootstrap_plan,
-            &EmitOptions { allow_destructive: true, source_desc: None, target_desc: None },
+            &EmitOptions {
+                allow_destructive: true,
+                database_flavor: p.target.database_flavor,
+                source_desc: None,
+                target_desc: None,
+            },
         );
         crate::apply::apply_script(&replica.url, &bootstrap.sql)
             .await
@@ -137,7 +181,11 @@ async fn run_on_replica(p: &VerifyParams<'_>, migration_sql: &str, replica: &Sha
         let replica_cat = introspect::introspect_url(&replica.url, p.introspect).await?;
         let drift = diff(p.target, &replica_cat);
         if !drift.is_empty() {
-            let drift_sql = emit(&drift, &EmitOptions::default()).sql;
+            let drift_sql = emit(
+                &drift,
+                &EmitOptions { database_flavor: p.target.database_flavor, ..Default::default() },
+            )
+            .sql;
             bail!(
                 "shadow replica does not faithfully reproduce the target ({} residual changes). \
                  This is a dpm coverage gap — the verify result would be meaningless.\n{}",
@@ -159,7 +207,13 @@ async fn run_on_replica(p: &VerifyParams<'_>, migration_sql: &str, replica: &Sha
     let residual_sql = if converged {
         None
     } else {
-        Some(emit(&residual, &EmitOptions::default()).sql)
+        Some(
+            emit(
+                &residual,
+                &EmitOptions { database_flavor: p.source.database_flavor, ..Default::default() },
+            )
+            .sql,
+        )
     };
 
     // External / cross-checks: need a live URL for the source side.

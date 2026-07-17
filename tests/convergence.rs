@@ -144,8 +144,15 @@ fn opts() -> IntrospectOptions {
     IntrospectOptions::default()
 }
 
-/// Core invariant: migrate target → re-diff → empty plan.
-async fn assert_converges(admin: &str, source_sql: &str, target_sql: &str, label: &str) {
+/// Core invariant: migrate target → re-diff → empty plan. The variant
+/// returning the databases lets behavioral tests execute the migrated objects
+/// before cleanup.
+async fn migrate_and_assert_converges(
+    admin: &str,
+    source_sql: &str,
+    target_sql: &str,
+    label: &str,
+) -> (ShadowDb, ShadowDb, String) {
     let (source_db, target_db) = setup_pair(admin, source_sql, target_sql).await;
 
     let source = introspect_url(&source_db.url, &opts()).await.expect("introspect source");
@@ -168,6 +175,12 @@ async fn assert_converges(admin: &str, source_sql: &str, target_sql: &str, label
         script.sql
     );
 
+    (source_db, target_db, script.sql)
+}
+
+async fn assert_converges(admin: &str, source_sql: &str, target_sql: &str, label: &str) {
+    let (source_db, target_db, _) =
+        migrate_and_assert_converges(admin, source_sql, target_sql, label).await;
     source_db.drop_db().await;
     target_db.drop_db().await;
 }
@@ -189,6 +202,47 @@ async fn teardown_to_empty_converges() {
     let Some(admin) = admin_url() else { return };
     // Everything in the target must be droppable down to an empty database.
     assert_converges(&admin, "", RICH_SCHEMA, "teardown").await;
+}
+
+/// Regression: `pg_get_constraintdef` is not a re-parse fixed point. A
+/// varchar IN-list CHECK is stored as `(col)::text = ANY ((ARRAY[...])::text[])`,
+/// but re-parsing that emitted text stores per-element casts
+/// (`ANY (ARRAY[('a'::varchar)::text, ...])`), which deparses differently —
+/// so a target built from dpm's own emitted SQL never string-equals the
+/// source and the diff churns the same constraint forever. Comparison must
+/// be modulo one server round-trip (canonicalization), not raw equality.
+#[tokio::test]
+async fn varchar_in_list_check_converges() {
+    let Some(admin) = admin_url() else { return };
+    assert_converges(
+        &admin,
+        r#"
+CREATE TABLE public.app_config (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  status varchar(32) NOT NULL DEFAULT 'active',
+  kind varchar(16),
+  CONSTRAINT app_config_pkey PRIMARY KEY (id),
+  CONSTRAINT app_config_status_chk CHECK (status IN ('active','paused','archived')),
+  CONSTRAINT app_config_kind_chk CHECK (kind IS NULL OR kind IN ('a','b'))
+);
+"#,
+        "",
+        "varchar-in-list-check-bootstrap",
+    )
+    .await;
+    // The same shape must also survive an incremental add to an existing table.
+    assert_converges(
+        &admin,
+        r#"
+CREATE TABLE public.jobs (
+  state varchar(24) NOT NULL,
+  CONSTRAINT jobs_state_chk CHECK (state IN ('queued','running','done'))
+);
+"#,
+        "CREATE TABLE public.jobs (state varchar(24) NOT NULL);",
+        "varchar-in-list-check-incremental",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -548,6 +602,287 @@ async fn matrix_index_churn() {
 }
 
 #[tokio::test]
+async fn postgres_advanced_indexes_converge() {
+    let Some(admin) = admin_url() else { return };
+    let (source_db, target_db, migration) = migrate_and_assert_converges(
+        &admin,
+        "CREATE TABLE search_documents (\
+           id bigint PRIMARY KEY, tenant_id bigint NOT NULL, title text NOT NULL, \
+           payload jsonb NOT NULL, active boolean NOT NULL DEFAULT true); \
+         CREATE INDEX documents_covering_idx ON search_documents (tenant_id, title DESC) \
+           INCLUDE (payload) WHERE active; \
+         CREATE INDEX documents_payload_idx ON search_documents USING gin (payload); \
+         CREATE UNIQUE INDEX documents_title_unique_idx \
+           ON search_documents (tenant_id, lower(title)) WHERE active;",
+        "CREATE TABLE search_documents (\
+           id bigint PRIMARY KEY, tenant_id bigint NOT NULL, title text NOT NULL, \
+           payload jsonb NOT NULL, active boolean NOT NULL DEFAULT true); \
+         CREATE INDEX documents_covering_idx ON search_documents (tenant_id, title); \
+         CREATE INDEX documents_payload_idx ON search_documents (tenant_id); \
+         CREATE INDEX documents_obsolete_idx ON search_documents (active); \
+         CREATE UNIQUE INDEX documents_obsolete_unique_idx ON search_documents (title);",
+        "advanced-indexes",
+    )
+    .await;
+    assert!(
+        migration.contains("DROP INDEX IF EXISTS \"public\".\"documents_obsolete_idx\""),
+        "{migration}"
+    );
+    assert!(
+        migration.contains(
+            "DROP INDEX IF EXISTS \"public\".\"documents_obsolete_unique_idx\""
+        ),
+        "{migration}"
+    );
+    source_db.drop_db().await;
+    target_db.drop_db().await;
+}
+
+#[tokio::test]
+async fn postgres_functions_procedures_and_triggers_converge_and_execute() {
+    let Some(admin) = admin_url() else { return };
+    let source_sql = r#"
+CREATE TABLE accounts (
+  id integer PRIMARY KEY,
+  balance integer NOT NULL,
+  touched boolean NOT NULL DEFAULT false
+);
+CREATE TABLE account_audit (account_id integer NOT NULL, new_balance integer NOT NULL);
+CREATE FUNCTION multiply_values(a integer, b integer) RETURNS integer
+  AS 'SELECT a * b' LANGUAGE SQL IMMUTABLE;
+CREATE PROCEDURE credit_account(account_id integer, amount integer)
+  LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE public.accounts SET balance = balance + amount WHERE accounts.id = account_id;
+END
+$$;
+CREATE FUNCTION audit_account_update() RETURNS trigger AS $$
+BEGIN
+  NEW.touched := true;
+  INSERT INTO public.account_audit(account_id, new_balance) VALUES (NEW.id, NEW.balance);
+  RETURN NEW;
+END
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER accounts_audit BEFORE UPDATE ON accounts
+  FOR EACH ROW EXECUTE FUNCTION audit_account_update();
+ALTER TABLE accounts ENABLE ALWAYS TRIGGER accounts_audit;
+"#;
+    let target_sql = r#"
+CREATE TABLE accounts (
+  id integer PRIMARY KEY,
+  balance integer NOT NULL,
+  touched boolean NOT NULL DEFAULT false
+);
+CREATE TABLE account_audit (account_id integer NOT NULL, new_balance integer NOT NULL);
+CREATE FUNCTION multiply_values(a integer, b integer) RETURNS integer
+  AS 'SELECT a + b' LANGUAGE SQL IMMUTABLE;
+CREATE PROCEDURE credit_account(account_id integer, amount integer)
+  LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE public.accounts SET balance = balance - amount WHERE accounts.id = account_id;
+END
+$$;
+CREATE PROCEDURE "obsolete account job"() LANGUAGE SQL AS 'SELECT 1';
+CREATE FUNCTION audit_account_update() RETURNS trigger AS $$
+BEGIN
+  NEW.touched := false;
+  RETURN NEW;
+END
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER accounts_audit BEFORE UPDATE ON accounts
+  FOR EACH ROW EXECUTE FUNCTION audit_account_update();
+ALTER TABLE accounts DISABLE TRIGGER accounts_audit;
+"#;
+    let (source_db, target_db, migration) =
+        migrate_and_assert_converges(&admin, source_sql, target_sql, "routines-triggers").await;
+    assert!(migration.contains("CREATE OR REPLACE FUNCTION"), "{migration}");
+    assert!(migration.contains("CREATE OR REPLACE PROCEDURE"), "{migration}");
+    assert!(
+        migration.contains("DROP PROCEDURE IF EXISTS \"public\".\"obsolete account job\"()"),
+        "{migration}"
+    );
+    assert!(
+        migration.contains("ENABLE ALWAYS TRIGGER \"accounts_audit\""),
+        "{migration}"
+    );
+
+    let mut conn = dpm::introspect::connect(&target_db.url).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO public.accounts (id, balance) VALUES (1, 10); \
+         CALL public.credit_account(1, 5);",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("execute migrated PostgreSQL procedure and trigger");
+    let behavior: (i32, bool, i32, i64) = sqlx::query_as(
+        "SELECT a.balance, a.touched, public.multiply_values(3, 4), count(au.account_id) \
+           FROM public.accounts a \
+           LEFT JOIN public.account_audit au ON au.account_id = a.id \
+          WHERE a.id = 1 \
+          GROUP BY a.balance, a.touched",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(behavior, (15, true, 12, 1));
+
+    source_db.drop_db().await;
+    target_db.drop_db().await;
+}
+
+#[tokio::test]
+async fn postgres_routine_options_bootstrap_json_and_teardown() {
+    let Some(admin) = admin_url() else { return };
+    let schema = r#"
+CREATE FUNCTION public.secure_greeting(prefix text DEFAULT 'hello')
+  RETURNS text IMMUTABLE SECURITY DEFINER LANGUAGE SQL
+  AS 'SELECT prefix || ''!''';
+CREATE PROCEDURE public.double_value(INOUT value integer, OUT doubled integer)
+  SECURITY DEFINER LANGUAGE plpgsql AS $$
+BEGIN
+  doubled := value * 2;
+  value := value + 1;
+END
+$$;
+"#;
+
+    let (source_db, target_db, migration) =
+        migrate_and_assert_converges(&admin, schema, "", "routine-options-bootstrap").await;
+    assert!(migration.contains("SECURITY DEFINER"), "{migration}");
+    assert!(migration.contains("DEFAULT 'hello'::text"), "{migration}");
+    assert!(migration.contains("INOUT value integer"), "{migration}");
+
+    let source_catalog = introspect_url(&source_db.url, &IntrospectOptions::default())
+        .await
+        .unwrap();
+    let json = serde_json::to_string_pretty(&source_catalog).unwrap();
+    let round_trip: dpm::model::Catalog = serde_json::from_str(&json).unwrap();
+    assert!(
+        diff(&source_catalog, &round_trip).is_empty(),
+        "PostgreSQL routine catalog JSON must round-trip"
+    );
+
+    let mut conn = dpm::introspect::connect(&target_db.url).await.unwrap();
+    let greeting: String = sqlx::query_scalar("SELECT public.secure_greeting()")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    let values: (i32, i32) = sqlx::query_as("CALL public.double_value(3, NULL)")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(greeting, "hello!");
+    assert_eq!(values, (4, 6));
+
+    source_db.drop_db().await;
+    target_db.drop_db().await;
+    assert_converges(&admin, "", schema, "routine-options-teardown").await;
+}
+
+#[tokio::test]
+async fn postgres_multiple_conditional_triggers_converge_and_execute() {
+    let Some(admin) = admin_url() else { return };
+    let source_sql = r#"
+CREATE TABLE public.events (id integer PRIMARY KEY, value integer NOT NULL);
+CREATE TABLE public.event_audit (event_id integer NOT NULL, observed_value integer NOT NULL);
+CREATE FUNCTION public.normalize_event() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.value < 0 THEN
+    NEW.value := 0;
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE FUNCTION public.audit_event() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO public.event_audit(event_id, observed_value) VALUES (NEW.id, NEW.value);
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER events_normalize BEFORE INSERT OR UPDATE ON public.events
+  FOR EACH ROW EXECUTE FUNCTION public.normalize_event();
+CREATE TRIGGER events_audit_insert AFTER INSERT ON public.events
+  FOR EACH ROW WHEN (NEW.value > 10)
+  EXECUTE FUNCTION public.audit_event();
+CREATE TRIGGER events_audit_update AFTER UPDATE ON public.events
+  FOR EACH ROW WHEN (NEW.value > 20)
+  EXECUTE FUNCTION public.audit_event();
+"#;
+    let target_sql = r#"
+CREATE TABLE public.events (id integer PRIMARY KEY, value integer NOT NULL);
+CREATE TABLE public.event_audit (event_id integer NOT NULL, observed_value integer NOT NULL);
+CREATE FUNCTION public.normalize_event() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.value < 0 THEN
+    NEW.value := 99;
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE FUNCTION public.audit_event() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO public.event_audit(event_id, observed_value) VALUES (NEW.id, -1);
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER events_normalize BEFORE INSERT OR UPDATE ON public.events
+  FOR EACH ROW EXECUTE FUNCTION public.normalize_event();
+CREATE TRIGGER events_audit_insert AFTER INSERT ON public.events
+  FOR EACH ROW WHEN (NEW.value > 10)
+  EXECUTE FUNCTION public.audit_event();
+CREATE TRIGGER events_audit_update AFTER UPDATE ON public.events
+  FOR EACH ROW WHEN (NEW.value > 20)
+  EXECUTE FUNCTION public.audit_event();
+CREATE TRIGGER events_audit_obsolete AFTER INSERT ON public.events
+  FOR EACH ROW WHEN (NEW.value > 1000)
+  EXECUTE FUNCTION public.audit_event();
+"#;
+
+    let (source_db, target_db, migration) = migrate_and_assert_converges(
+        &admin,
+        source_sql,
+        target_sql,
+        "multiple-conditional-triggers",
+    )
+    .await;
+    assert!(
+        migration.contains("DROP TRIGGER IF EXISTS \"events_audit_obsolete\""),
+        "{migration}"
+    );
+    assert!(migration.contains("CREATE OR REPLACE FUNCTION"), "{migration}");
+
+    let mut conn = dpm::introspect::connect(&target_db.url).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO public.events (id, value) VALUES (1, -5), (2, 15), (3, 25); \
+         UPDATE public.events SET value = 30 WHERE id = 2; \
+         UPDATE public.events SET value = -7 WHERE id = 1;",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("execute migrated PostgreSQL conditional triggers");
+    let values: (i32, i32, i32) = sqlx::query_as(
+        "SELECT max(value) FILTER (WHERE id = 1), \
+                max(value) FILTER (WHERE id = 2), \
+                max(value) FILTER (WHERE id = 3) \
+           FROM public.events",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    let audit: (i64, i64) = sqlx::query_as(
+        "SELECT count(*), sum(observed_value)::bigint FROM public.event_audit",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(values, (0, 30, 25));
+    assert_eq!(audit, (3, 70));
+
+    source_db.drop_db().await;
+    target_db.drop_db().await;
+}
+
+#[tokio::test]
 async fn matrix_views_functions_triggers() {
     let Some(admin) = admin_url() else { return };
     verify_with_all_checkers(
@@ -623,4 +958,338 @@ async fn matrix_sequence_churn() {
          CREATE SEQUENCE stale_seq AS integer;",
     )
     .await;
+}
+
+// ===========================================================================
+// Deeper invariants: hostile identifiers, column transitions, serial
+// adoption, schema scoping, determinism, and resource hygiene.
+// ===========================================================================
+
+/// Identifiers that need quoting everywhere: mixed case, spaces, keywords,
+/// embedded quotes. If any emission path forgets quote_ident, this breaks.
+#[tokio::test]
+async fn hostile_identifiers_converge() {
+    let Some(admin) = admin_url() else { return };
+    let schema = r#"
+CREATE SCHEMA "Mixed Case";
+CREATE TYPE "Mixed Case"."mood ""level""" AS ENUM ('so ""quoted""', 'and, comma');
+CREATE TABLE "Mixed Case"."order" (
+  "Id" bigserial NOT NULL,
+  "select" text NOT NULL,
+  "column with spaces" "Mixed Case"."mood ""level""" NOT NULL DEFAULT 'and, comma',
+  CONSTRAINT "order pkey" PRIMARY KEY ("Id"),
+  CONSTRAINT "check ""this""" CHECK (octet_length("select") > 0)
+);
+CREATE INDEX "weird index" ON "Mixed Case"."order" ("select");
+CREATE VIEW "Mixed Case"."View" AS SELECT "Id", "select" FROM "Mixed Case"."order";
+"#;
+    // bootstrap from empty AND teardown back to empty
+    assert_converges(&admin, schema, "", "hostile-bootstrap").await;
+    assert_converges(&admin, "", schema, "hostile-teardown").await;
+    // and a drifted pair: same names, different shape
+    let drifted = r#"
+CREATE SCHEMA "Mixed Case";
+CREATE TYPE "Mixed Case"."mood ""level""" AS ENUM ('so ""quoted""');
+CREATE TABLE "Mixed Case"."order" (
+  "Id" bigserial NOT NULL,
+  "select" text NOT NULL,
+  CONSTRAINT "order pkey" PRIMARY KEY ("Id")
+);
+"#;
+    assert_converges(&admin, schema, drifted, "hostile-drift").await;
+}
+
+/// Every column-facet transition in one table: type widen/narrow, default
+/// add/change/drop, NOT NULL both directions, identity kind flip and
+/// removal, and a generated-column expression change (destructive rebuild).
+#[tokio::test]
+async fn column_transitions_converge() {
+    let Some(admin) = admin_url() else { return };
+    assert_converges(
+        &admin,
+        "CREATE TABLE t (
+           a bigint,
+           b text NOT NULL DEFAULT 'new',
+           c integer,
+           d bigint GENERATED BY DEFAULT AS IDENTITY,
+           e bigint,
+           f text,
+           g integer GENERATED ALWAYS AS (c * 2) STORED
+         );",
+        "CREATE TABLE t (
+           a integer,
+           b text DEFAULT 'old',
+           c integer NOT NULL DEFAULT 7,
+           d bigint GENERATED ALWAYS AS IDENTITY,
+           e bigint GENERATED BY DEFAULT AS IDENTITY,
+           f varchar(10),
+           g integer GENERATED ALWAYS AS (c + 1) STORED
+         );",
+        "column-transitions",
+    )
+    .await;
+}
+
+/// Serial adoption: target has a plain integer PK, source has a serial one.
+/// The MakeSerial path must create the sequence, set the default, transfer
+/// ownership, and seed the counter past existing data.
+#[tokio::test]
+async fn serial_adoption_converges_and_respects_existing_rows() {
+    let Some(admin) = admin_url() else { return };
+    let (source_db, target_db) = setup_pair(
+        &admin,
+        "CREATE TABLE items (id integer PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY);",
+        "CREATE TABLE items (id integer PRIMARY KEY);",
+    )
+    .await;
+    // Also cover MakeSerial with real rows present.
+    let (serial_src, plain_tgt) = setup_pair(
+        &admin,
+        "CREATE TABLE s (id serial PRIMARY KEY, v text);",
+        "CREATE TABLE s (id integer NOT NULL, v text, CONSTRAINT s_pkey PRIMARY KEY (id));
+         INSERT INTO s (id, v) VALUES (1, 'a'), (7, 'b');",
+    )
+    .await;
+
+    for (label, s_db, t_db) in [("identity-adoption", &source_db, &target_db), ("serial-adoption", &serial_src, &plain_tgt)] {
+        let s = introspect_url(&s_db.url, &opts()).await.unwrap();
+        let t = introspect_url(&t_db.url, &opts()).await.unwrap();
+        let script = emit(&diff(&s, &t), &EmitOptions { allow_destructive: true, ..Default::default() });
+        apply_script(&t_db.url, &script.sql).await.unwrap_or_else(|e| panic!("[{label}] {e:#}\n{}", script.sql));
+        let migrated = introspect_url(&t_db.url, &opts()).await.unwrap();
+        let residual = diff(&s, &migrated);
+        assert!(residual.is_empty(), "[{label}] residual:\n{}", emit(&residual, &EmitOptions::default()).sql);
+    }
+
+    // The adopted serial must continue past existing ids, not collide.
+    let mut conn = dpm::introspect::connect(&plain_tgt.url).await.unwrap();
+    let next: i32 = sqlx::query_scalar("INSERT INTO public.s (v) VALUES ('c') RETURNING id")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert!(next > 7, "serial counter must be seeded past max(id)=7, got {next}");
+
+    source_db.drop_db().await;
+    target_db.drop_db().await;
+    serial_src.drop_db().await;
+    plain_tgt.drop_db().await;
+}
+
+/// --schemas scoping: drift outside the listed schemas is invisible.
+#[tokio::test]
+async fn schema_scoping_limits_the_diff() {
+    let Some(admin) = admin_url() else { return };
+    let (a, b) = setup_pair(
+        &admin,
+        "CREATE SCHEMA keep; CREATE SCHEMA ignore_me;
+         CREATE TABLE keep.t (id int PRIMARY KEY);
+         CREATE TABLE ignore_me.x (id int);",
+        "CREATE SCHEMA keep; CREATE SCHEMA ignore_me;
+         CREATE TABLE keep.t (id int PRIMARY KEY);
+         CREATE TABLE ignore_me.y (id text, extra bool);",
+    )
+    .await;
+
+    let scoped = IntrospectOptions { schemas: Some(vec!["keep".into()]), extra_excluded: vec![] };
+    let ca = introspect_url(&a.url, &scoped).await.unwrap();
+    let cb = introspect_url(&b.url, &scoped).await.unwrap();
+    assert!(diff(&ca, &cb).is_empty(), "drift in ignore_me must be invisible when scoped to keep");
+
+    let excluded = IntrospectOptions { schemas: None, extra_excluded: vec!["ignore_me".into()] };
+    let ca = introspect_url(&a.url, &excluded).await.unwrap();
+    let cb = introspect_url(&b.url, &excluded).await.unwrap();
+    assert!(diff(&ca, &cb).is_empty(), "drift in ignore_me must be invisible when excluded");
+
+    // Unscoped, the drift IS visible.
+    let ca = introspect_url(&a.url, &opts()).await.unwrap();
+    let cb = introspect_url(&b.url, &opts()).await.unwrap();
+    assert!(!diff(&ca, &cb).is_empty());
+
+    a.drop_db().await;
+    b.drop_db().await;
+}
+
+/// Catalog serialization must be deterministic: introspect the same database
+/// twice, get byte-identical JSON (BTreeMap ordering everywhere).
+#[tokio::test]
+async fn catalog_dumps_are_deterministic() {
+    let Some(admin) = admin_url() else { return };
+    let db = fresh_db(&admin).await;
+    db.apply_sql(RICH_SCHEMA).await.unwrap();
+    let one = serde_json::to_string_pretty(&introspect_url(&db.url, &opts()).await.unwrap()).unwrap();
+    let two = serde_json::to_string_pretty(&introspect_url(&db.url, &opts()).await.unwrap()).unwrap();
+    assert_eq!(one, two, "same database must dump byte-identically");
+    db.drop_db().await;
+}
+
+/// verify() must clean up every throwaway database it creates (target
+/// replica, source replica, flyway replica).
+#[tokio::test]
+async fn verify_leaves_no_shadow_databases_behind() {
+    let Some(admin) = admin_url() else { return };
+    let (source_db, target_db) = setup_pair(&admin, RICH_SCHEMA, DIVERGENT_SCHEMA).await;
+
+    let count_shadows = |admin: String| async move {
+        let mut conn = dpm::introspect::connect(&admin).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_database WHERE datname LIKE 'dpm_shadow_%'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        n
+    };
+    let before = count_shadows(admin.clone()).await;
+
+    let source = introspect_url(&source_db.url, &opts()).await.unwrap();
+    let target = introspect_url(&target_db.url, &opts()).await.unwrap();
+    for _ in 0..2 {
+        // Repeated verify runs must both converge (stability) and clean up.
+        let outcome = dpm::verify::verify(dpm::verify::VerifyParams {
+            source: &source,
+            target: &target,
+            shadow_server_url: &admin,
+            source_url_for_external: None, // force a source replica too
+            allow_destructive: true,
+            external_check: Some("true"),
+            checks: Default::default(),
+            bins: Default::default(),
+            keep_shadow: false,
+            verbose: false,
+            introspect: &opts(),
+        })
+        .await
+        .unwrap();
+        assert!(outcome.converged);
+        assert!(outcome.all_checks_agreed());
+    }
+
+    // Other tests run in parallel and create their own transient shadows;
+    // poll until the count settles back. A real leak never settles.
+    let mut after = count_shadows(admin.clone()).await;
+    for _ in 0..30 {
+        if after <= before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        after = count_shadows(admin.clone()).await;
+    }
+    assert!(after <= before, "verify leaked shadow databases: before={before}, after={after}");
+
+    source_db.drop_db().await;
+    target_db.drop_db().await;
+}
+
+// ===========================================================================
+// Migrations over POPULATED tables: schema convergence is necessary but not
+// sufficient — the data must survive, constraints must actually validate
+// against real rows, and invalid data must fail loudly.
+// ===========================================================================
+
+#[tokio::test]
+async fn populated_table_migration_preserves_data() {
+    let Some(admin) = admin_url() else { return };
+    let (source_db, target_db) = setup_pair(
+        &admin,
+        // Desired: widened type, new NOT NULL default column, check + unique
+        // over existing data, FK to a lookup table, index on a live column.
+        "CREATE TABLE lookup (code integer PRIMARY KEY);
+         CREATE TABLE readings (
+           id bigint NOT NULL,
+           sensor integer NOT NULL,
+           value bigint NOT NULL,
+           label text NOT NULL DEFAULT 'unlabeled',
+           CONSTRAINT readings_pkey PRIMARY KEY (id),
+           CONSTRAINT readings_sensor_fkey FOREIGN KEY (sensor) REFERENCES lookup(code),
+           CONSTRAINT readings_value_pos CHECK (value >= 0),
+           CONSTRAINT readings_id_uniq UNIQUE (id)
+         );
+         CREATE INDEX readings_sensor_idx ON readings (sensor);",
+        // Current: 50k live rows, narrower type, none of the constraints.
+        "CREATE TABLE lookup (code integer PRIMARY KEY);
+         INSERT INTO lookup SELECT g FROM generate_series(0, 9) g;
+         CREATE TABLE readings (
+           id bigint NOT NULL,
+           sensor integer NOT NULL,
+           value integer NOT NULL,
+           CONSTRAINT readings_pkey PRIMARY KEY (id)
+         );
+         INSERT INTO readings (id, sensor, value)
+           SELECT g, g % 10, (g * 7) % 100000 FROM generate_series(1, 50000) g;",
+    )
+    .await;
+
+    let mut conn = dpm::introspect::connect(&target_db.url).await.unwrap();
+    let (count_before, sum_before): (i64, i64) =
+        sqlx::query_as("SELECT count(*), sum(value)::bigint FROM public.readings")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(count_before, 50_000);
+
+    let source = introspect_url(&source_db.url, &opts()).await.unwrap();
+    let target = introspect_url(&target_db.url, &opts()).await.unwrap();
+    let plan = diff(&source, &target);
+    let script = emit(&plan, &EmitOptions { allow_destructive: true, ..Default::default() });
+    // The FK/check on an existing table must take the NOT VALID + VALIDATE path.
+    assert!(script.sql.contains("NOT VALID"), "{}", script.sql);
+    assert!(script.sql.contains("VALIDATE CONSTRAINT"), "{}", script.sql);
+
+    apply_script(&target_db.url, &script.sql)
+        .await
+        .unwrap_or_else(|e| panic!("populated migration failed: {e:#}\n{}", script.sql));
+
+    // Schema converged…
+    let migrated = introspect_url(&target_db.url, &opts()).await.unwrap();
+    let residual = diff(&source, &migrated);
+    assert!(residual.is_empty(), "{}", emit(&residual, &EmitOptions::default()).sql);
+
+    // …and the data survived: same row count, same value checksum, new
+    // column backfilled with its default, widened type holds the old values.
+    let (count_after, sum_after): (i64, i64) =
+        sqlx::query_as("SELECT count(*), sum(value)::bigint FROM public.readings")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!((count_before, sum_before), (count_after, sum_after), "data changed during migration");
+    let unlabeled: i64 = sqlx::query_scalar("SELECT count(*) FROM public.readings WHERE label = 'unlabeled'")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(unlabeled, 50_000, "NOT NULL DEFAULT column must backfill every row");
+
+    source_db.drop_db().await;
+    target_db.drop_db().await;
+}
+
+/// When existing data VIOLATES a constraint the desired schema adds, the
+/// migration must fail loudly at VALIDATE time — never silently succeed.
+#[tokio::test]
+async fn constraint_violated_by_existing_data_fails_loudly() {
+    let Some(admin) = admin_url() else { return };
+    let (source_db, target_db) = setup_pair(
+        &admin,
+        "CREATE TABLE m (id bigint PRIMARY KEY, v integer NOT NULL,
+           CONSTRAINT m_v_small CHECK (v < 100));",
+        "CREATE TABLE m (id bigint PRIMARY KEY, v integer NOT NULL);
+         INSERT INTO m SELECT g, g FROM generate_series(1, 500) g;",
+    )
+    .await;
+
+    let source = introspect_url(&source_db.url, &opts()).await.unwrap();
+    let target = introspect_url(&target_db.url, &opts()).await.unwrap();
+    let script = emit(&diff(&source, &target), &EmitOptions { allow_destructive: true, ..Default::default() });
+
+    let err = apply_script(&target_db.url, &script.sql)
+        .await
+        .expect_err("rows with v >= 100 must make VALIDATE fail");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("m_v_small"), "error must name the constraint: {msg}");
+
+    // Fail-loud also means fail-atomic for the transactional part: the
+    // constraint must not exist afterwards in any half-applied form.
+    let migrated = introspect_url(&target_db.url, &opts()).await.unwrap();
+    let table = migrated.tables.values().next().unwrap();
+    assert!(!table.constraints.contains_key("m_v_small"), "no half-applied constraint");
+
+    source_db.drop_db().await;
+    target_db.drop_db().await;
 }

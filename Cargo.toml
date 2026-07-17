@@ -1,11 +1,15 @@
 [package]
 name = "declarative-postgres-migrate"
-version = "0.2.1"
+version = "0.3.1"
 edition = "2021"
 license = "MIT"
-description = "Declarative, ORM-agnostic Postgres schema migration: introspect two databases (or SQL files / saved catalogs), diff the catalogs, and emit reviewable SQL that converges the target onto the source."
+description = "Declarative, ORM-agnostic PostgreSQL and CockroachDB schema migration: introspect two databases (or SQL files / saved catalogs), diff the catalogs, and emit reviewable SQL that converges the target onto the source."
 repository = "https://github.com/declarative-migrations/declarative-postgres-migrate.rs"
+homepage = "https://declarative-migrations.github.io"
 readme = "readme.md"
+keywords = ["postgres", "cockroachdb", "migration", "schema", "diff"]
+categories = ["database", "command-line-utilities", "development-tools"]
+exclude = [".github/", "docs/", "tests/", "scripts/publish/"]
 
 [lib]
 name = "dpm"
@@ -32,6 +36,9 @@ sqlx = { version = "0.8", default-features = false, features = [
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 toml = "0.8"
+
+[dev-dependencies]
+proptest = "1"
 
 [profile.release]
 lto = true
