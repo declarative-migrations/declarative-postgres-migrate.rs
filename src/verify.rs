@@ -187,7 +187,8 @@ async fn run_on_replica(p: &VerifyParams<'_>, migration_sql: &str, replica: &Sha
         crate::apply::apply_script(&replica.url, &bootstrap.sql)
             .await
             .context("bootstrapping the target replica on the shadow server failed")?;
-        let replica_cat = introspect::introspect_url(&replica.url, p.introspect).await?;
+        let mut replica_cat = introspect::introspect_url(&replica.url, p.introspect).await?;
+        crate::canonicalize::canonicalize_defs(&mut [&mut replica_cat], p.shadow_server_url, p.verbose).await?;
         let drift = diff(p.target, &replica_cat);
         if !drift.is_empty() {
             let drift_sql = emit(
