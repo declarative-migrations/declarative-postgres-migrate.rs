@@ -5,26 +5,27 @@
 //! the original parse as `(col)::text = ANY ((ARRAY['a'::character varying,
 //! ...])::text[])`, but feeding that emitted text back through the parser
 //! stores per-element casts (`ANY (ARRAY[('a'::character varying)::text,
-//! ...])`), which deparses differently. The same shape appears in CHECK
-//! constraints and in partial-index WHERE predicates. Raw string comparison
-//! therefore reports an eternal diff between a freshly-parsed schema and a
-//! database built from dpm's own emitted SQL — the same constraint or index
-//! is dropped and re-created forever.
+//! ...])`), which deparses differently. The same shape appears anywhere dpm
+//! compares a deparsed expression string: CHECK constraints, partial-index
+//! WHERE predicates, generated-column expressions, and view / materialized-
+//! view bodies. Raw string comparison therefore reports an eternal diff
+//! between a freshly-parsed schema and a database built from dpm's own emitted
+//! SQL — the same object is dropped and re-created forever.
 //!
 //! The fix stays true to the project's core idea (the server is the only
-//! trustworthy normalizer — never regex): every CHECK def and index def is
-//! rebuilt once against an empty copy of its table in a throwaway shadow
-//! database, and the re-read deparse is substituted into the catalog. One
-//! round-trip is the fixed point: an already-canonical def re-canonicalizes
-//! to itself, so both sides of any diff land on identical strings regardless
-//! of how their databases were built. Defs that fail to rebuild (extension
-//! types or functions missing on the shadow, etc.) are left untouched —
-//! degraded, never wrong: the worst case is the pre-existing behavior.
+//! trustworthy normalizer — never regex): every such def is rebuilt once in a
+//! throwaway shadow database — CHECK/index/generated against an empty copy of
+//! the owning table, views against copies of all the catalog's tables — and
+//! the re-read deparse is substituted into the catalog. One round-trip is the
+//! fixed point: an already-canonical def re-canonicalizes to itself, so both
+//! sides of any diff land on identical strings regardless of how their
+//! databases were built. Defs that fail to rebuild (a view over other views or
+//! functions, extension types missing on the shadow, etc.) are left untouched
+//! — degraded, never wrong: the worst case is the pre-existing behavior.
 //!
-//! Not yet round-tripped: column defaults and generated expressions (compared
-//! via `Column::semantic_eq`), view bodies, and function bodies. If a
-//! non-fixed-point shape surfaces for those, this module is where its
-//! canonicalization belongs.
+//! Left as-is: column DEFAULT expressions (a default is a single value, not an
+//! IN-list) and function bodies (stored source text, not re-deparsed). If a
+//! non-fixed-point shape surfaces there, this module is where it belongs.
 
 use std::collections::BTreeMap;
 
