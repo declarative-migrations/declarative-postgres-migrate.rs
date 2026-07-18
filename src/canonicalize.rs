@@ -374,6 +374,70 @@ async fn round_trip_index(
     Ok(row.1)
 }
 
+/// Add a throwaway generated column driven by `expr` to the scratch copy, read
+/// back the server's deparse of the generation expression, drop it again. The
+/// expression references only sibling columns of the same table, which the
+/// scratch copy already carries.
+async fn round_trip_generated(
+    conn: &mut sqlx::postgres::PgConnection,
+    qname: &QName,
+    col_type: &str,
+    expr: &str,
+) -> Result<String> {
+    let target = qualified(qname);
+    sqlx::raw_sql(&format!(
+        "ALTER TABLE {target} ADD COLUMN _dpm_canon_gen {col_type} \
+         GENERATED ALWAYS AS ({expr}) STORED"
+    ))
+    .execute(&mut *conn)
+    .await
+    .context("ADD generated COLUMN failed")?;
+    let row: (String,) = sqlx::query_as(
+        "SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid) \
+         FROM pg_catalog.pg_attrdef d \
+         JOIN pg_catalog.pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
+         WHERE a.attname = '_dpm_canon_gen' AND d.adrelid = ($1::text)::regclass",
+    )
+    .bind(&target)
+    .fetch_one(&mut *conn)
+    .await
+    .context("reading back canonical generation expression")?;
+    sqlx::raw_sql(&format!("ALTER TABLE {target} DROP COLUMN _dpm_canon_gen"))
+        .execute(&mut *conn)
+        .await
+        .context("DROP generated COLUMN failed")?;
+    Ok(row.0)
+}
+
+/// Recreate the view body under a throwaway name against the scratch tables,
+/// read back `pg_get_viewdef`, drop it again. `def` is the stored view body
+/// (the SELECT from `pg_get_viewdef`); a regular view suffices to canonicalize
+/// a materialized view's body since the deparse form is identical.
+async fn round_trip_view(
+    conn: &mut sqlx::postgres::PgConnection,
+    def: &str,
+) -> Result<String> {
+    sqlx::raw_sql("DROP VIEW IF EXISTS public._dpm_canon_view")
+        .execute(&mut *conn)
+        .await
+        .ok();
+    sqlx::raw_sql(&format!("CREATE VIEW public._dpm_canon_view AS {def}"))
+        .execute(&mut *conn)
+        .await
+        .context("CREATE VIEW failed")?;
+    let row: (String,) = sqlx::query_as(
+        "SELECT pg_catalog.pg_get_viewdef('public._dpm_canon_view'::regclass, true)",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .context("reading back canonical view def")?;
+    sqlx::raw_sql("DROP VIEW public._dpm_canon_view")
+        .execute(&mut *conn)
+        .await
+        .context("DROP VIEW failed")?;
+    Ok(row.0)
+}
+
 /// Identity of the column environment an expression parses against.
 fn column_signature(table: &Table) -> String {
     let mut parts: Vec<String> = table
