@@ -135,6 +135,10 @@ async fn canonicalize_on(
     let mut canonical: BTreeMap<(String, String), String> = BTreeMap::new();
 
     for catalog in catalogs.iter_mut() {
+        // Table-scoped defs (CHECK, index, generated-column expressions) resolve
+        // against the owning table's own columns, so they can be canonicalized
+        // per table and shared across catalogs via the (column-signature, def)
+        // cache.
         for (qname, table) in catalog.tables.iter_mut() {
             let sig = column_signature(table);
             let check_defs: Vec<String> = table
@@ -150,41 +154,41 @@ async fn canonicalize_on(
                 .map(|i| i.def.clone())
                 .filter(|d| !canonical.contains_key(&(sig.clone(), d.clone())))
                 .collect();
+            // (column type, generation expression) for generated columns whose
+            // expression is not already canonicalized.
+            let gen_exprs: Vec<(String, String)> = table
+                .columns
+                .iter()
+                .filter_map(|c| c.generated.as_ref().map(|g| (c.type_sql.clone(), g.clone())))
+                .filter(|(_, expr)| !canonical.contains_key(&(sig.clone(), expr.clone())))
+                .collect();
 
-            if !check_defs.is_empty() || !index_defs.is_empty() {
-                // An empty copy of the table under its real name, so index
-                // defs (full CREATE INDEX statements naming the table) and
-                // CHECK defs run verbatim. Sequential processing: a same-name
-                // table from another catalog is simply rebuilt.
+            if !check_defs.is_empty() || !index_defs.is_empty() || !gen_exprs.is_empty() {
+                // An empty copy of the table under its real name, so index defs
+                // (full CREATE INDEX statements naming the table), CHECK defs,
+                // and generated-column expressions run verbatim. Sequential
+                // processing: a same-name table from another catalog is rebuilt.
                 match create_scratch_table(&mut conn, qname, table).await {
                     Ok(()) => {
                         for def in check_defs {
                             let canon = round_trip_check(&mut conn, qname, &def)
                                 .await
-                                .unwrap_or_else(|e| {
-                                    if verbose {
-                                        eprintln!(
-                                            "dpm: canonicalize: CHECK def did not round-trip \
-                                             ({e:#}); comparing it verbatim: {def}"
-                                        );
-                                    }
-                                    def.clone()
-                                });
+                                .unwrap_or_else(|e| warn_verbatim(verbose, "CHECK", &def, &e));
                             canonical.insert((sig.clone(), def), canon);
                         }
                         for def in index_defs {
                             let canon = round_trip_index(&mut conn, qname, &def)
                                 .await
-                                .unwrap_or_else(|e| {
-                                    if verbose {
-                                        eprintln!(
-                                            "dpm: canonicalize: index def did not round-trip \
-                                             ({e:#}); comparing it verbatim: {def}"
-                                        );
-                                    }
-                                    def.clone()
-                                });
+                                .unwrap_or_else(|e| warn_verbatim(verbose, "index", &def, &e));
                             canonical.insert((sig.clone(), def), canon);
+                        }
+                        for (col_type, expr) in gen_exprs {
+                            let canon = round_trip_generated(&mut conn, qname, &col_type, &expr)
+                                .await
+                                .unwrap_or_else(|e| {
+                                    warn_verbatim(verbose, "generated column", &expr, &e)
+                                });
+                            canonical.insert((sig.clone(), expr), canon);
                         }
                     }
                     Err(e) => {
@@ -197,6 +201,9 @@ async fn canonicalize_on(
                         }
                         for d in check_defs.into_iter().chain(index_defs) {
                             canonical.insert((sig.clone(), d.clone()), d);
+                        }
+                        for (_, expr) in gen_exprs {
+                            canonical.insert((sig.clone(), expr.clone()), expr);
                         }
                     }
                 }
@@ -214,10 +221,56 @@ async fn canonicalize_on(
                     idx.def = canon.clone();
                 }
             }
+            for col in table.columns.iter_mut() {
+                if let Some(expr) = col.generated.clone() {
+                    if let Some(canon) = canonical.get(&(sig.clone(), expr)) {
+                        col.generated = Some(canon.clone());
+                    }
+                }
+            }
+        }
+
+        // View bodies reference arbitrarily many tables, so they cannot use the
+        // per-table (signature, def) cache — canonicalize them against a full
+        // set of scratch copies of THIS catalog's tables. A view over other
+        // views or functions will fail to recreate and is left verbatim.
+        if !catalog.views.is_empty() {
+            for (qname, table) in &catalog.tables {
+                if let Err(e) = create_scratch_table(&mut conn, qname, table).await {
+                    if verbose {
+                        eprintln!(
+                            "dpm: canonicalize: scratch copy of {}.{} for view resolution \
+                             failed ({e:#})",
+                            qname.schema, qname.name
+                        );
+                    }
+                }
+            }
+            let mut view_canon: BTreeMap<QName, String> = BTreeMap::new();
+            for (qname, view) in &catalog.views {
+                let canon = round_trip_view(&mut conn, &view.def)
+                    .await
+                    .unwrap_or_else(|e| warn_verbatim(verbose, "view", &view.def, &e));
+                view_canon.insert(qname.clone(), canon);
+            }
+            for (qname, view) in catalog.views.iter_mut() {
+                if let Some(canon) = view_canon.get(qname) {
+                    view.def = canon.clone();
+                }
+            }
         }
     }
     let _ = conn.close().await;
     Ok(())
+}
+
+/// Log (when verbose) that a def could not be round-tripped and will be
+/// compared verbatim, returning the original def for that comparison.
+fn warn_verbatim(verbose: bool, kind: &str, def: &str, err: &anyhow::Error) -> String {
+    if verbose {
+        eprintln!("dpm: canonicalize: {kind} def did not round-trip ({err:#}); comparing it verbatim: {def}");
+    }
+    def.to_string()
 }
 
 fn qualified(qname: &QName) -> String {
