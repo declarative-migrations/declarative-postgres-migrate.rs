@@ -48,12 +48,14 @@ pub async fn canonicalize_defs(
     verbose: bool,
 ) -> Result<()> {
     let has_work = catalogs.iter().any(|c| {
-        c.tables.values().any(|t| {
-            !t.indexes.is_empty()
-                || t.constraints
-                    .values()
-                    .any(|k| k.kind == ConstraintKind::Check)
-        })
+        !c.views.is_empty()
+            || c.tables.values().any(|t| {
+                !t.indexes.is_empty()
+                    || t.columns.iter().any(|col| col.generated.is_some())
+                    || t.constraints
+                        .values()
+                        .any(|k| k.kind == ConstraintKind::Check)
+            })
     });
     if !has_work {
         return Ok(());
