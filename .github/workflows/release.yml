@@ -94,6 +94,13 @@ jobs:
           tar -czf "$asset" -C "$staging" .
           if command -v sha256sum >/dev/null; then sha256sum "$asset" > "$asset.sha256"; else shasum -a 256 "$asset" > "$asset.sha256"; fi
           echo "ASSET=$asset" >> "$GITHUB_ENV"
+      - name: Attest build provenance
+        # Signs a Sigstore provenance attestation binding this binary to the
+        # workflow/commit that built it. Consumers verify with:
+        #   gh attestation verify <tarball> --repo declarative-migrations/declarative-postgres-migrate.rs
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
+        with:
+          subject-path: ${{ env.ASSET }}
       - name: Upload to release
         shell: bash
         env:
