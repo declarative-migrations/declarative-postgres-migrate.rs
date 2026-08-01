@@ -1,0 +1,22 @@
+name: nix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  agent-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # v3.21.8; pin the installer rather than following a mutable major tag.
+      - uses: DeterminateSystems/determinate-nix-action@d96678350ffd6a456235832eb11e1c491589b7bb
+      - name: Validate flake outputs
+        run: nix flake check --print-build-logs
+      - name: Run the noninteractive agent contract
+        run: nix develop -c agent-check

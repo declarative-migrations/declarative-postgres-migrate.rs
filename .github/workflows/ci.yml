@@ -21,6 +21,15 @@ jobs:
       - name: splitter property tests
         run: cargo test --test fuzz_splitter
 
+  package-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Package crate and install CLI in isolation
+        run: bash scripts/check-release-contract.sh
+
   postgres:
     runs-on: ubuntu-latest
     services:
@@ -78,7 +87,7 @@ jobs:
           cockroachdb/cockroach:v25.2.4 start-single-node --insecure
       - name: Wait for CockroachDB
         run: |
-          for attempt in {1..60}; do
+          for _ in {1..60}; do
             if docker exec dpm-cockroach cockroach sql \
               --insecure --host=localhost:26257 --execute='SELECT 1' >/dev/null 2>&1; then
               exit 0

@@ -39,6 +39,12 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    # contents: write to upload release assets; id-token + attestations for the
+    # Sigstore build-provenance attestation on each binary tarball.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:

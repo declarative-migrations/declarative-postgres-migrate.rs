@@ -227,6 +227,29 @@ scripts/test.sh           # boots an ephemeral Postgres cluster (initdb/pg_ctl,
                           # tears everything down
 ```
 
+For a pinned, reproducible agent environment, use Nix:
+
+```sh
+nix develop
+nix develop -c agent-check
+```
+
+`agent-check` runs Clippy, the library and splitter property suites, a Cargo
+publish dry-run, and a clean CLI install/version/help check. The development
+shell includes the PostgreSQL and Docker clients used by the integration
+workflows, but entering it never starts a database, reads migration credentials,
+or applies a migration.
+
+### Docker/OCI parity
+
+Docker is a test dependency, not the DPM distribution format:
+`scripts/test-cockroach.sh` and the CockroachDB CI job run the pinned
+CockroachDB image, while PostgreSQL can run as a CI service or through the
+ephemeral local script. DPM itself ships as the combined Rust library/CLI crate
+and as checksummed native release archives. There is currently no application
+container whose contents could diverge from those release paths; any future OCI
+image should run the same `agent-check` and package the same release binary.
+
 The integration suite's core invariant is **convergence**: for schema pairs covering every supported object class, applying the generated migration and re-diffing must yield zero changes. On top of that sits the **cross-checker matrix** (`matrix_*` tests): ten fixture pairs (bootstrap, teardown, divergent evolution, enum insertion, serial/identity transitions, constraint churn, index churn, views+functions+triggers, RLS/policies, multi-schema) each verified by every installed external tool — 7 tools × 10 fixtures when fully provisioned. This matrix is how the library gets refined: it has already caught and fixed atlas/liquibase/apgdiff/flyway driver quirks and one real dpm gap (target-only schemas are now dropped, gated and non-cascade).
 
 ## Prior art & lineage
