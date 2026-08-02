@@ -42,14 +42,40 @@ fn default_type() -> String {
     "string".to_string()
 }
 
+/// A declared subcommand (flags-2-env `[commands.<name>]`). dpm keeps its flags
+/// global for now, so only the marker `env`, `help`, and `aliases` are modeled;
+/// nested commands are not used.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct CommandSpec {
+    #[serde(default)]
+    pub env: Option<String>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub help: Option<String>,
+}
+
+/// The `[parse]` table (the parts dpm consumes).
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ParseSpec {
+    #[serde(default)]
+    pub command_env: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct CliFlagsFile {
     #[serde(default)]
     flags: std::collections::BTreeMap<String, FlagSpec>,
+    #[serde(default)]
+    commands: std::collections::BTreeMap<String, CommandSpec>,
+    #[serde(default)]
+    parse: ParseSpec,
 }
 
 pub struct FlagConfig {
     pub flags: std::collections::BTreeMap<String, FlagSpec>,
+    pub commands: std::collections::BTreeMap<String, CommandSpec>,
+    pub parse: ParseSpec,
 }
 
 pub fn load_config() -> Result<FlagConfig> {
@@ -58,7 +84,64 @@ pub fn load_config() -> Result<FlagConfig> {
     // from any directory.
     let text = std::fs::read_to_string(".cli-flags.toml").unwrap_or_else(|_| EMBEDDED_CLI_FLAGS_TOML.to_string());
     let parsed: CliFlagsFile = toml::from_str(&text).context("invalid .cli-flags.toml")?;
-    Ok(FlagConfig { flags: parsed.flags })
+    let config = FlagConfig { flags: parsed.flags, commands: parsed.commands, parse: parsed.parse };
+    config.audit_commands()?;
+    Ok(config)
+}
+
+impl FlagConfig {
+    /// Canonicalize a command token against declared names and aliases. Returns
+    /// the canonical command name, or `None` if it matches none.
+    pub fn canonical_command(&self, token: &str) -> Option<String> {
+        if self.commands.contains_key(token) {
+            return Some(token.to_string());
+        }
+        self.commands
+            .iter()
+            .find(|(_, spec)| spec.aliases.iter().any(|a| a == token))
+            .map(|(name, _)| name.clone())
+    }
+
+    /// The env key flags-2-env writes the selected command path into
+    /// (`[parse] command_env`), if configured.
+    pub fn command_env_key(&self) -> Option<&str> {
+        self.parse.command_env.as_deref()
+    }
+
+    /// The marker env a command sets to "true" when selected, if declared.
+    pub fn command_marker_env(&self, command: &str) -> Option<&str> {
+        self.commands.get(command).and_then(|c| c.env.as_deref())
+    }
+
+    /// Validate the command tables the way `flags2env audit` does: command names
+    /// and aliases must be unique across commands, and command envs must not
+    /// collide with each other or with any flag env. Cheap enough to run on
+    /// every load.
+    pub fn audit_commands(&self) -> Result<()> {
+        use std::collections::HashSet;
+        let flag_envs: HashSet<&str> = self.flags.values().map(|f| f.env.as_str()).collect();
+        let mut names: HashSet<&str> = HashSet::new();
+        let mut cmd_envs: HashSet<&str> = HashSet::new();
+        for (name, spec) in &self.commands {
+            if !names.insert(name.as_str()) {
+                bail!("duplicate command name `{name}` in .cli-flags.toml");
+            }
+            for alias in &spec.aliases {
+                if !names.insert(alias.as_str()) {
+                    bail!("command alias `{alias}` collides with another command name/alias");
+                }
+            }
+            if let Some(env) = &spec.env {
+                if flag_envs.contains(env.as_str()) {
+                    bail!("command `{name}` env `{env}` collides with a flag env");
+                }
+                if !cmd_envs.insert(env.as_str()) {
+                    bail!("command `{name}` env `{env}` collides with another command env");
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Parse `argv` (excluding program name and subcommand) into an env-override
@@ -317,7 +400,7 @@ aliases = ["jobs"]
 type = "integer"
 "#;
         let parsed: CliFlagsFile = toml::from_str(text).unwrap();
-        FlagConfig { flags: parsed.flags }
+        FlagConfig { flags: parsed.flags, commands: parsed.commands, parse: parsed.parse }
     }
 
     fn args(list: &[&str]) -> Vec<String> {
@@ -422,5 +505,47 @@ mod contract_tests {
         let r = Resolved::new(&config, overrides);
         assert_eq!(r.get_first(&["TARGET_DATABASE_URL", "DATABASE_URL"]).as_deref(), Some("postgres://t"));
         assert_eq!(r.get_first(&["NOPE_XYZ_123", "DATABASE_URL"]).as_deref(), Some("postgres://d"));
+    }
+
+    #[test]
+    fn embedded_config_declares_every_dispatched_command() {
+        // The commands flags-2-env knows about must match exactly the set
+        // `dispatch` (main.rs) handles, so completions/help and the executable
+        // can never drift.
+        let config = load_config().unwrap();
+        let mut declared: Vec<&str> = config.commands.keys().map(String::as_str).collect();
+        declared.sort_unstable();
+        assert_eq!(declared, ["apply", "bootstrap", "diff", "dump", "review", "verify"]);
+        assert_eq!(config.command_env_key(), Some("FLAGS2ENV_COMMAND"));
+        for name in &declared {
+            assert!(config.command_marker_env(name).is_some(), "command `{name}` has no marker env");
+        }
+    }
+
+    #[test]
+    fn command_tokens_canonicalize_and_reject_unknowns() {
+        let config = load_config().unwrap();
+        assert_eq!(config.canonical_command("apply").as_deref(), Some("apply"));
+        assert_eq!(config.canonical_command("verify").as_deref(), Some("verify"));
+        assert_eq!(config.canonical_command("not-a-command"), None);
+    }
+
+    #[test]
+    fn command_audit_rejects_env_collision_with_a_flag() {
+        // A command env colliding with a flag env is a hard error (mirrors
+        // `flags2env audit`), so the contract can't ship an ambiguous key.
+        let text = "[flags.source]\nenv = \"SOURCE_DATABASE_URL\"\n\n[commands.diff]\nenv = \"SOURCE_DATABASE_URL\"\n";
+        let parsed: CliFlagsFile = toml::from_str(text).unwrap();
+        let config = FlagConfig { flags: parsed.flags, commands: parsed.commands, parse: parsed.parse };
+        let err = config.audit_commands().unwrap_err().to_string();
+        assert!(err.contains("collides with a flag env"), "{err}");
+    }
+
+    #[test]
+    fn command_audit_rejects_duplicate_aliases() {
+        let text = "[commands.diff]\nenv = \"DPM_CMD_DIFF\"\naliases = [\"d\"]\n\n[commands.dump]\nenv = \"DPM_CMD_DUMP\"\naliases = [\"d\"]\n";
+        let parsed: CliFlagsFile = toml::from_str(text).unwrap();
+        let config = FlagConfig { flags: parsed.flags, commands: parsed.commands, parse: parsed.parse };
+        assert!(config.audit_commands().is_err());
     }
 }

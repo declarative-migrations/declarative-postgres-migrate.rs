@@ -80,12 +80,16 @@ fn main() {
 
 fn run() -> Result<i32> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let (command, rest) = match argv.split_first() {
+    let (raw_command, rest) = match argv.split_first() {
         Some((c, rest)) if !c.starts_with('-') => (c.clone(), rest.to_vec()),
         _ => ("help".to_string(), argv.clone()),
     };
 
     let config = flagenv::load_config()?;
+    // Canonicalize the command token against the flags-2-env command contract
+    // (resolves any declared command aliases). Non-command tokens like "help"
+    // pass through unchanged for the version/help and unknown-command paths.
+    let command = config.canonical_command(&raw_command).unwrap_or(raw_command);
     if command == "version" || rest.iter().any(|a| a == "--version") {
         println!("dpm {}", env!("CARGO_PKG_VERSION"));
         return Ok(0);
@@ -97,9 +101,20 @@ fn run() -> Result<i32> {
         return Ok(0);
     }
 
-    let (overrides, positionals) = flagenv::parse(&config, &rest)?;
+    let (mut overrides, positionals) = flagenv::parse(&config, &rest)?;
     if !positionals.is_empty() {
         bail!("unexpected positional arguments: {positionals:?}");
+    }
+    // Publish the resolved command through the flags-2-env command env (and its
+    // per-command marker), so config reads and any child processes can switch
+    // on FLAGS2ENV_COMMAND without re-parsing argv.
+    if config.commands.contains_key(&command) {
+        if let Some(key) = config.command_env_key() {
+            overrides.insert(key.to_string(), command.clone());
+        }
+        if let Some(marker) = config.command_marker_env(&command) {
+            overrides.insert(marker.to_string(), "true".to_string());
+        }
     }
     let resolved = Resolved::new(&config, overrides);
 

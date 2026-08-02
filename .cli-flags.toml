@@ -9,6 +9,40 @@ columns = ["options", "env", "type", "default", "description"]
 [parse]
 stop_at_first_positional = false
 positionals_env = "FLAGS2ENV_POSITIONALS"
+# flags-2-env resolves the selected command path into this env var, so the
+# native core, generated shell completions, and `flags2env audit` are all
+# subcommand-aware and dispatch is a plain switch on FLAGS2ENV_COMMAND.
+command_env = "FLAGS2ENV_COMMAND"
+
+# dpm's subcommands, declared for flags-2-env (github.com/ORESoftware/flags-2-env).
+# Command scoping of flags (e.g. the destructive-* flags only under `apply`,
+# the ai-* flags only under `review`) is the tracked follow-up; today every
+# flag is global so both the native core and the built-in fallback parser
+# resolve them identically. Each command sets its marker env to "true" when it
+# is on the selected path.
+[commands.diff]
+env = "DPM_CMD_DIFF"
+help = "Generate SQL that converges the target onto the source (stdout or --out)."
+
+[commands.apply]
+env = "DPM_CMD_APPLY"
+help = "Generate and execute the migration against the target database."
+
+[commands.dump]
+env = "DPM_CMD_DUMP"
+help = "Snapshot a database catalog to JSON (feed to later diffs, CI, or AI review)."
+
+[commands.bootstrap]
+env = "DPM_CMD_BOOTSTRAP"
+help = "Emit the full DDL for a source (equivalent to diffing against an empty database)."
+
+[commands.verify]
+env = "DPM_CMD_VERIFY"
+help = "Rehearse the migration on a shadow replica of the target and prove convergence."
+
+[commands.review]
+env = "DPM_CMD_REVIEW"
+help = "Generate the migration and have an AI tool review it (claude/codex/chatgpt/gemini)."
 
 [flags.source]
 env = "SOURCE_DATABASE_URL"
