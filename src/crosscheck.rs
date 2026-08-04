@@ -605,38 +605,40 @@ pub fn run_liquibase(bin: &str, migrated_url: &str, source_url: &str) -> CheckRe
         )
     };
     let command = format!(
-        "{bin} --show-banner=false diff          --url {url} --username {user} --password {password}          --reference-url {reference_url} --reference-username {reference_user}          --reference-password {reference_password}",
+        "{bin} --show-banner=false diff \
+         --url {url} --username {user} \
+         --reference-url {reference_url} --reference-username {reference_user}",
         bin = shell_quote(bin),
         url = shell_quote(&jdbc(&a)),
         user = shell_quote(&a.user),
-        password = shell_quote(a.password.as_deref().unwrap_or("")),
         reference_url = shell_quote(&jdbc(&b)),
         reference_user = shell_quote(&b.user),
-        reference_password = shell_quote(b.password.as_deref().unwrap_or("")),
     );
-    let reported_command = format!(
-        "{bin} --show-banner=false diff          --url {url} --username {user} --password {password}          --reference-url {reference_url} --reference-username {reference_user}          --reference-password {reference_password}",
-        bin = shell_quote(bin),
-        url = shell_quote(&jdbc(&a)),
-        user = shell_quote(&a.user),
-        password = shell_quote(if a.password.is_some() { "***" } else { "" }),
-        reference_url = shell_quote(&jdbc(&b)),
-        reference_user = shell_quote(&b.user),
-        reference_password =
-            shell_quote(if b.password.is_some() { "***" } else { "" }),
-    );
+    let mut env = Vec::new();
+    if let Some(password) = &a.password {
+        env.push((
+            "LIQUIBASE_COMMAND_PASSWORD".to_string(),
+            password.to_string(),
+        ));
+    }
+    if let Some(password) = &b.password {
+        env.push((
+            "LIQUIBASE_COMMAND_REFERENCE_PASSWORD".to_string(),
+            password.to_string(),
+        ));
+    }
     let secrets: Vec<&str> = [a.password.as_deref(), b.password.as_deref()]
         .into_iter()
         .flatten()
         .collect();
-    match run_shell(&command, &[]) {
+    match run_shell(&command, &env) {
         Ok((success, stdout, stderr)) => {
             let stdout = redact_secrets(&stdout, &secrets);
             let stderr = redact_secrets(&stderr, &secrets);
             if !success {
                 return CheckReport::error(
                     name,
-                    reported_command,
+                    command,
                     format!(
                         "liquibase failed: {}",
                         if stderr.trim().is_empty() {
@@ -650,16 +652,13 @@ pub fn run_liquibase(bin: &str, migrated_url: &str, source_url: &str) -> CheckRe
             let violations = liquibase_violations(&stdout);
             CheckReport {
                 name: name.into(),
-                command: reported_command,
+                command,
                 agreed: violations.is_empty(),
-                output: violations.join(
-                    "
-",
-                ),
+                output: violations.join("\n"),
                 error: None,
             }
         }
-        Err(error) => CheckReport::error(name, reported_command, format!("{error:#}")),
+        Err(error) => CheckReport::error(name, command, format!("{error:#}")),
     }
 }
 
@@ -866,30 +865,27 @@ pub fn run_flyway(bin: &str, replica_url: &str, migration_sql: &str) -> CheckRep
         parts.host, parts.port, parts.dbname, parts.sslmode
     );
     let command = format!(
-        "{bin} -url={url} -user={user} -password={password}          -locations=filesystem:{directory} -mixed=true -baselineOnMigrate=true          -validateMigrationNaming=true migrate",
+        "{bin} -url={url} -user={user} \
+         -locations=filesystem:{directory} -mixed=true -baselineOnMigrate=true \
+         -validateMigrationNaming=true migrate",
         bin = shell_quote(bin),
         url = shell_quote(&jdbc),
         user = shell_quote(&parts.user),
-        password = shell_quote(parts.password.as_deref().unwrap_or("")),
         directory = shell_quote(&dir.path().display().to_string()),
     );
-    let reported_command = format!(
-        "{bin} -url={url} -user={user} -password={password}          -locations=filesystem:{directory} -mixed=true -baselineOnMigrate=true          -validateMigrationNaming=true migrate",
-        bin = shell_quote(bin),
-        url = shell_quote(&jdbc),
-        user = shell_quote(&parts.user),
-        password = shell_quote(if parts.password.is_some() { "***" } else { "" }),
-        directory = shell_quote(&dir.path().display().to_string()),
-    );
+    let mut env = Vec::new();
+    if let Some(password) = &parts.password {
+        env.push(("FLYWAY_PASSWORD".to_string(), password.to_string()));
+    }
     let secrets: Vec<&str> = parts.password.as_deref().into_iter().collect();
-    match run_shell(&command, &[]) {
+    match run_shell(&command, &env) {
         Ok((success, stdout, stderr)) => {
             let stdout = redact_secrets(&stdout, &secrets);
             let stderr = redact_secrets(&stderr, &secrets);
             if success {
                 CheckReport {
                     name: name.into(),
-                    command: reported_command,
+                    command,
                     agreed: true,
                     output: String::new(),
                     error: None,
@@ -904,20 +900,17 @@ pub fn run_flyway(bin: &str, replica_url: &str, migration_sql: &str) -> CheckRep
                     .into_iter()
                     .rev()
                     .collect::<Vec<_>>()
-                    .join(
-                        "
-",
-                    );
+                    .join("\n");
                 CheckReport {
                     name: name.into(),
-                    command: reported_command,
+                    command,
                     agreed: false,
                     output: tail,
                     error: None,
                 }
             }
         }
-        Err(error) => CheckReport::error(name, reported_command, format!("{error:#}")),
+        Err(error) => CheckReport::error(name, command, format!("{error:#}")),
     }
 }
 
@@ -1130,6 +1123,52 @@ mod tests {
         );
         assert!(!r.agreed);
         assert!(r.output.contains("alter table"));
+    }
+
+    #[test]
+    fn liquibase_and_flyway_receive_passwords_only_through_environment() {
+        let directory = ScratchDir::create("credential-stubs").unwrap();
+        let liquibase = directory.path().join("liquibase-stub");
+        let flyway = directory.path().join("flyway-stub");
+        std::fs::write(
+            &liquibase,
+            "#!/bin/sh\n\
+             test \"$LIQUIBASE_COMMAND_PASSWORD\" = \"target-secret\" || exit 41\n\
+             test \"$LIQUIBASE_COMMAND_REFERENCE_PASSWORD\" = \"source-secret\" || exit 42\n\
+             printf 'Missing Table(s): NONE\\nUnexpected Table(s): NONE\\nChanged Table(s): NONE\\n'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &flyway,
+            "#!/bin/sh\n\
+             test \"$FLYWAY_PASSWORD\" = \"target-secret\" || exit 43\n\
+             exit 0\n",
+        )
+        .unwrap();
+        for executable in [&liquibase, &flyway] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let liquibase_report = run_liquibase(
+            liquibase.to_str().unwrap(),
+            "postgres://target:target-secret@db/target",
+            "postgres://source:source-secret@db/source",
+        );
+        assert!(liquibase_report.agreed, "{liquibase_report:?}");
+        assert!(!liquibase_report.command.contains("target-secret"));
+        assert!(!liquibase_report.command.contains("source-secret"));
+        assert!(!liquibase_report.command.contains("--password"));
+        assert!(!liquibase_report.command.contains("--reference-password"));
+
+        let flyway_report = run_flyway(
+            flyway.to_str().unwrap(),
+            "postgres://target:target-secret@db/target",
+            "SELECT 1;",
+        );
+        assert!(flyway_report.agreed, "{flyway_report:?}");
+        assert!(!flyway_report.command.contains("target-secret"));
+        assert!(!flyway_report.command.contains("-password"));
     }
 
     #[test]
