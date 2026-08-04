@@ -1,0 +1,222 @@
+name: agent-ai-temp-hardening
+
+on:
+  push:
+    branches:
+      - agent/harden-apply-convergence-20260804
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Harden AI review payload files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("src/ai.rs")
+          text = path.read_text(encoding="utf-8")
+          if "struct ReviewPayloadFile" in text:
+              print("secure payload file implementation already present")
+              raise SystemExit(0)
+
+          import_anchor = "use serde_json::json;\n"
+          imports = '''use serde_json::json;
+          use std::{
+              fs::OpenOptions,
+              io::Write,
+              path::PathBuf,
+              sync::atomic::{AtomicU64, Ordering},
+          };
+          '''
+          if text.count(import_anchor) != 1:
+              raise SystemExit("src/ai.rs: import anchor changed")
+          text = text.replace(import_anchor, imports, 1)
+
+          marker = "fn run_review_cli(\n"
+          helpers = '''static REVIEW_PAYLOAD_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+          struct ReviewPayloadFile {
+              path: PathBuf,
+          }
+
+          impl ReviewPayloadFile {
+              fn create(payload: &str, tag: usize) -> Result<Self> {
+                  let directory = std::env::temp_dir();
+                  for _ in 0..64 {
+                      let counter = REVIEW_PAYLOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
+                      let nonce = std::time::SystemTime::now()
+                          .duration_since(std::time::UNIX_EPOCH)
+                          .map(|duration| duration.as_nanos())
+                          .unwrap_or_default();
+                      let path = directory.join(format!(
+                          ".dpm-ai-review-{:x}-{tag:x}-{nonce:x}-{counter:x}.md",
+                          std::process::id()
+                      ));
+
+                      let mut options = OpenOptions::new();
+                      options.write(true).create_new(true);
+                      #[cfg(unix)]
+                      {
+                          use std::os::unix::fs::OpenOptionsExt;
+                          options.mode(0o600);
+                      }
+
+                      match options.open(&path) {
+                          Ok(mut file) => {
+                              let write_result = (|| -> std::io::Result<()> {
+                                  file.write_all(payload.as_bytes())?;
+                                  file.flush()
+                              })();
+                              if let Err(error) = write_result {
+                                  let _ = std::fs::remove_file(&path);
+                                  return Err(error).with_context(|| {
+                                      format!("writing secure AI review payload {}", path.display())
+                                  });
+                              }
+                              return Ok(Self { path });
+                          }
+                          Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                              continue;
+                          }
+                          Err(error) => {
+                              return Err(error).with_context(|| {
+                                  format!("creating secure AI review payload {}", path.display())
+                              });
+                          }
+                      }
+                  }
+                  bail!("unable to allocate a unique secure AI review payload file")
+              }
+          }
+
+          impl Drop for ReviewPayloadFile {
+              fn drop(&mut self) {
+                  let _ = std::fs::remove_file(&self.path);
+              }
+          }
+
+          fn shell_quote(value: &str) -> String {
+              format!("'{}'", value.replace('\\'', "'\\\\''"))
+          }
+
+          '''
+          if text.count(marker) != 1:
+              raise SystemExit("src/ai.rs: CLI function marker changed")
+          text = text.replace(marker, helpers + marker, 1)
+
+          function_pattern = re.compile(
+              r"fn run_review_cli\(.*?\n\}\n\n#\[cfg\(test\)\]",
+              re.DOTALL,
+          )
+          replacement = '''fn run_review_cli(
+              tool: &str,
+              custom_cmd: Option<&str>,
+              payload: &str,
+              tag: usize,
+              verbose: bool,
+          ) -> Result<ReviewOutcome> {
+              let template = tool_command_template(tool, custom_cmd)?;
+              let payload_file = ReviewPayloadFile::create(payload, tag)?;
+              let file_argument = shell_quote(payload_file.path.to_string_lossy().as_ref());
+              let command = template.replace("{file}", &file_argument);
+              if verbose {
+                  eprintln!("dpm: ai review via CLI: {command}");
+              }
+              // The reviewer is an independent non-interactive call; strip Claude
+              // Code's nesting guard so `dpm review` works when dpm itself is being
+              // driven from inside a Claude Code session (the guard exists for
+              // interactive sessions sharing runtime resources, and its own error
+              // message documents this bypass).
+              let output = std::process::Command::new("sh")
+                  .arg("-c")
+                  .arg(&command)
+                  .env_remove("CLAUDECODE")
+                  .output()
+                  .with_context(|| format!("running AI reviewer: {command}"))?;
+
+              let transcript = format!(
+                  "{}{}",
+                  String::from_utf8_lossy(&output.stdout),
+                  String::from_utf8_lossy(&output.stderr)
+              );
+              if !output.status.success() {
+                  return Ok(ReviewOutcome {
+                      approved: false,
+                      verdict: Some(format!("reviewer exited {}", output.status)),
+                      transcript,
+                      command,
+                  });
+              }
+              Ok(outcome_from_transcript(transcript, command))
+          }
+
+          #[cfg(test)]'''
+          text, count = function_pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f"src/ai.rs: CLI function match count={count}")
+
+          test_marker = '''    #[test]
+              fn tool_templates() {
+          '''
+          tests = r'''    #[test]
+              fn shell_quotes_payload_paths() {
+                  assert_eq!(shell_quote("/tmp/a b'c"), "'/tmp/a b'\\''c'");
+              }
+
+              #[test]
+              fn review_payload_file_is_private_and_removed() {
+                  let path;
+                  {
+                      let payload_file = ReviewPayloadFile::create("private schema", 17).unwrap();
+                      path = payload_file.path.clone();
+                      assert_eq!(std::fs::read_to_string(&path).unwrap(), "private schema");
+                      #[cfg(unix)]
+                      {
+                          use std::os::unix::fs::PermissionsExt;
+                          let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                          assert_eq!(mode, 0o600);
+                      }
+                  }
+                  assert!(!path.exists(), "payload file should be removed on drop");
+              }
+
+          '''
+          if text.count(test_marker) != 1:
+              raise SystemExit("src/ai.rs: test insertion anchor changed")
+          text = text.replace(test_marker, tests + test_marker, 1)
+          path.write_text(text, encoding="utf-8")
+          PY
+
+          rustfmt --edition 2021 src/ai.rs
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --lib
+          git diff --check
+      - name: Commit and push source-only hardening
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- src/ai.rs; then
+            echo "No source change to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/ai.rs
+          git commit -m "Secure AI review payload files"
+          git push origin HEAD:agent/harden-apply-convergence-20260804
