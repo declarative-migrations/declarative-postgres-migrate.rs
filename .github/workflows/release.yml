@@ -68,9 +68,32 @@ jobs:
           test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$(git rev-parse HEAD)"
           cargo publish --dry-run --locked
 
+  prepare-release:
+    name: prepare GitHub release
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Create a draft release when absent
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --draft \
+              --title "dpm $RELEASE_TAG" \
+              --notes "declarative-postgres-migrate $RELEASE_TAG"
+          fi
+
   build:
     name: ${{ matrix.target }}
-    needs: preflight
+    needs: [preflight, prepare-release]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     permissions:
@@ -135,23 +158,34 @@ jobs:
         uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
         with:
           subject-path: ${{ env.ASSET }}
-      - name: Upload to release
+      - name: Upload asset to the prepared release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
-        run: |
-          set -euo pipefail
-          gh release view "$RELEASE_TAG" >/dev/null 2>&1 \
-            || gh release create "$RELEASE_TAG" \
-              --title "dpm $RELEASE_TAG" \
-              --notes "declarative-postgres-migrate $RELEASE_TAG"
-          gh release upload "$RELEASE_TAG" "$ASSET" "$ASSET.sha256" --clobber
+        run: gh release upload "$RELEASE_TAG" "$ASSET" "$ASSET.sha256" --clobber
+
+  publish-release:
+    name: publish GitHub release
+    needs: [preflight, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the complete release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: gh release edit "$RELEASE_TAG" --draft=false
 
   publish-crate:
     name: crates.io publish
     if: github.event_name == 'push'
-    needs: [preflight, build]
+    needs: [preflight, build, publish-release]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
