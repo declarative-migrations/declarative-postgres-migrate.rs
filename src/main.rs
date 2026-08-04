@@ -179,14 +179,20 @@ fn side_spec(
         }
         return Ok(SideSpec::JsonPath(path));
     }
-    let raw = r
-        .get_first(generic_keys)
-        .with_context(|| format!("no {side}: pass --{side} (or the matching env var; run `dpm help`)"))?;
+    let raw = r.get_first(generic_keys).with_context(|| {
+        format!("no {side}: pass --{side} (or the matching env var; run `dpm help`)")
+    })?;
     SideSpec::parse(&raw)
 }
 
 fn source_spec(r: &Resolved) -> Result<SideSpec> {
-    side_spec(r, "SOURCE_SQL_FILE", "SOURCE_CATALOG_JSON", &["SOURCE_DATABASE_URL"], "source")
+    side_spec(
+        r,
+        "SOURCE_SQL_FILE",
+        "SOURCE_CATALOG_JSON",
+        &["SOURCE_DATABASE_URL"],
+        "source",
+    )
 }
 
 fn target_spec(r: &Resolved) -> Result<SideSpec> {
@@ -258,20 +264,33 @@ async fn load_sides(r: &Resolved, bootstrap: bool) -> Result<DiffInputs> {
             target_cat.database_flavor.label()
         );
     }
-    let mut inputs = DiffInputs { source_cat, target_cat, source_desc: source.describe(), target_desc };
+    let mut inputs = DiffInputs {
+        source_cat,
+        target_cat,
+        source_desc: source.describe(),
+        target_desc,
+    };
     // With a shadow server available, normalize CHECK and index defs to their
     // re-parse fixed point so string comparison is exact regardless of whether
     // a side was built from original SQL or from dpm's own emitted deparse.
     if let Some(shadow) = &ctx.shadow_url {
-        dpm::canonicalize::canonicalize_defs(&mut [&mut inputs.source_cat, &mut inputs.target_cat], shadow, ctx.verbose)
-            .await
-            .context("canonicalizing deparsed definitions on the shadow server")?;
+        dpm::canonicalize::canonicalize_defs(
+            &mut [&mut inputs.source_cat, &mut inputs.target_cat],
+            shadow,
+            ctx.verbose,
+        )
+        .await
+        .context("canonicalizing deparsed definitions on the shadow server")?;
     }
     Ok(inputs)
 }
 
 /// Migration script + optional FK-index advisory block.
-fn render(r: &Resolved, inputs: &DiffInputs, allow_destructive_sql: bool) -> (Plan, Script, String) {
+fn render(
+    r: &Resolved,
+    inputs: &DiffInputs,
+    allow_destructive_sql: bool,
+) -> (Plan, Script, String) {
     let plan = diff(&inputs.source_cat, &inputs.target_cat);
     let script = emit(
         &plan,
@@ -309,7 +328,8 @@ async fn maybe_ai_review(
     }
     let tool = r.get("DPM_AI_TOOL").unwrap_or_else(|| "claude".to_string());
     let custom = r.get("DPM_AI_CMD");
-    let transport = ai::Transport::parse(&r.get("DPM_AI_TRANSPORT").unwrap_or_else(|| "auto".into()))?;
+    let transport =
+        ai::Transport::parse(&r.get("DPM_AI_TRANSPORT").unwrap_or_else(|| "auto".into()))?;
     let model = r.get("DPM_AI_MODEL");
     let req = ReviewRequest {
         sql: script.sql.clone(),
@@ -336,7 +356,9 @@ async fn maybe_ai_review(
     match (&outcome.approved, &outcome.verdict) {
         (true, Some(v)) => eprintln!("dpm: ai review: {v}"),
         (_, Some(v)) => eprintln!("dpm: ai review REJECTED: {v}"),
-        (_, None) => eprintln!("dpm: ai review returned no parseable verdict (treated as rejection)"),
+        (_, None) => {
+            eprintln!("dpm: ai review returned no parseable verdict (treated as rejection)")
+        }
     }
     Ok(Some(outcome))
 }
@@ -389,7 +411,10 @@ async fn cmd_diff(r: &Resolved, bootstrap: bool) -> Result<i32> {
 async fn cmd_apply(r: &Resolved) -> Result<i32> {
     let target = target_spec(r)?;
     let SideSpec::Url(target_url) = &target else {
-        bail!("apply needs a live --target database URL (got {})", target.describe());
+        bail!(
+            "apply needs a live --target database URL (got {})",
+            target.describe()
+        );
     };
     let inputs = load_sides(r, false).await?;
     let policy = destructive_policy(r);
@@ -429,7 +454,9 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
     if let Some(outcome) = maybe_ai_review(r, &plan, &script, &inputs, policy, false).await? {
         if !outcome.approved {
             if ai_strict(r) {
-                eprintln!("dpm: aborting apply (AI reviewer rejected; use --ai-strict=false to override)");
+                eprintln!(
+                    "dpm: aborting apply (AI reviewer rejected; use --ai-strict=false to override)"
+                );
                 eprintln!("--- reviewer transcript ---\n{}", outcome.transcript);
                 return Ok(4);
             }
@@ -465,19 +492,40 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
     let opts = introspect_options(r);
     let mut migrated = dpm::introspect::introspect_url(target_url, &opts).await?;
     if let Some(shadow) = r.get("SHADOW_DATABASE_URL") {
-        dpm::canonicalize::canonicalize_defs(&mut [&mut migrated], &shadow, r.get_bool("DPM_VERBOSE"))
-            .await
-            .context("canonicalizing deparsed definitions on the shadow server")?;
+        dpm::canonicalize::canonicalize_defs(
+            &mut [&mut migrated],
+            &shadow,
+            r.get_bool("DPM_VERBOSE"),
+        )
+        .await
+        .context("canonicalizing deparsed definitions on the shadow server")?;
     }
     let residual = diff(&inputs.source_cat, &migrated);
-    let residual_real: Vec<_> = residual.changes.iter().filter(|c| !c.is_manual()).collect();
-    if residual_real.is_empty() {
+    let converged = residual.is_empty();
+    let residual_sql = if converged {
+        None
+    } else {
+        Some(
+            emit(
+                &residual,
+                &EmitOptions {
+                    database_flavor: inputs.source_cat.database_flavor,
+                    ..Default::default()
+                },
+            )
+            .sql,
+        )
+    };
+    if converged {
         eprintln!("dpm: converged — target now matches the source");
     } else {
         eprintln!(
-            "dpm: warning: {} change(s) remain after apply (gated destructive or manual items)",
-            residual_real.len()
+            "dpm: NOT CONVERGED — {} change(s) remain after apply",
+            residual.changes.len()
         );
+        if let Some(sql) = &residual_sql {
+            eprintln!("--- residual diff ---\n{sql}");
+        }
     }
 
     // Optional independent cross-checks of the freshly migrated target.
@@ -521,16 +569,16 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
             },
         };
         if let Some(compare_url) = compare_url {
-            let checks = dpm::crosscheck::run_diff_checks(&selection, &check_bins(r), target_url, &compare_url);
+            let checks = dpm::crosscheck::run_diff_checks(
+                &selection,
+                &check_bins(r),
+                target_url,
+                &compare_url,
+            );
             report_checks(&checks);
-            let scan_ok = maybe_ai_discrepancy_scan(
-                r,
-                residual_real.is_empty(),
-                None,
-                &checks,
-            )
-            .await?
-            .unwrap_or(true);
+            let scan_ok = maybe_ai_discrepancy_scan(r, converged, residual_sql.as_deref(), &checks)
+                .await?
+                .unwrap_or(true);
             if let Some(db) = source_replica {
                 db.drop_db().await;
             }
@@ -542,7 +590,7 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
             }
         }
     }
-    Ok(0)
+    Ok(if converged { 0 } else { 3 })
 }
 
 async fn cmd_dump(r: &Resolved) -> Result<i32> {
@@ -606,7 +654,8 @@ async fn maybe_ai_discrepancy_scan(
     }
     let tool = r.get("DPM_AI_TOOL").unwrap_or_else(|| "claude".to_string());
     let custom = r.get("DPM_AI_CMD");
-    let transport = ai::Transport::parse(&r.get("DPM_AI_TRANSPORT").unwrap_or_else(|| "auto".into()))?;
+    let transport =
+        ai::Transport::parse(&r.get("DPM_AI_TRANSPORT").unwrap_or_else(|| "auto".into()))?;
     let model = r.get("DPM_AI_MODEL");
     let reports: Vec<(String, bool, String, Option<String>)> = checks
         .iter()
@@ -614,11 +663,24 @@ async fn maybe_ai_discrepancy_scan(
         .collect();
     let payload = ai::build_discrepancy_payload(converged, residual_sql, &reports);
     eprintln!("dpm: ai discrepancy scan via {tool} ...");
-    let outcome = ai::run_payload(&tool, custom.as_deref(), transport, model.as_deref(), &payload, r.get_bool("DPM_VERBOSE")).await?;
+    let outcome = ai::run_payload(
+        &tool,
+        custom.as_deref(),
+        transport,
+        model.as_deref(),
+        &payload,
+        r.get_bool("DPM_VERBOSE"),
+    )
+    .await?;
     match (&outcome.approved, &outcome.verdict) {
         (true, Some(v)) => eprintln!("dpm: ai discrepancy scan: {v}"),
-        (_, Some(v)) => eprintln!("dpm: ai discrepancy scan REJECTED: {v}\n{}", outcome.transcript),
-        (_, None) => eprintln!("dpm: ai discrepancy scan returned no parseable verdict (treated as rejection)"),
+        (_, Some(v)) => eprintln!(
+            "dpm: ai discrepancy scan REJECTED: {v}\n{}",
+            outcome.transcript
+        ),
+        (_, None) => eprintln!(
+            "dpm: ai discrepancy scan returned no parseable verdict (treated as rejection)"
+        ),
     }
     Ok(Some(outcome.approved))
 }
@@ -679,8 +741,13 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
 
     // AI discrepancy scan over the cross-check reports.
     let mut ai_ok = true;
-    if let Some(approved) =
-        maybe_ai_discrepancy_scan(r, outcome.converged, outcome.residual_sql.as_deref(), &outcome.checks).await?
+    if let Some(approved) = maybe_ai_discrepancy_scan(
+        r,
+        outcome.converged,
+        outcome.residual_sql.as_deref(),
+        &outcome.checks,
+    )
+    .await?
     {
         ai_ok &= approved || !ai_strict(r);
     }
@@ -705,14 +772,21 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
     if !ai_ok {
         return Ok(4);
     }
-    Ok(if outcome.converged && outcome.all_checks_agreed() { 0 } else { 3 })
+    Ok(if outcome.converged && outcome.all_checks_agreed() {
+        0
+    } else {
+        3
+    })
 }
 
 fn report_checks(checks: &[dpm::crosscheck::CheckReport]) {
     for c in checks {
         match (&c.error, c.agreed) {
             (Some(err), _) => eprintln!("dpm: cross-check {} ERROR: {err}", c.name),
-            (None, true) => eprintln!("dpm: cross-check {} agreed (no remaining differences)", c.name),
+            (None, true) => eprintln!(
+                "dpm: cross-check {} agreed (no remaining differences)",
+                c.name
+            ),
             (None, false) => eprintln!(
                 "dpm: cross-check {} DISAGREED — it still sees differences:\n{}",
                 c.name, c.output
@@ -732,7 +806,8 @@ async fn cmd_review(r: &Resolved) -> Result<i32> {
     }
     summarize(&script);
 
-    let outcome = maybe_ai_review(r, &plan, &script, &inputs, policy, true).await?
+    let outcome = maybe_ai_review(r, &plan, &script, &inputs, policy, true)
+        .await?
         .expect("review command forces AI review");
     println!("{}", outcome.transcript.trim_end());
     if outcome.approved {
