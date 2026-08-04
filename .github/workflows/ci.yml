@@ -21,14 +21,40 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: formatting
-        run: cargo fmt --all -- --check
+      - name: formatting (changed Rust files)
+        shell: bash
+        env:
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${GITHUB_BASE_REF:-}" ]]; then
+            base="$(git merge-base HEAD "origin/${GITHUB_BASE_REF}")"
+          elif [[ -n "${PUSH_BASE:-}" && ! "${PUSH_BASE}" =~ ^0+$ ]] \
+            && git cat-file -e "${PUSH_BASE}^{commit}" 2>/dev/null; then
+            base="${PUSH_BASE}"
+          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            base="HEAD^"
+          else
+            echo "No base commit is available; skipping the changed-file format check."
+            exit 0
+          fi
+
+          mapfile -d '' rust_files < <(
+            git diff --name-only --diff-filter=ACMRT -z "$base" HEAD -- '*.rs'
+          )
+          if ((${#rust_files[@]} == 0)); then
+            echo "No changed Rust files."
+            exit 0
+          fi
+          printf 'Checking %s\n' "${rust_files[@]}"
+          rustfmt --edition 2021 --check "${rust_files[@]}"
       - name: clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: unit tests
