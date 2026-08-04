@@ -45,42 +45,67 @@ jobs:
 
           path = Path("src/verify.rs")
           text = path.read_text(encoding="utf-8")
-          marker = '''                checks.push(CheckReport {
-                      name: "external".into(),
-          '''
-          start = text.find(marker)
-          if start < 0:
-              raise SystemExit("src/verify.rs: external CheckReport start not found")
-          end_marker = "                });\n"
-          end = text.find(end_marker, start)
-          if end < 0:
-              raise SystemExit("src/verify.rs: external CheckReport end not found")
-          end += len(end_marker)
-          old = text[start:end]
-          if "error: if output.status.success()" not in old:
-              raise SystemExit("src/verify.rs: external CheckReport no longer has the expected classification")
-          new = '''                let agreed = output.status.success() && stdout.is_empty();
-                  let detail = if !stdout.is_empty() {
-                      stdout
-                  } else if !stderr.is_empty() {
-                      stderr
-                  } else if output.status.success() {
-                      String::new()
-                  } else {
-                      format!("external check exited {}", output.status)
-                  };
-                  checks.push(CheckReport {
-                      name: "external".into(),
-                      command: reported_command,
-                      agreed,
-                      output: detail,
-                      // A checker that ran and returned non-zero is a semantic
-                      // disagreement. Only failure to spawn the checker is an
-                      // infrastructure error (handled by `with_context` above).
-                      error: None,
-                  });
-          '''
-          path.write_text(text[:start] + new + text[end:], encoding="utf-8")
+          old_classification = "error: if output.status.success()"
+          fixed_marker = "let agreed = output.status.success() && stdout.is_empty();"
+
+          if old_classification not in text:
+              if fixed_marker in text:
+                  print("external-check disagreement semantics already fixed")
+              else:
+                  raise SystemExit(
+                      "src/verify.rs: neither the old nor fixed external-check block was found"
+                  )
+          else:
+              needle = 'name: "external".into(),'
+              name_pos = text.index(needle)
+              line_start = text.rfind("\n", 0, name_pos) + 1
+              name_indent = text[line_start:name_pos]
+              if not name_indent or name_indent.strip():
+                  raise SystemExit("src/verify.rs: could not infer external report indentation")
+              if not name_indent.endswith("    "):
+                  raise SystemExit("src/verify.rs: external report is not four-space indented")
+
+              block_indent = name_indent[:-4]
+              start_marker = block_indent + "checks.push(CheckReport {"
+              start = text.rfind(start_marker, 0, name_pos)
+              if start < 0:
+                  raise SystemExit("src/verify.rs: external CheckReport start not found")
+              end_marker = "\n" + block_indent + "});\n"
+              end = text.find(end_marker, name_pos)
+              if end < 0:
+                  raise SystemExit("src/verify.rs: external CheckReport end not found")
+              end += len(end_marker)
+
+              old = text[start:end]
+              if old_classification not in old:
+                  raise SystemExit(
+                      "src/verify.rs: located external report lacks the old classification"
+                  )
+
+              lines = [
+                  "let agreed = output.status.success() && stdout.is_empty();",
+                  "let detail = if !stdout.is_empty() {",
+                  "    stdout",
+                  "} else if !stderr.is_empty() {",
+                  "    stderr",
+                  "} else if output.status.success() {",
+                  "    String::new()",
+                  "} else {",
+                  '    format!("external check exited {}", output.status)',
+                  "};",
+                  "checks.push(CheckReport {",
+                  '    name: "external".into(),',
+                  "    command: reported_command,",
+                  "    agreed,",
+                  "    output: detail,",
+                  "    // A checker that ran and returned non-zero is a semantic",
+                  "    // disagreement. Only failure to spawn the checker is an",
+                  "    // infrastructure error (handled by `with_context` above).",
+                  "    error: None,",
+                  "});",
+              ]
+              replacement = "\n".join(block_indent + line for line in lines) + "\n"
+              path.write_text(text[:start] + replacement + text[end:], encoding="utf-8")
           PY
 
           rustfmt --edition 2021 src/verify.rs
