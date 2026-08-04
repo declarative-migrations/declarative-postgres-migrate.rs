@@ -83,7 +83,11 @@ pub async fn verify(p: VerifyParams<'_>) -> Result<VerifyOutcome> {
         p.verbose,
     )
     .await?;
-    let p = VerifyParams { source: &source, target: &target, ..p };
+    let p = VerifyParams {
+        source: &source,
+        target: &target,
+        ..p
+    };
 
     // The migration under test.
     let plan = diff(p.source, p.target);
@@ -110,7 +114,10 @@ pub async fn verify(p: VerifyParams<'_>) -> Result<VerifyOutcome> {
     }
     let outcome = run_on_replica(&p, &script.sql, &replica).await;
     if p.keep_shadow {
-        eprintln!("dpm: keeping verify replica {}", introspect::redact_url(&replica.url));
+        eprintln!(
+            "dpm: keeping verify replica {}",
+            introspect::redact_url(&replica.url)
+        );
         replica.into_kept();
     } else {
         replica.drop_db().await;
@@ -150,7 +157,9 @@ pub async fn materialize_catalog(
     let applied = crate::apply::apply_script(&db.url, &bootstrap.sql).await;
     if let Err(e) = applied {
         db.drop_db().await;
-        return Err(e).with_context(|| format!("bootstrapping the {label} replica on the shadow server failed"));
+        return Err(e).with_context(|| {
+            format!("bootstrapping the {label} replica on the shadow server failed")
+        });
     }
     let mut replica_cat = match introspect::introspect_url(&db.url, opts).await {
         Ok(c) => c,
@@ -163,7 +172,8 @@ pub async fn materialize_catalog(
     // index defs are the re-parse fixed point; canonicalize before comparing
     // against the (already canonicalized) catalog.
     if let Err(e) =
-        crate::canonicalize::canonicalize_defs(&mut [&mut replica_cat], shadow_server_url, verbose).await
+        crate::canonicalize::canonicalize_defs(&mut [&mut replica_cat], shadow_server_url, verbose)
+            .await
     {
         db.drop_db().await;
         return Err(e);
@@ -172,7 +182,10 @@ pub async fn materialize_catalog(
     if !drift.is_empty() {
         let drift_sql = emit(
             &drift,
-            &EmitOptions { database_flavor: cat.database_flavor, ..Default::default() },
+            &EmitOptions {
+                database_flavor: cat.database_flavor,
+                ..Default::default()
+            },
         )
         .sql;
         db.drop_db().await;
@@ -186,7 +199,60 @@ pub async fn materialize_catalog(
     Ok(db)
 }
 
-async fn run_on_replica(p: &VerifyParams<'_>, migration_sql: &str, replica: &ShadowDb) -> Result<VerifyOutcome> {
+fn render_external_template(template: &str, source: &str, target: &str) -> String {
+    let mut rendered = String::with_capacity(template.len() + source.len() + target.len());
+    let mut offset = 0usize;
+    while offset < template.len() {
+        let remainder = &template[offset..];
+        let source_at = remainder.find("{source}").map(|index| offset + index);
+        let target_at = remainder.find("{target}").map(|index| offset + index);
+        let next = match (source_at, target_at) {
+            (Some(source_index), Some(target_index)) => {
+                if source_index <= target_index {
+                    (source_index, "{source}".len(), source)
+                } else {
+                    (target_index, "{target}".len(), target)
+                }
+            }
+            (Some(source_index), None) => (source_index, "{source}".len(), source),
+            (None, Some(target_index)) => (target_index, "{target}".len(), target),
+            (None, None) => {
+                rendered.push_str(remainder);
+                break;
+            }
+        };
+        rendered.push_str(&template[offset..next.0]);
+        rendered.push_str(next.2);
+        offset = next.0 + next.1;
+    }
+    rendered
+}
+
+fn external_check_commands(template: &str, source_url: &str, target_url: &str) -> (String, String) {
+    let command = render_external_template(
+        template,
+        &crosscheck::shell_quote(source_url),
+        &crosscheck::shell_quote(target_url),
+    );
+    let reported = render_external_template(
+        template,
+        &crosscheck::shell_quote(&introspect::redact_url(source_url)),
+        &crosscheck::shell_quote(&introspect::redact_url(target_url)),
+    );
+    (command, reported)
+}
+
+fn redact_external_output(value: &str, source_url: &str, target_url: &str) -> String {
+    value
+        .replace(source_url, &introspect::redact_url(source_url))
+        .replace(target_url, &introspect::redact_url(target_url))
+}
+
+async fn run_on_replica(
+    p: &VerifyParams<'_>,
+    migration_sql: &str,
+    replica: &ShadowDb,
+) -> Result<VerifyOutcome> {
     // Bootstrap the replica to match the target (destructive allowed: there
     // is nothing to destroy in an empty db), with fidelity sanity-check.
     {
@@ -204,12 +270,20 @@ async fn run_on_replica(p: &VerifyParams<'_>, migration_sql: &str, replica: &Sha
             .await
             .context("bootstrapping the target replica on the shadow server failed")?;
         let mut replica_cat = introspect::introspect_url(&replica.url, p.introspect).await?;
-        crate::canonicalize::canonicalize_defs(&mut [&mut replica_cat], p.shadow_server_url, p.verbose).await?;
+        crate::canonicalize::canonicalize_defs(
+            &mut [&mut replica_cat],
+            p.shadow_server_url,
+            p.verbose,
+        )
+        .await?;
         let drift = diff(p.target, &replica_cat);
         if !drift.is_empty() {
             let drift_sql = emit(
                 &drift,
-                &EmitOptions { database_flavor: p.target.database_flavor, ..Default::default() },
+                &EmitOptions {
+                    database_flavor: p.target.database_flavor,
+                    ..Default::default()
+                },
             )
             .sql;
             bail!(
@@ -228,7 +302,8 @@ async fn run_on_replica(p: &VerifyParams<'_>, migration_sql: &str, replica: &Sha
 
     // Re-diff.
     let mut migrated = introspect::introspect_url(&replica.url, p.introspect).await?;
-    crate::canonicalize::canonicalize_defs(&mut [&mut migrated], p.shadow_server_url, p.verbose).await?;
+    crate::canonicalize::canonicalize_defs(&mut [&mut migrated], p.shadow_server_url, p.verbose)
+        .await?;
     let residual = diff(p.source, &migrated);
     let converged = residual.is_empty();
     let residual_sql = if converged {
@@ -237,7 +312,10 @@ async fn run_on_replica(p: &VerifyParams<'_>, migration_sql: &str, replica: &Sha
         Some(
             emit(
                 &residual,
-                &EmitOptions { database_flavor: p.source.database_flavor, ..Default::default() },
+                &EmitOptions {
+                    database_flavor: p.source.database_flavor,
+                    ..Default::default()
+                },
             )
             .sql,
         )
@@ -252,7 +330,15 @@ async fn run_on_replica(p: &VerifyParams<'_>, migration_sql: &str, replica: &Sha
         let source_url: Option<String> = match p.source_url_for_external {
             Some(u) => Some(u.to_string()),
             None => {
-                match materialize_catalog("source", p.source, p.shadow_server_url, p.introspect, p.verbose).await {
+                match materialize_catalog(
+                    "source",
+                    p.source,
+                    p.shadow_server_url,
+                    p.introspect,
+                    p.verbose,
+                )
+                .await
+                {
                     Ok(db) => {
                         let url = db.url.clone();
                         source_replica = Some(db);
@@ -274,18 +360,33 @@ async fn run_on_replica(p: &VerifyParams<'_>, migration_sql: &str, replica: &Sha
 
         if let Some(source_url) = &source_url {
             // Diff-agreement checkers compare the migrated replica to the source.
-            checks.extend(crosscheck::run_diff_checks(&p.checks, &p.bins, &replica.url, source_url));
+            checks.extend(crosscheck::run_diff_checks(
+                &p.checks,
+                &p.bins,
+                &replica.url,
+                source_url,
+            ));
 
             // flyway validates the SCRIPT under a standard runner against a
             // fresh replica of the ORIGINAL target.
-            let want_flyway = p.checks.flyway
-                || (p.checks.all && crosscheck::binary_exists(&p.bins.flyway));
+            let want_flyway =
+                p.checks.flyway || (p.checks.all && crosscheck::binary_exists(&p.bins.flyway));
             if want_flyway {
-                match materialize_catalog("flyway-target", p.target, p.shadow_server_url, p.introspect, p.verbose)
-                    .await
+                match materialize_catalog(
+                    "flyway-target",
+                    p.target,
+                    p.shadow_server_url,
+                    p.introspect,
+                    p.verbose,
+                )
+                .await
                 {
                     Ok(db) => {
-                        checks.push(crosscheck::run_flyway(&p.bins.flyway, &db.url, migration_sql));
+                        checks.push(crosscheck::run_flyway(
+                            &p.bins.flyway,
+                            &db.url,
+                            migration_sql,
+                        ));
                         db.drop_db().await;
                     }
                     Err(e) => checks.push(CheckReport {
@@ -299,26 +400,51 @@ async fn run_on_replica(p: &VerifyParams<'_>, migration_sql: &str, replica: &Sha
             }
 
             if let Some(template) = p.external_check {
-                let cmd = template.replace("{source}", source_url).replace("{target}", &replica.url);
+                let (command, reported_command) =
+                    external_check_commands(template, source_url, &replica.url);
                 let output = std::process::Command::new("sh")
                     .arg("-c")
-                    .arg(&cmd)
+                    .arg(&command)
                     .output()
-                    .with_context(|| format!("running external check: {cmd}"))?;
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    .with_context(|| format!("running external check: {reported_command}"))?;
+                let stdout = redact_external_output(
+                    String::from_utf8_lossy(&output.stdout).trim(),
+                    source_url,
+                    &replica.url,
+                );
+                let stderr = redact_external_output(
+                    String::from_utf8_lossy(&output.stderr).trim(),
+                    source_url,
+                    &replica.url,
+                );
                 checks.push(CheckReport {
                     name: "external".into(),
-                    command: cmd,
+                    command: reported_command,
                     agreed: output.status.success() && stdout.is_empty(),
                     output: stdout,
-                    error: None,
+                    error: if output.status.success() {
+                        None
+                    } else {
+                        Some(format!(
+                            "external check exited {}{}",
+                            output.status,
+                            if stderr.is_empty() {
+                                String::new()
+                            } else {
+                                format!(": {stderr}")
+                            }
+                        ))
+                    },
                 });
             }
         }
 
         if let Some(db) = source_replica {
             if p.keep_shadow {
-                eprintln!("dpm: keeping source replica {}", introspect::redact_url(&db.url));
+                eprintln!(
+                    "dpm: keeping source replica {}",
+                    introspect::redact_url(&db.url)
+                );
                 db.into_kept();
             } else {
                 db.drop_db().await;
@@ -333,4 +459,35 @@ async fn run_on_replica(p: &VerifyParams<'_>, migration_sql: &str, replica: &Sha
         residual_sql,
         checks,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_check_placeholders_are_shell_quoted_and_reported_without_secrets() {
+        let source = "postgres://alice:s'ecret@db/source?token=source;printf PWN";
+        let target = "postgres://bob:target-secret@db/target?token=target";
+        let (command, reported) =
+            external_check_commands("printf '%s\\n' {source} {target}", source, target);
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{source}\n{target}\n")
+        );
+        for secret in [
+            "s'ecret",
+            "target-secret",
+            "source;printf PWN",
+            "token=target",
+        ] {
+            assert!(!reported.contains(secret), "leaked {secret}: {reported}");
+        }
+    }
 }
