@@ -417,24 +417,25 @@ async fn run_on_replica(
                     source_url,
                     &replica.url,
                 );
+                let agreed = output.status.success() && stdout.is_empty();
+                let detail = if !stdout.is_empty() {
+                    stdout
+                } else if !stderr.is_empty() {
+                    stderr
+                } else if output.status.success() {
+                    String::new()
+                } else {
+                    format!("external check exited {}", output.status)
+                };
                 checks.push(CheckReport {
                     name: "external".into(),
                     command: reported_command,
-                    agreed: output.status.success() && stdout.is_empty(),
-                    output: stdout,
-                    error: if output.status.success() {
-                        None
-                    } else {
-                        Some(format!(
-                            "external check exited {}{}",
-                            output.status,
-                            if stderr.is_empty() {
-                                String::new()
-                            } else {
-                                format!(": {stderr}")
-                            }
-                        ))
-                    },
+                    agreed,
+                    output: detail,
+                    // A checker that ran and returned non-zero is a semantic
+                    // disagreement. Only failure to spawn the checker is an
+                    // infrastructure error (handled by `with_context` above).
+                    error: None,
                 });
             }
         }
