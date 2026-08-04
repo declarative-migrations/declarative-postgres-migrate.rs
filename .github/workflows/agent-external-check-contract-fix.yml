@@ -45,26 +45,20 @@ jobs:
 
           path = Path("src/verify.rs")
           text = path.read_text(encoding="utf-8")
-          old = '''                checks.push(CheckReport {
+          marker = '''                checks.push(CheckReport {
                       name: "external".into(),
-                      command: reported_command,
-                      agreed: output.status.success() && stdout.is_empty(),
-                      output: stdout,
-                      error: if output.status.success() {
-                          None
-                      } else {
-                          Some(format!(
-                              "external check exited {}{}",
-                              output.status,
-                              if stderr.is_empty() {
-                                  String::new()
-                              } else {
-                                  format!(": {stderr}")
-                              }
-                          ))
-                      },
-                  });
           '''
+          start = text.find(marker)
+          if start < 0:
+              raise SystemExit("src/verify.rs: external CheckReport start not found")
+          end_marker = "                });\n"
+          end = text.find(end_marker, start)
+          if end < 0:
+              raise SystemExit("src/verify.rs: external CheckReport end not found")
+          end += len(end_marker)
+          old = text[start:end]
+          if "error: if output.status.success()" not in old:
+              raise SystemExit("src/verify.rs: external CheckReport no longer has the expected classification")
           new = '''                let agreed = output.status.success() && stdout.is_empty();
                   let detail = if !stdout.is_empty() {
                       stdout
@@ -86,10 +80,7 @@ jobs:
                       error: None,
                   });
           '''
-          count = text.count(old)
-          if count != 1:
-              raise SystemExit(f"src/verify.rs: expected one external report block, found {count}")
-          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          path.write_text(text[:start] + new + text[end:], encoding="utf-8")
           PY
 
           rustfmt --edition 2021 src/verify.rs
