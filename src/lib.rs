@@ -2,9 +2,9 @@
 //!
 //! ORM-agnostic, declarative PostgreSQL and CockroachDB schema migration. The
 //! core idea: each server's compatible catalog is the neutral interchange
-//! format — it doesn't matter whether a schema was authored by Prisma, Drizzle, SeaORM, ent,
-//! peewee, or raw SQL. dpm introspects two states (live database, saved
-//! catalog dump, or a `.sql` file materialized via a shadow database),
+//! format — it doesn't matter whether a schema was authored by Prisma, Drizzle,
+//! SeaORM, ent, peewee, or raw SQL. dpm introspects two states (live database,
+//! saved catalog dump, or a `.sql` file materialized via a shadow database),
 //! diffs the catalogs, and emits ordered, reviewable SQL that converges the
 //! target onto the source.
 //!
@@ -19,6 +19,9 @@
 //!   convergence; optional external cross-checkers (migra, pgdiff, ...).
 //! - [`advisor`]: non-DDL advice (foreign keys lacking supporting indexes).
 //! - [`source`]: resolve a URL / `.json` dump / `.sql` file into a `Catalog`.
+//! - [`interfaces`]: versioned, credential-free HTTP DTOs and OpenAPI contract.
+//! - [`server`]: hardened `dpm-server` runtime using database aliases.
+//! - [`sync`]: typed remote client and extraction boundary for `dpm-sync`.
 //! - [`flagenv`]: flags-2-env CLI contract (flags ↔ env vars).
 
 pub mod advisor;
@@ -29,9 +32,12 @@ pub mod crosscheck;
 pub mod diff;
 pub mod emit;
 pub mod flagenv;
+pub mod interfaces;
 pub mod introspect;
 pub mod model;
+pub mod server;
 pub mod source;
+pub mod sync;
 pub mod verify;
 
 pub use diff::{diff, Change, Plan};
