@@ -1,0 +1,49 @@
+name: Format flags-2-env E2E patch
+
+on:
+  pull_request:
+    paths:
+      - 'src/main.rs'
+      - 'tests/flagenv_cli_e2e.rs'
+      - '.github/workflows/agent-format-flagenv-e2e.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PR_BRANCH: ${{ github.head_ref }}
+    steps:
+      - name: Checkout same-repository PR branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.head_ref }}
+          persist-credentials: true
+
+      - name: Install Rustfmt
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: rustfmt
+
+      - name: Apply repository formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          git diff --check
+          if git diff --quiet -- src/main.rs tests/flagenv_cli_e2e.rs; then
+            echo 'E2E patch is already formatted.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/main.rs tests/flagenv_cli_e2e.rs
+          git commit -m 'Format flags-2-env E2E patch'
+          git push origin "HEAD:${PR_BRANCH}"
