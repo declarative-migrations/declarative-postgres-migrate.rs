@@ -1,3 +1,7 @@
 target/
 tmp/
 *.log
+tmp
+temp
+tmp/worktrees
+temp/worktrees

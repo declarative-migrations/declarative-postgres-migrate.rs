@@ -25,7 +25,9 @@ fn admin_url() -> Option<String> {
 }
 
 async fn fresh_db(admin: &str) -> ShadowDb {
-    ShadowDb::create(admin, false).await.expect("create test database")
+    ShadowDb::create(admin, false)
+        .await
+        .expect("create test database")
 }
 
 /// A schema exercising every object class dpm covers: enums, serial +
@@ -156,22 +158,43 @@ async fn migrate_and_assert_converges(
 ) -> (ShadowDb, ShadowDb, String) {
     let (source_db, target_db) = setup_pair(admin, source_sql, target_sql).await;
 
-    let mut source = introspect_url(&source_db.url, &opts()).await.expect("introspect source");
-    let mut target = introspect_url(&target_db.url, &opts()).await.expect("introspect target");
+    let mut source = introspect_url(&source_db.url, &opts())
+        .await
+        .expect("introspect source");
+    let mut target = introspect_url(&target_db.url, &opts())
+        .await
+        .expect("introspect target");
     // Mirror the production pipeline: with a shadow server available, CHECK
     // and index defs are canonicalized to their re-parse fixed point before
     // comparison.
-    canonicalize_defs(&mut [&mut source, &mut target], admin, false).await.expect("canonicalize sides");
+    canonicalize_defs(&mut [&mut source, &mut target], admin, false)
+        .await
+        .expect("canonicalize sides");
 
     let plan = diff(&source, &target);
-    let script = emit(&plan, &EmitOptions { allow_destructive: true, ..Default::default() });
+    let script = emit(
+        &plan,
+        &EmitOptions {
+            allow_destructive: true,
+            ..Default::default()
+        },
+    );
 
     apply_script(&target_db.url, &script.sql)
         .await
-        .unwrap_or_else(|e| panic!("[{label}] applying generated migration failed: {e:#}\n--- script ---\n{}", script.sql));
+        .unwrap_or_else(|e| {
+            panic!(
+                "[{label}] applying generated migration failed: {e:#}\n--- script ---\n{}",
+                script.sql
+            )
+        });
 
-    let mut migrated = introspect_url(&target_db.url, &opts()).await.expect("re-introspect target");
-    canonicalize_defs(&mut [&mut migrated], admin, false).await.expect("canonicalize migrated");
+    let mut migrated = introspect_url(&target_db.url, &opts())
+        .await
+        .expect("re-introspect target");
+    canonicalize_defs(&mut [&mut migrated], admin, false)
+        .await
+        .expect("canonicalize migrated");
     let residual = diff(&source, &migrated);
     let residual_script = emit(&residual, &EmitOptions::default());
     assert!(
@@ -302,7 +325,11 @@ async fn identical_databases_produce_empty_plan() {
     let cb = introspect_url(&b.url, &opts()).await.unwrap();
     let plan = diff(&ca, &cb);
     let script = emit(&plan, &EmitOptions::default());
-    assert!(plan.is_empty(), "identical databases must diff clean:\n{}", script.sql);
+    assert!(
+        plan.is_empty(),
+        "identical databases must diff clean:\n{}",
+        script.sql
+    );
     a.drop_db().await;
     b.drop_db().await;
 }
@@ -349,7 +376,11 @@ async fn verify_reports_convergence() {
     })
     .await
     .expect("verify run");
-    assert!(outcome.converged, "verify must converge; residual:\n{:?}", outcome.residual_sql);
+    assert!(
+        outcome.converged,
+        "verify must converge; residual:\n{:?}",
+        outcome.residual_sql
+    );
 
     source_db.drop_db().await;
     target_db.drop_db().await;
@@ -406,17 +437,37 @@ async fn all_side_kind_combinations_agree() {
     std::fs::write(&source_json, serde_json::to_string(&source_cat).unwrap()).unwrap();
     std::fs::write(&target_json, serde_json::to_string(&target_cat).unwrap()).unwrap();
 
-    let source_kinds = [source_db.url.clone(), source_sql.display().to_string(), source_json.display().to_string()];
-    let target_kinds = [target_db.url.clone(), target_sql.display().to_string(), target_json.display().to_string()];
+    let source_kinds = [
+        source_db.url.clone(),
+        source_sql.display().to_string(),
+        source_json.display().to_string(),
+    ];
+    let target_kinds = [
+        target_db.url.clone(),
+        target_sql.display().to_string(),
+        target_json.display().to_string(),
+    ];
 
     // Reference plan from url ↔ url.
-    let reference = emit(&diff(&source_cat, &target_cat), &EmitOptions { allow_destructive: true, ..Default::default() });
+    let reference = emit(
+        &diff(&source_cat, &target_cat),
+        &EmitOptions {
+            allow_destructive: true,
+            ..Default::default()
+        },
+    );
 
     for s in &source_kinds {
         for t in &target_kinds {
             let sc = resolve_side(s, &admin).await;
             let tc = resolve_side(t, &admin).await;
-            let script = emit(&diff(&sc, &tc), &EmitOptions { allow_destructive: true, ..Default::default() });
+            let script = emit(
+                &diff(&sc, &tc),
+                &EmitOptions {
+                    allow_destructive: true,
+                    ..Default::default()
+                },
+            );
             assert_eq!(
                 script.sql, reference.sql,
                 "combo source={s} target={t} produced a different migration"
@@ -513,7 +564,13 @@ async fn destructive_counts_drive_the_two_consent_gate() {
 
     // sql-consent on: one live destructive statement — the ops gate (in the
     // CLI) must see live_destructive = 1.
-    let live = emit(&plan, &EmitOptions { allow_destructive: true, ..Default::default() });
+    let live = emit(
+        &plan,
+        &EmitOptions {
+            allow_destructive: true,
+            ..Default::default()
+        },
+    );
     assert_eq!(live.destructive_count - live.gated_count, 1);
 
     source_db.drop_db().await;
@@ -539,7 +596,10 @@ async fn verify_with_all_checkers(admin: &str, label: &str, source_sql: &str, ta
         source_url_for_external: Some(&source_db.url),
         allow_destructive: true,
         external_check: None,
-        checks: dpm::crosscheck::CheckSelection { all: true, ..Default::default() },
+        checks: dpm::crosscheck::CheckSelection {
+            all: true,
+            ..Default::default()
+        },
         bins: Default::default(),
         keep_shadow: false,
         verbose: false,
@@ -678,9 +738,7 @@ async fn postgres_advanced_indexes_converge() {
         "{migration}"
     );
     assert!(
-        migration.contains(
-            "DROP INDEX IF EXISTS \"public\".\"documents_obsolete_unique_idx\""
-        ),
+        migration.contains("DROP INDEX IF EXISTS \"public\".\"documents_obsolete_unique_idx\""),
         "{migration}"
     );
     source_db.drop_db().await;
@@ -744,8 +802,14 @@ ALTER TABLE accounts DISABLE TRIGGER accounts_audit;
 "#;
     let (source_db, target_db, migration) =
         migrate_and_assert_converges(&admin, source_sql, target_sql, "routines-triggers").await;
-    assert!(migration.contains("CREATE OR REPLACE FUNCTION"), "{migration}");
-    assert!(migration.contains("CREATE OR REPLACE PROCEDURE"), "{migration}");
+    assert!(
+        migration.contains("CREATE OR REPLACE FUNCTION"),
+        "{migration}"
+    );
+    assert!(
+        migration.contains("CREATE OR REPLACE PROCEDURE"),
+        "{migration}"
+    );
     assert!(
         migration.contains("DROP PROCEDURE IF EXISTS \"public\".\"obsolete account job\"()"),
         "{migration}"
@@ -898,7 +962,10 @@ CREATE TRIGGER events_audit_obsolete AFTER INSERT ON public.events
         migration.contains("DROP TRIGGER IF EXISTS \"events_audit_obsolete\""),
         "{migration}"
     );
-    assert!(migration.contains("CREATE OR REPLACE FUNCTION"), "{migration}");
+    assert!(
+        migration.contains("CREATE OR REPLACE FUNCTION"),
+        "{migration}"
+    );
 
     let mut conn = dpm::introspect::connect(&target_db.url).await.unwrap();
     sqlx::raw_sql(
@@ -918,12 +985,11 @@ CREATE TRIGGER events_audit_obsolete AFTER INSERT ON public.events
     .fetch_one(&mut conn)
     .await
     .unwrap();
-    let audit: (i64, i64) = sqlx::query_as(
-        "SELECT count(*), sum(observed_value)::bigint FROM public.event_audit",
-    )
-    .fetch_one(&mut conn)
-    .await
-    .unwrap();
+    let audit: (i64, i64) =
+        sqlx::query_as("SELECT count(*), sum(observed_value)::bigint FROM public.event_audit")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
     assert_eq!(values, (0, 30, 25));
     assert_eq!(audit, (3, 70));
 
@@ -1100,14 +1166,29 @@ async fn serial_adoption_converges_and_respects_existing_rows() {
     )
     .await;
 
-    for (label, s_db, t_db) in [("identity-adoption", &source_db, &target_db), ("serial-adoption", &serial_src, &plain_tgt)] {
+    for (label, s_db, t_db) in [
+        ("identity-adoption", &source_db, &target_db),
+        ("serial-adoption", &serial_src, &plain_tgt),
+    ] {
         let s = introspect_url(&s_db.url, &opts()).await.unwrap();
         let t = introspect_url(&t_db.url, &opts()).await.unwrap();
-        let script = emit(&diff(&s, &t), &EmitOptions { allow_destructive: true, ..Default::default() });
-        apply_script(&t_db.url, &script.sql).await.unwrap_or_else(|e| panic!("[{label}] {e:#}\n{}", script.sql));
+        let script = emit(
+            &diff(&s, &t),
+            &EmitOptions {
+                allow_destructive: true,
+                ..Default::default()
+            },
+        );
+        apply_script(&t_db.url, &script.sql)
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] {e:#}\n{}", script.sql));
         let migrated = introspect_url(&t_db.url, &opts()).await.unwrap();
         let residual = diff(&s, &migrated);
-        assert!(residual.is_empty(), "[{label}] residual:\n{}", emit(&residual, &EmitOptions::default()).sql);
+        assert!(
+            residual.is_empty(),
+            "[{label}] residual:\n{}",
+            emit(&residual, &EmitOptions::default()).sql
+        );
     }
 
     // The adopted serial must continue past existing ids, not collide.
@@ -1116,7 +1197,10 @@ async fn serial_adoption_converges_and_respects_existing_rows() {
         .fetch_one(&mut conn)
         .await
         .unwrap();
-    assert!(next > 7, "serial counter must be seeded past max(id)=7, got {next}");
+    assert!(
+        next > 7,
+        "serial counter must be seeded past max(id)=7, got {next}"
+    );
 
     source_db.drop_db().await;
     target_db.drop_db().await;
@@ -1139,15 +1223,27 @@ async fn schema_scoping_limits_the_diff() {
     )
     .await;
 
-    let scoped = IntrospectOptions { schemas: Some(vec!["keep".into()]), extra_excluded: vec![] };
+    let scoped = IntrospectOptions {
+        schemas: Some(vec!["keep".into()]),
+        extra_excluded: vec![],
+    };
     let ca = introspect_url(&a.url, &scoped).await.unwrap();
     let cb = introspect_url(&b.url, &scoped).await.unwrap();
-    assert!(diff(&ca, &cb).is_empty(), "drift in ignore_me must be invisible when scoped to keep");
+    assert!(
+        diff(&ca, &cb).is_empty(),
+        "drift in ignore_me must be invisible when scoped to keep"
+    );
 
-    let excluded = IntrospectOptions { schemas: None, extra_excluded: vec!["ignore_me".into()] };
+    let excluded = IntrospectOptions {
+        schemas: None,
+        extra_excluded: vec!["ignore_me".into()],
+    };
     let ca = introspect_url(&a.url, &excluded).await.unwrap();
     let cb = introspect_url(&b.url, &excluded).await.unwrap();
-    assert!(diff(&ca, &cb).is_empty(), "drift in ignore_me must be invisible when excluded");
+    assert!(
+        diff(&ca, &cb).is_empty(),
+        "drift in ignore_me must be invisible when excluded"
+    );
 
     // Unscoped, the drift IS visible.
     let ca = introspect_url(&a.url, &opts()).await.unwrap();
@@ -1165,8 +1261,10 @@ async fn catalog_dumps_are_deterministic() {
     let Some(admin) = admin_url() else { return };
     let db = fresh_db(&admin).await;
     db.apply_sql(RICH_SCHEMA).await.unwrap();
-    let one = serde_json::to_string_pretty(&introspect_url(&db.url, &opts()).await.unwrap()).unwrap();
-    let two = serde_json::to_string_pretty(&introspect_url(&db.url, &opts()).await.unwrap()).unwrap();
+    let one =
+        serde_json::to_string_pretty(&introspect_url(&db.url, &opts()).await.unwrap()).unwrap();
+    let two =
+        serde_json::to_string_pretty(&introspect_url(&db.url, &opts()).await.unwrap()).unwrap();
     assert_eq!(one, two, "same database must dump byte-identically");
     db.drop_db().await;
 }
@@ -1180,10 +1278,12 @@ async fn verify_leaves_no_shadow_databases_behind() {
 
     let count_shadows = |admin: String| async move {
         let mut conn = dpm::introspect::connect(&admin).await.unwrap();
-        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_database WHERE datname LIKE 'dpm_shadow_%'")
-            .fetch_one(&mut conn)
-            .await
-            .unwrap();
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_database WHERE datname LIKE 'dpm_shadow_%'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
         n
     };
     let before = count_shadows(admin.clone()).await;
@@ -1221,7 +1321,10 @@ async fn verify_leaves_no_shadow_databases_behind() {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         after = count_shadows(admin.clone()).await;
     }
-    assert!(after <= before, "verify leaked shadow databases: before={before}, after={after}");
+    assert!(
+        after <= before,
+        "verify leaked shadow databases: before={before}, after={after}"
+    );
 
     source_db.drop_db().await;
     target_db.drop_db().await;
@@ -1277,7 +1380,13 @@ async fn populated_table_migration_preserves_data() {
     let source = introspect_url(&source_db.url, &opts()).await.unwrap();
     let target = introspect_url(&target_db.url, &opts()).await.unwrap();
     let plan = diff(&source, &target);
-    let script = emit(&plan, &EmitOptions { allow_destructive: true, ..Default::default() });
+    let script = emit(
+        &plan,
+        &EmitOptions {
+            allow_destructive: true,
+            ..Default::default()
+        },
+    );
     // The FK/check on an existing table must take the NOT VALID + VALIDATE path.
     assert!(script.sql.contains("NOT VALID"), "{}", script.sql);
     assert!(script.sql.contains("VALIDATE CONSTRAINT"), "{}", script.sql);
@@ -1289,7 +1398,11 @@ async fn populated_table_migration_preserves_data() {
     // Schema converged…
     let migrated = introspect_url(&target_db.url, &opts()).await.unwrap();
     let residual = diff(&source, &migrated);
-    assert!(residual.is_empty(), "{}", emit(&residual, &EmitOptions::default()).sql);
+    assert!(
+        residual.is_empty(),
+        "{}",
+        emit(&residual, &EmitOptions::default()).sql
+    );
 
     // …and the data survived: same row count, same value checksum, new
     // column backfilled with its default, widened type holds the old values.
@@ -1298,12 +1411,20 @@ async fn populated_table_migration_preserves_data() {
             .fetch_one(&mut conn)
             .await
             .unwrap();
-    assert_eq!((count_before, sum_before), (count_after, sum_after), "data changed during migration");
-    let unlabeled: i64 = sqlx::query_scalar("SELECT count(*) FROM public.readings WHERE label = 'unlabeled'")
-        .fetch_one(&mut conn)
-        .await
-        .unwrap();
-    assert_eq!(unlabeled, 50_000, "NOT NULL DEFAULT column must backfill every row");
+    assert_eq!(
+        (count_before, sum_before),
+        (count_after, sum_after),
+        "data changed during migration"
+    );
+    let unlabeled: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM public.readings WHERE label = 'unlabeled'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(
+        unlabeled, 50_000,
+        "NOT NULL DEFAULT column must backfill every row"
+    );
 
     source_db.drop_db().await;
     target_db.drop_db().await;
@@ -1325,19 +1446,31 @@ async fn constraint_violated_by_existing_data_fails_loudly() {
 
     let source = introspect_url(&source_db.url, &opts()).await.unwrap();
     let target = introspect_url(&target_db.url, &opts()).await.unwrap();
-    let script = emit(&diff(&source, &target), &EmitOptions { allow_destructive: true, ..Default::default() });
+    let script = emit(
+        &diff(&source, &target),
+        &EmitOptions {
+            allow_destructive: true,
+            ..Default::default()
+        },
+    );
 
     let err = apply_script(&target_db.url, &script.sql)
         .await
         .expect_err("rows with v >= 100 must make VALIDATE fail");
     let msg = format!("{err:#}");
-    assert!(msg.contains("m_v_small"), "error must name the constraint: {msg}");
+    assert!(
+        msg.contains("m_v_small"),
+        "error must name the constraint: {msg}"
+    );
 
     // Fail-loud also means fail-atomic for the transactional part: the
     // constraint must not exist afterwards in any half-applied form.
     let migrated = introspect_url(&target_db.url, &opts()).await.unwrap();
     let table = migrated.tables.values().next().unwrap();
-    assert!(!table.constraints.contains_key("m_v_small"), "no half-applied constraint");
+    assert!(
+        !table.constraints.contains_key("m_v_small"),
+        "no half-applied constraint"
+    );
 
     source_db.drop_db().await;
     target_db.drop_db().await;

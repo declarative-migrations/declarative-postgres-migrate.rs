@@ -15,70 +15,201 @@ use crate::model::*;
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Change {
-    CreateSchema { name: String },
+    CreateSchema {
+        name: String,
+    },
     /// Target-only schema, dropped WITHOUT CASCADE: if out-of-scope objects
     /// remain inside, the apply fails loudly instead of destroying them.
-    DropSchema { name: String },
-    CreateExtension { name: String },
-    DropExtension { name: String },
+    DropSchema {
+        name: String,
+    },
+    CreateExtension {
+        name: String,
+    },
+    DropExtension {
+        name: String,
+    },
 
-    CreateEnum { ty: QName, labels: Vec<String> },
+    CreateEnum {
+        ty: QName,
+        labels: Vec<String>,
+    },
     /// `before == None` means append at the end.
-    AddEnumValue { ty: QName, value: String, before: Option<String> },
+    AddEnumValue {
+        ty: QName,
+        value: String,
+        before: Option<String>,
+    },
     /// Labels were removed or reordered: converging requires a full type
     /// rebuild with column rewrites, which dpm will not attempt automatically.
-    EnumNeedsRebuild { ty: QName, source_labels: Vec<String>, target_labels: Vec<String> },
-    DropEnum { ty: QName },
+    EnumNeedsRebuild {
+        ty: QName,
+        source_labels: Vec<String>,
+        target_labels: Vec<String>,
+    },
+    DropEnum {
+        ty: QName,
+    },
 
-    CreateSequence { seq: QName, def: Sequence },
-    AlterSequence { seq: QName, def: Sequence },
-    DropSequence { seq: QName },
+    CreateSequence {
+        seq: QName,
+        def: Sequence,
+    },
+    AlterSequence {
+        seq: QName,
+        def: Sequence,
+    },
+    DropSequence {
+        seq: QName,
+    },
 
-    CreateTable { table: QName, def: Table },
-    DropTable { table: QName },
+    CreateTable {
+        table: QName,
+        def: Table,
+    },
+    DropTable {
+        table: QName,
+    },
 
-    AddColumn { table: QName, def: Column },
-    DropColumn { table: QName, column: String },
-    AlterColumnType { table: QName, column: String, from: String, to: String, collation: Option<String> },
-    SetNotNull { table: QName, column: String },
-    DropNotNull { table: QName, column: String },
+    AddColumn {
+        table: QName,
+        def: Column,
+    },
+    DropColumn {
+        table: QName,
+        column: String,
+    },
+    AlterColumnType {
+        table: QName,
+        column: String,
+        from: String,
+        to: String,
+        collation: Option<String>,
+    },
+    SetNotNull {
+        table: QName,
+        column: String,
+    },
+    DropNotNull {
+        table: QName,
+        column: String,
+    },
     /// CockroachDB `VISIBLE` / `NOT VISIBLE`; PostgreSQL columns are always
     /// represented as visible.
-    SetColumnVisibility { table: QName, column: String, hidden: bool },
-    SetDefault { table: QName, column: String, expr: String },
-    DropDefault { table: QName, column: String },
+    SetColumnVisibility {
+        table: QName,
+        column: String,
+        hidden: bool,
+    },
+    SetDefault {
+        table: QName,
+        column: String,
+        expr: String,
+    },
+    DropDefault {
+        table: QName,
+        column: String,
+    },
     /// Convert a plain column into a serial-style column: create the owned
     /// sequence, set the nextval default, transfer ownership.
-    MakeSerial { table: QName, column: String, type_sql: String },
+    MakeSerial {
+        table: QName,
+        column: String,
+        type_sql: String,
+    },
     /// Remove a serial default (and its now-orphaned sequence — the sequence
     /// drop is the destructive half).
-    DropSerial { table: QName, column: String },
-    AddIdentity { table: QName, column: String, kind: IdentityKind },
-    DropIdentity { table: QName, column: String },
-    SetIdentityKind { table: QName, column: String, kind: IdentityKind },
+    DropSerial {
+        table: QName,
+        column: String,
+    },
+    AddIdentity {
+        table: QName,
+        column: String,
+        kind: IdentityKind,
+    },
+    DropIdentity {
+        table: QName,
+        column: String,
+    },
+    SetIdentityKind {
+        table: QName,
+        column: String,
+        kind: IdentityKind,
+    },
     /// Generation expressions cannot be altered in place; converging means
     /// drop + re-add the column (data in the target column is lost).
-    RegenerateColumn { table: QName, def: Column },
+    RegenerateColumn {
+        table: QName,
+        def: Column,
+    },
 
-    AddConstraint { table: QName, name: String, def: String, kind: ConstraintKind, table_is_new: bool },
-    DropConstraint { table: QName, name: String, kind: ConstraintKind, replaced: bool },
+    AddConstraint {
+        table: QName,
+        name: String,
+        def: String,
+        kind: ConstraintKind,
+        table_is_new: bool,
+    },
+    DropConstraint {
+        table: QName,
+        name: String,
+        kind: ConstraintKind,
+        replaced: bool,
+    },
 
-    CreateIndex { table: QName, name: String, def: String },
-    DropIndex { index: QName, unique: bool, replaced: bool },
+    CreateIndex {
+        table: QName,
+        name: String,
+        def: String,
+    },
+    DropIndex {
+        index: QName,
+        unique: bool,
+        replaced: bool,
+    },
 
-    EnableRls { table: QName },
-    DisableRls { table: QName },
-    ForceRls { table: QName },
-    UnforceRls { table: QName },
-    CreatePolicy { table: QName, def: Policy },
-    DropPolicy { table: QName, name: String, replaced: bool },
+    EnableRls {
+        table: QName,
+    },
+    DisableRls {
+        table: QName,
+    },
+    ForceRls {
+        table: QName,
+    },
+    UnforceRls {
+        table: QName,
+    },
+    CreatePolicy {
+        table: QName,
+        def: Policy,
+    },
+    DropPolicy {
+        table: QName,
+        name: String,
+        replaced: bool,
+    },
 
-    CreateView { view: QName, materialized: bool, def: String },
-    DropView { view: QName, materialized: bool, replaced: bool },
+    CreateView {
+        view: QName,
+        materialized: bool,
+        def: String,
+    },
+    DropView {
+        view: QName,
+        materialized: bool,
+        replaced: bool,
+    },
 
     /// `def` is a complete CREATE FUNCTION/PROCEDURE statement. The emitter
     /// adds `OR REPLACE` when the server's deparser omits it.
-    CreateFunction { key: String, kind: RoutineKind, def: String, replacing: bool },
+    CreateFunction {
+        key: String,
+        kind: RoutineKind,
+        def: String,
+        replacing: bool,
+    },
     DropFunction {
         key: String,
         schema: String,
@@ -87,9 +218,21 @@ pub enum Change {
         replaced: bool,
     },
 
-    CreateTrigger { key: String, table: QName, def: String },
-    DropTrigger { table: QName, name: String, replaced: bool },
-    SetTriggerMode { table: QName, name: String, mode: TriggerMode },
+    CreateTrigger {
+        key: String,
+        table: QName,
+        def: String,
+    },
+    DropTrigger {
+        table: QName,
+        name: String,
+        replaced: bool,
+    },
+    SetTriggerMode {
+        table: QName,
+        name: String,
+        mode: TriggerMode,
+    },
 }
 
 impl Change {
@@ -109,8 +252,12 @@ impl Change {
             | Change::DropSerial { .. }
             | Change::RegenerateColumn { .. } => true,
             Change::DropFunction { replaced, .. } => !replaced,
-            Change::DropConstraint { kind, replaced, .. } => !replaced && kind.drop_is_destructive(),
-            Change::DropIndex { unique, replaced, .. } => !replaced && *unique,
+            Change::DropConstraint { kind, replaced, .. } => {
+                !replaced && kind.drop_is_destructive()
+            }
+            Change::DropIndex {
+                unique, replaced, ..
+            } => !replaced && *unique,
             Change::DropView { replaced, .. } => !replaced,
             Change::DropTrigger { replaced, .. } => !replaced,
             Change::DropPolicy { replaced, .. } => !replaced,
@@ -177,32 +324,44 @@ fn diff_schemas(source: &Catalog, target: &Catalog, plan: &mut Plan) {
             || source.enums.keys().any(|q| &q.schema == schema)
             || source.sequences.keys().any(|q| &q.schema == schema)
             || source.views.keys().any(|q| &q.schema == schema)
-            || source.functions.keys().any(|k| k.starts_with(&format!("{schema}.")))
+            || source
+                .functions
+                .keys()
+                .any(|k| k.starts_with(&format!("{schema}.")))
             || schema != "public";
         if !target_has && source_uses {
-            plan.changes.push(Change::CreateSchema { name: schema.clone() });
+            plan.changes.push(Change::CreateSchema {
+                name: schema.clone(),
+            });
         }
     }
     for schema in &target.schemas {
         if schema != "public" && !source.schemas.contains(schema) {
-            plan.changes.push(Change::DropSchema { name: schema.clone() });
+            plan.changes.push(Change::DropSchema {
+                name: schema.clone(),
+            });
         }
     }
 }
 
 fn diff_extensions(source: &Catalog, target: &Catalog, plan: &mut Plan) {
     for ext in source.extensions.difference(&target.extensions) {
-        plan.changes.push(Change::CreateExtension { name: ext.clone() });
+        plan.changes
+            .push(Change::CreateExtension { name: ext.clone() });
     }
     for ext in target.extensions.difference(&source.extensions) {
-        plan.changes.push(Change::DropExtension { name: ext.clone() });
+        plan.changes
+            .push(Change::DropExtension { name: ext.clone() });
     }
 }
 
 fn diff_enums(source: &Catalog, target: &Catalog, plan: &mut Plan) {
     for (ty, labels) in &source.enums {
         match target.enums.get(ty) {
-            None => plan.changes.push(Change::CreateEnum { ty: ty.clone(), labels: labels.clone() }),
+            None => plan.changes.push(Change::CreateEnum {
+                ty: ty.clone(),
+                labels: labels.clone(),
+            }),
             Some(t_labels) if t_labels == labels => {}
             Some(t_labels) => {
                 // Only pure insertions are automatable: the target's labels
@@ -245,9 +404,15 @@ fn is_subsequence(needle: &[String], haystack: &[String]) -> bool {
 fn diff_sequences(source: &Catalog, target: &Catalog, plan: &mut Plan) {
     for (q, def) in &source.sequences {
         match target.sequences.get(q) {
-            None => plan.changes.push(Change::CreateSequence { seq: q.clone(), def: def.clone() }),
+            None => plan.changes.push(Change::CreateSequence {
+                seq: q.clone(),
+                def: def.clone(),
+            }),
             Some(t) if t == def => {}
-            Some(_) => plan.changes.push(Change::AlterSequence { seq: q.clone(), def: def.clone() }),
+            Some(_) => plan.changes.push(Change::AlterSequence {
+                seq: q.clone(),
+                def: def.clone(),
+            }),
         }
     }
     for q in target.sequences.keys() {
@@ -260,7 +425,10 @@ fn diff_sequences(source: &Catalog, target: &Catalog, plan: &mut Plan) {
 fn diff_tables(source: &Catalog, target: &Catalog, plan: &mut Plan) {
     for (q, s_table) in &source.tables {
         match target.tables.get(q) {
-            None => plan.changes.push(Change::CreateTable { table: q.clone(), def: s_table.clone() }),
+            None => plan.changes.push(Change::CreateTable {
+                table: q.clone(),
+                def: s_table.clone(),
+            }),
             Some(t_table) => diff_one_table(q, s_table, t_table, plan),
         }
     }
@@ -277,21 +445,30 @@ fn diff_one_table(q: &QName, s: &Table, t: &Table, plan: &mut Plan) {
         // full (destructive, gated) table rebuild — nothing finer-grained
         // applies, so short-circuit.
         plan.changes.push(Change::DropTable { table: q.clone() });
-        plan.changes.push(Change::CreateTable { table: q.clone(), def: s.clone() });
+        plan.changes.push(Change::CreateTable {
+            table: q.clone(),
+            def: s.clone(),
+        });
         return;
     }
 
     // Columns (compared as a set by name; ordinal drift is not a difference).
     for s_col in &s.columns {
         match t.column(&s_col.name) {
-            None => plan.changes.push(Change::AddColumn { table: q.clone(), def: s_col.clone() }),
+            None => plan.changes.push(Change::AddColumn {
+                table: q.clone(),
+                def: s_col.clone(),
+            }),
             Some(t_col) if s_col.semantic_eq(t_col) => {}
             Some(t_col) => diff_one_column(q, s_col, t_col, plan),
         }
     }
     for t_col in &t.columns {
         if s.column(&t_col.name).is_none() {
-            plan.changes.push(Change::DropColumn { table: q.clone(), column: t_col.name.clone() });
+            plan.changes.push(Change::DropColumn {
+                table: q.clone(),
+                column: t_col.name.clone(),
+            });
         }
     }
 
@@ -382,17 +559,31 @@ fn diff_one_table(q: &QName, s: &Table, t: &Table, plan: &mut Plan) {
     // Policies, compared structurally.
     for (name, s_pol) in &s.policies {
         match t.policies.get(name) {
-            None => plan.changes.push(Change::CreatePolicy { table: q.clone(), def: s_pol.clone() }),
+            None => plan.changes.push(Change::CreatePolicy {
+                table: q.clone(),
+                def: s_pol.clone(),
+            }),
             Some(t_pol) if t_pol == s_pol => {}
             Some(_) => {
-                plan.changes.push(Change::DropPolicy { table: q.clone(), name: name.clone(), replaced: true });
-                plan.changes.push(Change::CreatePolicy { table: q.clone(), def: s_pol.clone() });
+                plan.changes.push(Change::DropPolicy {
+                    table: q.clone(),
+                    name: name.clone(),
+                    replaced: true,
+                });
+                plan.changes.push(Change::CreatePolicy {
+                    table: q.clone(),
+                    def: s_pol.clone(),
+                });
             }
         }
     }
     for name in t.policies.keys() {
         if !s.policies.contains_key(name) {
-            plan.changes.push(Change::DropPolicy { table: q.clone(), name: name.clone(), replaced: false });
+            plan.changes.push(Change::DropPolicy {
+                table: q.clone(),
+                name: name.clone(),
+                replaced: false,
+            });
         }
     }
 
@@ -406,7 +597,10 @@ fn diff_one_table(q: &QName, s: &Table, t: &Table, plan: &mut Plan) {
         plan.changes.push(Change::DropTable { table: q.clone() });
         plan.changes.push(Change::CreateTable {
             table: q.clone(),
-            def: Table { partition_by: s.partition_by.clone(), ..s_clone_for_rebuild(s) },
+            def: Table {
+                partition_by: s.partition_by.clone(),
+                ..s_clone_for_rebuild(s)
+            },
         });
     }
 }
@@ -419,7 +613,10 @@ fn diff_one_column(q: &QName, s: &Column, t: &Column, plan: &mut Plan) {
     // Generated expression change ⇒ column rebuild (destructive), and no
     // other per-facet changes make sense on top.
     if s.generated != t.generated {
-        plan.changes.push(Change::RegenerateColumn { table: q.clone(), def: s.clone() });
+        plan.changes.push(Change::RegenerateColumn {
+            table: q.clone(),
+            def: s.clone(),
+        });
         return;
     }
 
@@ -437,11 +634,20 @@ fn diff_one_column(q: &QName, s: &Column, t: &Column, plan: &mut Plan) {
 
     // Identity transitions.
     match (t.identity, s.identity) {
-        (None, Some(kind)) => plan.changes.push(Change::AddIdentity { table: q.clone(), column: col.clone(), kind }),
-        (Some(_), None) => plan.changes.push(Change::DropIdentity { table: q.clone(), column: col.clone() }),
-        (Some(a), Some(b)) if a != b => {
-            plan.changes.push(Change::SetIdentityKind { table: q.clone(), column: col.clone(), kind: b })
-        }
+        (None, Some(kind)) => plan.changes.push(Change::AddIdentity {
+            table: q.clone(),
+            column: col.clone(),
+            kind,
+        }),
+        (Some(_), None) => plan.changes.push(Change::DropIdentity {
+            table: q.clone(),
+            column: col.clone(),
+        }),
+        (Some(a), Some(b)) if a != b => plan.changes.push(Change::SetIdentityKind {
+            table: q.clone(),
+            column: col.clone(),
+            kind: b,
+        }),
         _ => {}
     }
 
@@ -455,9 +661,16 @@ fn diff_one_column(q: &QName, s: &Column, t: &Column, plan: &mut Plan) {
                 type_sql: s.type_sql.clone(),
             }),
             (true, false) => {
-                plan.changes.push(Change::DropSerial { table: q.clone(), column: col.clone() });
+                plan.changes.push(Change::DropSerial {
+                    table: q.clone(),
+                    column: col.clone(),
+                });
                 if let Some(expr) = &s.default {
-                    plan.changes.push(Change::SetDefault { table: q.clone(), column: col.clone(), expr: expr.clone() });
+                    plan.changes.push(Change::SetDefault {
+                        table: q.clone(),
+                        column: col.clone(),
+                        expr: expr.clone(),
+                    });
                 }
             }
             (false, false) => {
@@ -468,7 +681,10 @@ fn diff_one_column(q: &QName, s: &Column, t: &Column, plan: &mut Plan) {
                             column: col.clone(),
                             expr: expr.clone(),
                         }),
-                        None => plan.changes.push(Change::DropDefault { table: q.clone(), column: col.clone() }),
+                        None => plan.changes.push(Change::DropDefault {
+                            table: q.clone(),
+                            column: col.clone(),
+                        }),
                     }
                 }
             }
@@ -477,8 +693,14 @@ fn diff_one_column(q: &QName, s: &Column, t: &Column, plan: &mut Plan) {
     }
 
     match (t.not_null, s.not_null) {
-        (false, true) => plan.changes.push(Change::SetNotNull { table: q.clone(), column: col }),
-        (true, false) => plan.changes.push(Change::DropNotNull { table: q.clone(), column: col }),
+        (false, true) => plan.changes.push(Change::SetNotNull {
+            table: q.clone(),
+            column: col,
+        }),
+        (true, false) => plan.changes.push(Change::DropNotNull {
+            table: q.clone(),
+            column: col,
+        }),
         _ => {}
     }
 
@@ -664,7 +886,10 @@ mod tests {
     #[test]
     fn identical_catalogs_produce_empty_plan() {
         let mut a = Catalog::empty_with_schemas(["public".into()]);
-        a.tables.insert(QName::new("public", "t"), table_with(vec![col("id", "integer")]));
+        a.tables.insert(
+            QName::new("public", "t"),
+            table_with(vec![col("id", "integer")]),
+        );
         let plan = diff(&a, &a.clone());
         assert!(plan.is_empty(), "plan not empty: {:?}", plan.changes);
     }
@@ -674,8 +899,12 @@ mod tests {
         let mut src = Catalog::empty_with_schemas(["public".into()]);
         let mut tgt = src.clone();
         let ty = QName::new("public", "mood");
-        src.enums.insert(ty.clone(), vec!["sad".into(), "meh".into(), "ok".into(), "great".into()]);
-        tgt.enums.insert(ty.clone(), vec!["sad".into(), "ok".into()]);
+        src.enums.insert(
+            ty.clone(),
+            vec!["sad".into(), "meh".into(), "ok".into(), "great".into()],
+        );
+        tgt.enums
+            .insert(ty.clone(), vec!["sad".into(), "ok".into()]);
         let plan = diff(&src, &tgt);
         let adds: Vec<(String, Option<String>)> = plan
             .changes
@@ -702,7 +931,10 @@ mod tests {
         src.enums.insert(ty.clone(), vec!["b".into(), "a".into()]);
         tgt.enums.insert(ty.clone(), vec!["a".into(), "b".into()]);
         let plan = diff(&src, &tgt);
-        assert!(matches!(plan.changes.as_slice(), [Change::EnumNeedsRebuild { .. }]));
+        assert!(matches!(
+            plan.changes.as_slice(),
+            [Change::EnumNeedsRebuild { .. }]
+        ));
     }
 
     #[test]
@@ -714,17 +946,29 @@ mod tests {
         let mut t_t = s_t.clone();
         s_t.constraints.insert(
             "t_pkey".into(),
-            Constraint { name: "t_pkey".into(), kind: ConstraintKind::PrimaryKey, def: "PRIMARY KEY (id)".into() },
+            Constraint {
+                name: "t_pkey".into(),
+                kind: ConstraintKind::PrimaryKey,
+                def: "PRIMARY KEY (id)".into(),
+            },
         );
         t_t.constraints.insert(
             "t_pkey".into(),
-            Constraint { name: "t_pkey".into(), kind: ConstraintKind::PrimaryKey, def: "PRIMARY KEY (id, x)".into() },
+            Constraint {
+                name: "t_pkey".into(),
+                kind: ConstraintKind::PrimaryKey,
+                def: "PRIMARY KEY (id, x)".into(),
+            },
         );
         src.tables.insert(q.clone(), s_t);
         tgt.tables.insert(q.clone(), t_t);
         let plan = diff(&src, &tgt);
         assert_eq!(plan.changes.len(), 2);
-        assert_eq!(plan.destructive_count(), 0, "replace pair must not be destructive");
+        assert_eq!(
+            plan.destructive_count(),
+            0,
+            "replace pair must not be destructive"
+        );
     }
 
     #[test]
@@ -736,11 +980,19 @@ mod tests {
         let mut t_t = s_t.clone();
         t_t.constraints.insert(
             "t_uniq".into(),
-            Constraint { name: "t_uniq".into(), kind: ConstraintKind::Unique, def: "UNIQUE (id)".into() },
+            Constraint {
+                name: "t_uniq".into(),
+                kind: ConstraintKind::Unique,
+                def: "UNIQUE (id)".into(),
+            },
         );
         t_t.constraints.insert(
             "t_chk".into(),
-            Constraint { name: "t_chk".into(), kind: ConstraintKind::Check, def: "CHECK ((id > 0))".into() },
+            Constraint {
+                name: "t_chk".into(),
+                kind: ConstraintKind::Check,
+                def: "CHECK ((id > 0))".into(),
+            },
         );
         src.tables.insert(q.clone(), s_t);
         tgt.tables.insert(q.clone(), t_t);
@@ -760,7 +1012,9 @@ mod tests {
         src.tables.insert(q.clone(), table_with(vec![s_col]));
         tgt.tables.insert(q.clone(), table_with(vec![t_col]));
         let plan = diff(&src, &tgt);
-        assert!(matches!(plan.changes.as_slice(), [Change::SetDefault { expr, .. }] if expr == "42"));
+        assert!(
+            matches!(plan.changes.as_slice(), [Change::SetDefault { expr, .. }] if expr == "42")
+        );
     }
 }
 
@@ -800,8 +1054,10 @@ mod transition_tests {
 
     fn one_table_pair(s_col: Column, t_col: Column) -> Plan {
         let (mut s, mut t) = (cat(), cat());
-        s.tables.insert(QName::new("public", "t"), table(vec![s_col]));
-        t.tables.insert(QName::new("public", "t"), table(vec![t_col]));
+        s.tables
+            .insert(QName::new("public", "t"), table(vec![s_col]));
+        t.tables
+            .insert(QName::new("public", "t"), table(vec![t_col]));
         diff(&s, &t)
     }
 
@@ -812,15 +1068,30 @@ mod transition_tests {
         let plain = col("id", "bigint");
 
         let plan = one_table_pair(with_identity.clone(), plain.clone());
-        assert!(matches!(plan.changes.as_slice(), [Change::AddIdentity { kind: IdentityKind::Always, .. }]));
+        assert!(matches!(
+            plan.changes.as_slice(),
+            [Change::AddIdentity {
+                kind: IdentityKind::Always,
+                ..
+            }]
+        ));
 
         let plan = one_table_pair(plain, with_identity.clone());
-        assert!(matches!(plan.changes.as_slice(), [Change::DropIdentity { .. }]));
+        assert!(matches!(
+            plan.changes.as_slice(),
+            [Change::DropIdentity { .. }]
+        ));
 
         let mut by_default = with_identity.clone();
         by_default.identity = Some(IdentityKind::ByDefault);
         let plan = one_table_pair(by_default, with_identity);
-        assert!(matches!(plan.changes.as_slice(), [Change::SetIdentityKind { kind: IdentityKind::ByDefault, .. }]));
+        assert!(matches!(
+            plan.changes.as_slice(),
+            [Change::SetIdentityKind {
+                kind: IdentityKind::ByDefault,
+                ..
+            }]
+        ));
     }
 
     #[test]
@@ -831,7 +1102,10 @@ mod transition_tests {
         let mut b = col("len", "integer");
         b.generated = Some("char_length(title)".into());
         let plan = one_table_pair(a, b);
-        assert!(matches!(plan.changes.as_slice(), [Change::RegenerateColumn { .. }]));
+        assert!(matches!(
+            plan.changes.as_slice(),
+            [Change::RegenerateColumn { .. }]
+        ));
     }
 
     #[test]
@@ -842,11 +1116,21 @@ mod transition_tests {
         let plain = col("id", "integer");
 
         let plan = one_table_pair(serial.clone(), plain.clone());
-        assert!(matches!(plan.changes.as_slice(), [Change::MakeSerial { .. }]));
+        assert!(matches!(
+            plan.changes.as_slice(),
+            [Change::MakeSerial { .. }]
+        ));
 
         let plan = one_table_pair(plain, serial);
-        assert!(plan.changes.iter().any(|c| matches!(c, Change::DropSerial { .. })));
-        assert_eq!(plan.destructive_count(), 1, "sequence drop loses the counter");
+        assert!(plan
+            .changes
+            .iter()
+            .any(|c| matches!(c, Change::DropSerial { .. })));
+        assert_eq!(
+            plan.destructive_count(),
+            1,
+            "sequence drop loses the counter"
+        );
     }
 
     #[test]
@@ -865,15 +1149,53 @@ mod transition_tests {
     fn view_trigger_policy_changes_are_replace_pairs() {
         let (mut s, mut t) = (cat(), cat());
         let q = QName::new("public", "v");
-        s.views.insert(q.clone(), View { materialized: false, def: "SELECT 1".into() });
-        t.views.insert(q.clone(), View { materialized: false, def: "SELECT 2".into() });
-        s.triggers.insert("public.t.trg".into(), Trigger { table: QName::new("public", "t"), name: "trg".into(), mode: TriggerMode::Origin, def: "A".into() });
-        t.triggers.insert("public.t.trg".into(), Trigger { table: QName::new("public", "t"), name: "trg".into(), mode: TriggerMode::Origin, def: "B".into() });
+        s.views.insert(
+            q.clone(),
+            View {
+                materialized: false,
+                def: "SELECT 1".into(),
+            },
+        );
+        t.views.insert(
+            q.clone(),
+            View {
+                materialized: false,
+                def: "SELECT 2".into(),
+            },
+        );
+        s.triggers.insert(
+            "public.t.trg".into(),
+            Trigger {
+                table: QName::new("public", "t"),
+                name: "trg".into(),
+                mode: TriggerMode::Origin,
+                def: "A".into(),
+            },
+        );
+        t.triggers.insert(
+            "public.t.trg".into(),
+            Trigger {
+                table: QName::new("public", "t"),
+                name: "trg".into(),
+                mode: TriggerMode::Origin,
+                def: "B".into(),
+            },
+        );
         let plan = diff(&s, &t);
         assert_eq!(plan.changes.len(), 4);
-        assert_eq!(plan.destructive_count(), 0, "replace pairs are not destructive");
-        assert!(plan.changes.iter().any(|c| matches!(c, Change::DropView { replaced: true, .. })));
-        assert!(plan.changes.iter().any(|c| matches!(c, Change::DropTrigger { replaced: true, .. })));
+        assert_eq!(
+            plan.destructive_count(),
+            0,
+            "replace pairs are not destructive"
+        );
+        assert!(plan
+            .changes
+            .iter()
+            .any(|c| matches!(c, Change::DropView { replaced: true, .. })));
+        assert!(plan
+            .changes
+            .iter()
+            .any(|c| matches!(c, Change::DropTrigger { replaced: true, .. })));
     }
 
     #[test]
@@ -889,10 +1211,22 @@ mod transition_tests {
         s.extensions.insert("pgcrypto".into());
         t.extensions.insert("uuid-ossp".into());
         let plan = diff(&s, &t);
-        assert!(plan.changes.iter().any(|c| matches!(c, Change::EnableRls { .. })));
-        assert!(plan.changes.iter().any(|c| matches!(c, Change::ForceRls { .. })));
-        assert!(plan.changes.iter().any(|c| matches!(c, Change::CreateExtension { name } if name == "pgcrypto")));
-        assert!(plan.changes.iter().any(|c| matches!(c, Change::DropExtension { name } if name == "uuid-ossp")));
+        assert!(plan
+            .changes
+            .iter()
+            .any(|c| matches!(c, Change::EnableRls { .. })));
+        assert!(plan
+            .changes
+            .iter()
+            .any(|c| matches!(c, Change::ForceRls { .. })));
+        assert!(plan
+            .changes
+            .iter()
+            .any(|c| matches!(c, Change::CreateExtension { name } if name == "pgcrypto")));
+        assert!(plan
+            .changes
+            .iter()
+            .any(|c| matches!(c, Change::DropExtension { name } if name == "uuid-ossp")));
     }
 
     #[test]
@@ -905,7 +1239,12 @@ mod transition_tests {
         s.tables.insert(q.clone(), st);
         t.tables.insert(q, tt);
         let plan = diff(&s, &t);
-        assert_eq!(plan.changes.len(), 2, "rebuild pair only: {:?}", plan.changes);
+        assert_eq!(
+            plan.changes.len(),
+            2,
+            "rebuild pair only: {:?}",
+            plan.changes
+        );
         assert!(matches!(plan.changes[0], Change::DropTable { .. }));
         assert!(matches!(plan.changes[1], Change::CreateTable { .. }));
     }
@@ -917,12 +1256,17 @@ mod transition_tests {
         t.schemas.insert("legacy".into());
         s.schemas.insert("public".into());
         let plan = diff(&s, &t);
-        assert!(matches!(plan.changes.as_slice(), [Change::DropSchema { name }] if name == "legacy"));
+        assert!(
+            matches!(plan.changes.as_slice(), [Change::DropSchema { name }] if name == "legacy")
+        );
 
         // public on target-only side is never dropped
         let s2 = Catalog::default();
         let plan = diff(&s2, &cat());
-        assert!(plan.changes.iter().all(|c| !matches!(c, Change::DropSchema { .. })));
+        assert!(plan
+            .changes
+            .iter()
+            .all(|c| !matches!(c, Change::DropSchema { .. })));
     }
 
     #[test]

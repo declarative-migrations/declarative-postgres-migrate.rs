@@ -92,7 +92,9 @@ impl Emitter {
         }
         if destructive && !self.allow_destructive {
             self.gated_count += 1;
-            self.comment("[destructive — gated; re-run with --allow-destructive-sql to generate live]");
+            self.comment(
+                "[destructive — gated; re-run with --allow-destructive-sql to generate live]",
+            );
             for s in stmts {
                 for l in s.lines() {
                     let _ = writeln!(self.out, "-- {l}");
@@ -143,7 +145,11 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
     }
 
     // Phase 0: enum value additions, outside the transaction.
-    let adds: Vec<&Change> = plan.changes.iter().filter(|c| matches!(c, Change::AddEnumValue { .. })).collect();
+    let adds: Vec<&Change> = plan
+        .changes
+        .iter()
+        .filter(|c| matches!(c, Change::AddEnumValue { .. }))
+        .collect();
     if !adds.is_empty() {
         e.comment("Enum additions run outside the transaction: a value added inside a");
         e.comment("transaction cannot be referenced until that transaction commits.");
@@ -174,23 +180,37 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
         match c {
             Change::CreateSchema { name } => e.change(
                 &format!("create schema: {name}"),
-                &[format!("CREATE SCHEMA IF NOT EXISTS {};", quote_ident(name))],
+                &[format!(
+                    "CREATE SCHEMA IF NOT EXISTS {};",
+                    quote_ident(name)
+                )],
                 false,
             ),
             Change::CreateExtension { name } => e.change(
                 &format!("create extension: {name}"),
-                &[format!("CREATE EXTENSION IF NOT EXISTS {};", quote_ident(name))],
+                &[format!(
+                    "CREATE EXTENSION IF NOT EXISTS {};",
+                    quote_ident(name)
+                )],
                 false,
             ),
             Change::CreateEnum { ty, labels } => {
-                let labels_sql = labels.iter().map(|l| quote_literal(l)).collect::<Vec<_>>().join(", ");
+                let labels_sql = labels
+                    .iter()
+                    .map(|l| quote_literal(l))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 e.change(
                     &format!("create enum: {}", ty.label()),
                     &[format!("CREATE TYPE {} AS ENUM ({labels_sql});", ty.sql())],
                     false,
                 );
             }
-            Change::EnumNeedsRebuild { ty, source_labels, target_labels } => {
+            Change::EnumNeedsRebuild {
+                ty,
+                source_labels,
+                target_labels,
+            } => {
                 e.manual(&format!(
                     "MANUAL REVIEW: enum {} labels were removed or reordered.\n\
                      desired: {source_labels:?}\n\
@@ -206,10 +226,23 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
 
     // Phase 3: drops of dependents.
     for c in &plan.changes {
-        if let Change::DropTrigger { table, name, replaced } = c {
+        if let Change::DropTrigger {
+            table,
+            name,
+            replaced,
+        } = c
+        {
             e.change(
-                &format!("drop trigger: {}.{name}{}", table.label(), replace_tag(*replaced)),
-                &[format!("DROP TRIGGER IF EXISTS {} ON {};", quote_ident(name), table.sql())],
+                &format!(
+                    "drop trigger: {}.{name}{}",
+                    table.label(),
+                    replace_tag(*replaced)
+                ),
+                &[format!(
+                    "DROP TRIGGER IF EXISTS {} ON {};",
+                    quote_ident(name),
+                    table.sql()
+                )],
                 c.is_destructive(),
             );
         }
@@ -231,19 +264,46 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
         }
     }
     for c in &plan.changes {
-        if let Change::DropPolicy { table, name, replaced } = c {
+        if let Change::DropPolicy {
+            table,
+            name,
+            replaced,
+        } = c
+        {
             e.change(
-                &format!("drop policy: {name} on {}{}", table.label(), replace_tag(*replaced)),
-                &[format!("DROP POLICY IF EXISTS {} ON {};", quote_ident(name), table.sql())],
+                &format!(
+                    "drop policy: {name} on {}{}",
+                    table.label(),
+                    replace_tag(*replaced)
+                ),
+                &[format!(
+                    "DROP POLICY IF EXISTS {} ON {};",
+                    quote_ident(name),
+                    table.sql()
+                )],
                 c.is_destructive(),
             );
         }
     }
     for c in &plan.changes {
-        if let Change::DropView { view, materialized, replaced } = c {
-            let kw = if *materialized { "MATERIALIZED VIEW" } else { "VIEW" };
+        if let Change::DropView {
+            view,
+            materialized,
+            replaced,
+        } = c
+        {
+            let kw = if *materialized {
+                "MATERIALIZED VIEW"
+            } else {
+                "VIEW"
+            };
             e.change(
-                &format!("drop {}: {}{}", kw.to_lowercase(), view.label(), replace_tag(*replaced)),
+                &format!(
+                    "drop {}: {}{}",
+                    kw.to_lowercase(),
+                    view.label(),
+                    replace_tag(*replaced)
+                ),
                 &[format!("DROP {kw} IF EXISTS {};", view.sql())],
                 c.is_destructive(),
             );
@@ -257,7 +317,10 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
         .filter(|c| matches!(c, Change::DropConstraint { .. }))
         .collect();
     ordered_con_drops.sort_by_key(|c| match c {
-        Change::DropConstraint { kind: ConstraintKind::ForeignKey, .. } => 0,
+        Change::DropConstraint {
+            kind: ConstraintKind::ForeignKey,
+            ..
+        } => 0,
         _ => 1,
     });
     for c in ordered_con_drops {
@@ -287,14 +350,21 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
                 )
             };
             e.change(
-                &format!("drop constraint: {name} on {}{}", table.label(), replace_tag(*replaced)),
+                &format!(
+                    "drop constraint: {name} on {}{}",
+                    table.label(),
+                    replace_tag(*replaced)
+                ),
                 &[drop_sql],
                 c.is_destructive(),
             );
         }
     }
     for c in &plan.changes {
-        if let Change::DropIndex { index, replaced, .. } = c {
+        if let Change::DropIndex {
+            index, replaced, ..
+        } = c
+        {
             e.change(
                 &format!("drop index: {}{}", index.label(), replace_tag(*replaced)),
                 &[format!("DROP INDEX IF EXISTS {};", index.sql())],
@@ -306,9 +376,11 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
     // Phase 5: sequences.
     for c in &plan.changes {
         match c {
-            Change::CreateSequence { seq, def } => {
-                e.change(&format!("create sequence: {}", seq.label()), &[sequence_create_sql(seq, def)], false)
-            }
+            Change::CreateSequence { seq, def } => e.change(
+                &format!("create sequence: {}", seq.label()),
+                &[sequence_create_sql(seq, def)],
+                false,
+            ),
             Change::AlterSequence { seq, def } => e.change(
                 &format!(
                     "alter sequence: {}\n\
@@ -327,7 +399,11 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
     for c in &plan.changes {
         if let Change::CreateTable { table, def } = c {
             let statements = create_table_sql(table, def, e.database_flavor);
-            e.change(&format!("create table: {}", table.label()), &statements, false);
+            e.change(
+                &format!("create table: {}", table.label()),
+                &statements,
+                false,
+            );
         }
     }
     for c in &plan.changes {
@@ -336,12 +412,24 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
                 let def_sql = column_def_sql_for_flavor(def, e.database_flavor);
                 e.change(
                     &format!("add column: {}.{}", table.label(), def.name),
-                    &[format!("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {def_sql};", table.sql())],
+                    &[format!(
+                        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {def_sql};",
+                        table.sql()
+                    )],
                     false,
                 );
             }
-            Change::AlterColumnType { table, column, from, to, collation } => {
-                let collate = collation.as_ref().map(|c| format!(" COLLATE {c}")).unwrap_or_default();
+            Change::AlterColumnType {
+                table,
+                column,
+                from,
+                to,
+                collation,
+            } => {
+                let collate = collation
+                    .as_ref()
+                    .map(|c| format!(" COLLATE {c}"))
+                    .unwrap_or_default();
                 e.change(
                     &format!(
                         "alter column type: {}.{column}  {from} -> {to}\n\
@@ -362,15 +450,27 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
                      NOTE: fails if existing rows contain NULLs — backfill first if needed.",
                     table.label()
                 ),
-                &[format!("ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;", table.sql(), quote_ident(column))],
+                &[format!(
+                    "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;",
+                    table.sql(),
+                    quote_ident(column)
+                )],
                 false,
             ),
             Change::DropNotNull { table, column } => e.change(
                 &format!("drop not null: {}.{column}", table.label()),
-                &[format!("ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL;", table.sql(), quote_ident(column))],
+                &[format!(
+                    "ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL;",
+                    table.sql(),
+                    quote_ident(column)
+                )],
                 false,
             ),
-            Change::SetColumnVisibility { table, column, hidden } => e.change(
+            Change::SetColumnVisibility {
+                table,
+                column,
+                hidden,
+            } => e.change(
                 &format!(
                     "set column visibility: {}.{column} -> {}",
                     table.label(),
@@ -384,17 +484,33 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
                 )],
                 false,
             ),
-            Change::SetDefault { table, column, expr } => e.change(
+            Change::SetDefault {
+                table,
+                column,
+                expr,
+            } => e.change(
                 &format!("set default: {}.{column}", table.label()),
-                &[format!("ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {expr};", table.sql(), quote_ident(column))],
+                &[format!(
+                    "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {expr};",
+                    table.sql(),
+                    quote_ident(column)
+                )],
                 false,
             ),
             Change::DropDefault { table, column } => e.change(
                 &format!("drop default: {}.{column}", table.label()),
-                &[format!("ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;", table.sql(), quote_ident(column))],
+                &[format!(
+                    "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
+                    table.sql(),
+                    quote_ident(column)
+                )],
                 false,
             ),
-            Change::MakeSerial { table, column, type_sql } => {
+            Change::MakeSerial {
+                table,
+                column,
+                type_sql,
+            } => {
                 let seq = serial_sequence_qname(table, column);
                 e.change(
                     &format!("make serial: {}.{column} ({type_sql})", table.label()),
@@ -426,13 +542,21 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
                         table.label()
                     ),
                     &[
-                        format!("ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;", table.sql(), quote_ident(column)),
+                        format!(
+                            "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
+                            table.sql(),
+                            quote_ident(column)
+                        ),
                         format!("DROP SEQUENCE IF EXISTS {};", seq.sql()),
                     ],
                     true,
                 );
             }
-            Change::AddIdentity { table, column, kind } => e.change(
+            Change::AddIdentity {
+                table,
+                column,
+                kind,
+            } => e.change(
                 &format!("add identity: {}.{column}", table.label()),
                 &[format!(
                     "ALTER TABLE {} ALTER COLUMN {} ADD {};",
@@ -451,14 +575,22 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
                 )],
                 false,
             ),
-            Change::SetIdentityKind { table, column, kind } => {
+            Change::SetIdentityKind {
+                table,
+                column,
+                kind,
+            } => {
                 let set = match kind {
                     IdentityKind::Always => "SET GENERATED ALWAYS",
                     IdentityKind::ByDefault => "SET GENERATED BY DEFAULT",
                 };
                 e.change(
                     &format!("set identity kind: {}.{column}", table.label()),
-                    &[format!("ALTER TABLE {} ALTER COLUMN {} {set};", table.sql(), quote_ident(column))],
+                    &[format!(
+                        "ALTER TABLE {} ALTER COLUMN {} {set};",
+                        table.sql(),
+                        quote_ident(column)
+                    )],
                     false,
                 );
             }
@@ -473,7 +605,11 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
                         def.name
                     ),
                     &[
-                        format!("ALTER TABLE {} DROP COLUMN IF EXISTS {};", table.sql(), quote_ident(&def.name)),
+                        format!(
+                            "ALTER TABLE {} DROP COLUMN IF EXISTS {};",
+                            table.sql(),
+                            quote_ident(&def.name)
+                        ),
                         format!("ALTER TABLE {} ADD COLUMN {def_sql};", table.sql()),
                     ],
                     true,
@@ -488,7 +624,11 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
         if let Change::DropColumn { table, column } = c {
             e.change(
                 &format!("drop column: {}.{column}", table.label()),
-                &[format!("ALTER TABLE {} DROP COLUMN IF EXISTS {};", table.sql(), quote_ident(column))],
+                &[format!(
+                    "ALTER TABLE {} DROP COLUMN IF EXISTS {};",
+                    table.sql(),
+                    quote_ident(column)
+                )],
                 true,
             );
         }
@@ -527,7 +667,15 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
         .changes
         .iter()
         .filter(|c| matches!(c, Change::AddConstraint { .. }))
-        .partition(|c| !matches!(c, Change::AddConstraint { kind: ConstraintKind::ForeignKey, .. }));
+        .partition(|c| {
+            !matches!(
+                c,
+                Change::AddConstraint {
+                    kind: ConstraintKind::ForeignKey,
+                    ..
+                }
+            )
+        });
     for c in non_fk {
         emit_add_constraint(&mut e, c);
     }
@@ -548,17 +696,46 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
     }
 
     // Phase 9: views (plain first — matviews may select from them).
-    let mut views: Vec<&Change> = plan.changes.iter().filter(|c| matches!(c, Change::CreateView { .. })).collect();
-    views.sort_by_key(|c| matches!(c, Change::CreateView { materialized: true, .. }));
+    let mut views: Vec<&Change> = plan
+        .changes
+        .iter()
+        .filter(|c| matches!(c, Change::CreateView { .. }))
+        .collect();
+    views.sort_by_key(|c| {
+        matches!(
+            c,
+            Change::CreateView {
+                materialized: true,
+                ..
+            }
+        )
+    });
     for c in views {
-        if let Change::CreateView { view, materialized, def } = c {
+        if let Change::CreateView {
+            view,
+            materialized,
+            def,
+        } = c
+        {
             let stmt = if *materialized {
-                format!("CREATE MATERIALIZED VIEW {} AS\n{}", view.sql(), def.trim_end())
+                format!(
+                    "CREATE MATERIALIZED VIEW {} AS\n{}",
+                    view.sql(),
+                    def.trim_end()
+                )
             } else {
                 format!("CREATE VIEW {} AS\n{}", view.sql(), def.trim_end())
             };
             e.change(
-                &format!("create {}: {}", if *materialized { "materialized view" } else { "view" }, view.label()),
+                &format!(
+                    "create {}: {}",
+                    if *materialized {
+                        "materialized view"
+                    } else {
+                        "view"
+                    },
+                    view.label()
+                ),
                 &[ensure_semicolon(&stmt)],
                 false,
             );
@@ -567,7 +744,13 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
 
     // Phase 10: functions/procedures, then triggers.
     for c in &plan.changes {
-        if let Change::CreateFunction { key, kind, def, replacing } = c {
+        if let Change::CreateFunction {
+            key,
+            kind,
+            def,
+            replacing,
+        } = c
+        {
             let tag = if *replacing { " (replacing)" } else { "" };
             e.change(
                 &format!("create {}: {key}{tag}", kind.label()),
@@ -578,7 +761,11 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
     }
     for c in &plan.changes {
         if let Change::CreateTrigger { key, def, .. } = c {
-            e.change(&format!("create trigger: {key}"), &[ensure_semicolon(def)], false);
+            e.change(
+                &format!("create trigger: {key}"),
+                &[ensure_semicolon(def)],
+                false,
+            );
         }
     }
     for c in &plan.changes {
@@ -603,14 +790,20 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
             if def.rls_enabled {
                 e.change(
                     &format!("enable row level security: {}", table.label()),
-                    &[format!("ALTER TABLE {} ENABLE ROW LEVEL SECURITY;", table.sql())],
+                    &[format!(
+                        "ALTER TABLE {} ENABLE ROW LEVEL SECURITY;",
+                        table.sql()
+                    )],
                     false,
                 );
             }
             if def.rls_forced {
                 e.change(
                     &format!("force row level security: {}", table.label()),
-                    &[format!("ALTER TABLE {} FORCE ROW LEVEL SECURITY;", table.sql())],
+                    &[format!(
+                        "ALTER TABLE {} FORCE ROW LEVEL SECURITY;",
+                        table.sql()
+                    )],
                     false,
                 );
             }
@@ -627,22 +820,34 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
         match c {
             Change::EnableRls { table } => e.change(
                 &format!("enable row level security: {}", table.label()),
-                &[format!("ALTER TABLE {} ENABLE ROW LEVEL SECURITY;", table.sql())],
+                &[format!(
+                    "ALTER TABLE {} ENABLE ROW LEVEL SECURITY;",
+                    table.sql()
+                )],
                 false,
             ),
             Change::DisableRls { table } => e.change(
                 &format!("disable row level security: {}", table.label()),
-                &[format!("ALTER TABLE {} DISABLE ROW LEVEL SECURITY;", table.sql())],
+                &[format!(
+                    "ALTER TABLE {} DISABLE ROW LEVEL SECURITY;",
+                    table.sql()
+                )],
                 false,
             ),
             Change::ForceRls { table } => e.change(
                 &format!("force row level security: {}", table.label()),
-                &[format!("ALTER TABLE {} FORCE ROW LEVEL SECURITY;", table.sql())],
+                &[format!(
+                    "ALTER TABLE {} FORCE ROW LEVEL SECURITY;",
+                    table.sql()
+                )],
                 false,
             ),
             Change::UnforceRls { table } => e.change(
                 &format!("no force row level security: {}", table.label()),
-                &[format!("ALTER TABLE {} NO FORCE ROW LEVEL SECURITY;", table.sql())],
+                &[format!(
+                    "ALTER TABLE {} NO FORCE ROW LEVEL SECURITY;",
+                    table.sql()
+                )],
                 false,
             ),
             Change::CreatePolicy { table, def } => e.change(
@@ -724,11 +929,19 @@ fn finish(mut e: Emitter) -> Script {
 }
 
 fn emit_add_constraint(e: &mut Emitter, c: &Change) {
-    if let Change::AddConstraint { table, name, def, kind, table_is_new } = c {
+    if let Change::AddConstraint {
+        table,
+        name,
+        def,
+        kind,
+        table_is_new,
+    } = c
+    {
         // On existing tables, CHECK and FK adds use NOT VALID + VALIDATE so
         // the ACCESS EXCLUSIVE window stays short and existing rows are
         // validated without blocking writes.
-        let two_step = !table_is_new && matches!(kind, ConstraintKind::Check | ConstraintKind::ForeignKey);
+        let two_step =
+            !table_is_new && matches!(kind, ConstraintKind::Check | ConstraintKind::ForeignKey);
         let stmts = if two_step {
             vec![
                 format!(
@@ -736,7 +949,11 @@ fn emit_add_constraint(e: &mut Emitter, c: &Change) {
                     table.sql(),
                     quote_ident(name)
                 ),
-                format!("ALTER TABLE {} VALIDATE CONSTRAINT {};", table.sql(), quote_ident(name)),
+                format!(
+                    "ALTER TABLE {} VALIDATE CONSTRAINT {};",
+                    table.sql(),
+                    quote_ident(name)
+                ),
             ]
         } else {
             vec![format!(
@@ -745,7 +962,11 @@ fn emit_add_constraint(e: &mut Emitter, c: &Change) {
                 quote_ident(name)
             )]
         };
-        e.change(&format!("add constraint: {name} on {}", table.label()), &stmts, false);
+        e.change(
+            &format!("add constraint: {name} on {}", table.label()),
+            &stmts,
+            false,
+        );
     }
 }
 
@@ -798,7 +1019,11 @@ fn create_table_sql(q: &QName, t: &Table, database_flavor: DatabaseFlavor) -> Ve
         .collect();
     for con in t.constraints.values() {
         if con.kind != ConstraintKind::ForeignKey {
-            parts.push(format!("  CONSTRAINT {} {}", quote_ident(&con.name), con.def));
+            parts.push(format!(
+                "  CONSTRAINT {} {}",
+                quote_ident(&con.name),
+                con.def
+            ));
         }
     }
     let partition = t
@@ -864,14 +1089,24 @@ fn policy_create_sql(table: &QName, p: &Policy) -> String {
         "CREATE POLICY {} ON {} AS {} FOR {}",
         quote_ident(&p.name),
         table.sql(),
-        if p.permissive { "PERMISSIVE" } else { "RESTRICTIVE" },
+        if p.permissive {
+            "PERMISSIVE"
+        } else {
+            "RESTRICTIVE"
+        },
         p.command
     );
     if !p.roles.is_empty() {
         let roles = p
             .roles
             .iter()
-            .map(|r| if r == "public" { r.clone() } else { quote_ident(r) })
+            .map(|r| {
+                if r == "public" {
+                    r.clone()
+                } else {
+                    quote_ident(r)
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let _ = write!(sql, " TO {roles}");
@@ -887,7 +1122,10 @@ fn policy_create_sql(table: &QName, p: &Policy) -> String {
 }
 
 fn serial_sequence_qname(table: &QName, column: &str) -> QName {
-    QName::new(table.schema.clone(), format!("{}_{}_seq", table.name, column))
+    QName::new(
+        table.schema.clone(),
+        format!("{}_{}_seq", table.name, column),
+    )
 }
 
 fn replace_tag(replaced: bool) -> &'static str {
@@ -924,7 +1162,11 @@ fn routine_create_sql(def: &str, replacing: bool) -> String {
 }
 
 fn routine_drop_sql(kind: RoutineKind, schema: &str, signature: &str) -> String {
-    format!("DROP {} IF EXISTS {}.{signature};", kind.sql(), quote_ident(schema))
+    format!(
+        "DROP {} IF EXISTS {}.{signature};",
+        kind.sql(),
+        quote_ident(schema)
+    )
 }
 
 #[cfg(test)]
@@ -961,7 +1203,10 @@ mod tests {
         let mut c = base_column("id", "bigint");
         c.identity = Some(IdentityKind::Always);
         c.not_null = true;
-        assert_eq!(column_def_sql(&c), "\"id\" bigint GENERATED ALWAYS AS IDENTITY NOT NULL");
+        assert_eq!(
+            column_def_sql(&c),
+            "\"id\" bigint GENERATED ALWAYS AS IDENTITY NOT NULL"
+        );
     }
 
     #[test]
@@ -980,13 +1225,25 @@ mod tests {
     #[test]
     fn destructive_statements_are_gated_by_default() {
         let mut plan = crate::diff::Plan::default();
-        plan.changes.push(Change::DropTable { table: QName::new("public", "gone") });
+        plan.changes.push(Change::DropTable {
+            table: QName::new("public", "gone"),
+        });
         let script = emit(&plan, &EmitOptions::default());
-        assert!(script.sql.contains("-- DROP TABLE IF EXISTS \"public\".\"gone\";"));
+        assert!(script
+            .sql
+            .contains("-- DROP TABLE IF EXISTS \"public\".\"gone\";"));
         assert_eq!(script.gated_count, 1);
 
-        let script = emit(&plan, &EmitOptions { allow_destructive: true, ..Default::default() });
-        assert!(script.sql.contains("\nDROP TABLE IF EXISTS \"public\".\"gone\";"));
+        let script = emit(
+            &plan,
+            &EmitOptions {
+                allow_destructive: true,
+                ..Default::default()
+            },
+        );
+        assert!(script
+            .sql
+            .contains("\nDROP TABLE IF EXISTS \"public\".\"gone\";"));
         assert_eq!(script.gated_count, 0);
     }
 
@@ -1025,7 +1282,10 @@ mod tests {
         let pk = script.sql.find("parent_pkey").unwrap();
         let fk = script.sql.find("child_parent_fkey\" FOREIGN KEY").unwrap();
         assert!(pk < fk, "PK must be added before FK");
-        assert!(script.sql.contains("NOT VALID"), "FK on existing table uses NOT VALID");
+        assert!(
+            script.sql.contains("NOT VALID"),
+            "FK on existing table uses NOT VALID"
+        );
         assert!(script.sql.contains("VALIDATE CONSTRAINT"));
     }
 
@@ -1050,25 +1310,69 @@ mod ordering_tests {
     }
 
     fn pos(hay: &str, needle: &str) -> usize {
-        hay.find(needle).unwrap_or_else(|| panic!("missing {needle:?} in:\n{hay}"))
+        hay.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle:?} in:\n{hay}"))
     }
 
     #[test]
     fn drops_precede_creates_and_fk_drops_come_first() {
         let t = QName::new("public", "t");
         let plan = plan_of(vec![
-            Change::CreateIndex { table: t.clone(), name: "t_idx".into(), def: "CREATE INDEX t_idx ON public.t USING btree (a)".into() },
-            Change::DropIndex { index: QName::new("public", "t_idx"), unique: false, replaced: true },
-            Change::AddConstraint { table: t.clone(), name: "t_chk".into(), def: "CHECK ((a > 0))".into(), kind: ConstraintKind::Check, table_is_new: false },
-            Change::DropConstraint { table: t.clone(), name: "t_chk".into(), kind: ConstraintKind::Check, replaced: true },
-            Change::DropConstraint { table: t.clone(), name: "t_fk".into(), kind: ConstraintKind::ForeignKey, replaced: true },
-            Change::AddConstraint { table: t.clone(), name: "t_fk".into(), def: "FOREIGN KEY (a) REFERENCES public.p(id)".into(), kind: ConstraintKind::ForeignKey, table_is_new: false },
+            Change::CreateIndex {
+                table: t.clone(),
+                name: "t_idx".into(),
+                def: "CREATE INDEX t_idx ON public.t USING btree (a)".into(),
+            },
+            Change::DropIndex {
+                index: QName::new("public", "t_idx"),
+                unique: false,
+                replaced: true,
+            },
+            Change::AddConstraint {
+                table: t.clone(),
+                name: "t_chk".into(),
+                def: "CHECK ((a > 0))".into(),
+                kind: ConstraintKind::Check,
+                table_is_new: false,
+            },
+            Change::DropConstraint {
+                table: t.clone(),
+                name: "t_chk".into(),
+                kind: ConstraintKind::Check,
+                replaced: true,
+            },
+            Change::DropConstraint {
+                table: t.clone(),
+                name: "t_fk".into(),
+                kind: ConstraintKind::ForeignKey,
+                replaced: true,
+            },
+            Change::AddConstraint {
+                table: t.clone(),
+                name: "t_fk".into(),
+                def: "FOREIGN KEY (a) REFERENCES public.p(id)".into(),
+                kind: ConstraintKind::ForeignKey,
+                table_is_new: false,
+            },
         ]);
-        let sql = emit(&plan, &EmitOptions { allow_destructive: true, ..Default::default() }).sql;
+        let sql = emit(
+            &plan,
+            &EmitOptions {
+                allow_destructive: true,
+                ..Default::default()
+            },
+        )
+        .sql;
 
         // FK drop before non-FK drop; all drops before any (re)creates.
-        assert!(pos(&sql, "DROP CONSTRAINT IF EXISTS \"t_fk\"") < pos(&sql, "DROP CONSTRAINT IF EXISTS \"t_chk\""));
-        assert!(pos(&sql, "DROP CONSTRAINT IF EXISTS \"t_chk\"") < pos(&sql, "ADD CONSTRAINT \"t_chk\""));
+        assert!(
+            pos(&sql, "DROP CONSTRAINT IF EXISTS \"t_fk\"")
+                < pos(&sql, "DROP CONSTRAINT IF EXISTS \"t_chk\"")
+        );
+        assert!(
+            pos(&sql, "DROP CONSTRAINT IF EXISTS \"t_chk\"")
+                < pos(&sql, "ADD CONSTRAINT \"t_chk\"")
+        );
         assert!(pos(&sql, "DROP INDEX IF EXISTS") < pos(&sql, "CREATE INDEX t_idx"));
         // FK re-add comes after non-FK re-add and after index create.
         assert!(pos(&sql, "ADD CONSTRAINT \"t_chk\"") < pos(&sql, "ADD CONSTRAINT \"t_fk\""));
@@ -1105,9 +1409,7 @@ mod ordering_tests {
             },
         )
         .sql;
-        assert!(cockroach.contains(
-            "DROP INDEX IF EXISTS \"app\".\"users_email_key\" CASCADE;"
-        ));
+        assert!(cockroach.contains("DROP INDEX IF EXISTS \"app\".\"users_email_key\" CASCADE;"));
         assert!(!cockroach.contains("DROP CONSTRAINT"));
     }
 
@@ -1115,12 +1417,27 @@ mod ordering_tests {
     fn changed_trigger_drops_before_function_replace_and_recreates_after() {
         let t = QName::new("public", "ev");
         let plan = plan_of(vec![
-            Change::CreateFunction { key: "public.bump()".into(), kind: RoutineKind::Function, def: "CREATE OR REPLACE FUNCTION public.bump() ...".into(), replacing: true },
-            Change::CreateTrigger { key: "public.ev.trg".into(), table: t.clone(), def: "CREATE TRIGGER trg BEFORE UPDATE ON public.ev ...".into() },
-            Change::DropTrigger { table: t.clone(), name: "trg".into(), replaced: true },
+            Change::CreateFunction {
+                key: "public.bump()".into(),
+                kind: RoutineKind::Function,
+                def: "CREATE OR REPLACE FUNCTION public.bump() ...".into(),
+                replacing: true,
+            },
+            Change::CreateTrigger {
+                key: "public.ev.trg".into(),
+                table: t.clone(),
+                def: "CREATE TRIGGER trg BEFORE UPDATE ON public.ev ...".into(),
+            },
+            Change::DropTrigger {
+                table: t.clone(),
+                name: "trg".into(),
+                replaced: true,
+            },
         ]);
         let sql = emit(&plan, &EmitOptions::default()).sql;
-        assert!(pos(&sql, "DROP TRIGGER IF EXISTS \"trg\"") < pos(&sql, "CREATE OR REPLACE FUNCTION"));
+        assert!(
+            pos(&sql, "DROP TRIGGER IF EXISTS \"trg\"") < pos(&sql, "CREATE OR REPLACE FUNCTION")
+        );
         assert!(pos(&sql, "CREATE OR REPLACE FUNCTION") < pos(&sql, "CREATE TRIGGER trg"));
     }
 
@@ -1132,14 +1449,28 @@ mod ordering_tests {
         assert!(script.sql.contains("-- DROP SCHEMA IF EXISTS \"app\";"));
         assert!(!script.sql.contains("DROP SCHEMA IF EXISTS \"app\" CASCADE"));
 
-        let live = emit(&plan, &EmitOptions { allow_destructive: true, ..Default::default() });
+        let live = emit(
+            &plan,
+            &EmitOptions {
+                allow_destructive: true,
+                ..Default::default()
+            },
+        );
         assert!(live.sql.contains("\nDROP SCHEMA IF EXISTS \"app\";"));
     }
 
     #[test]
     fn alter_sequence_clamps_counter_before_altering() {
         let seq = QName::new("public", "order_numbers");
-        let def = Sequence { type_sql: "bigint".into(), start: 100, increment: 10, min_value: 100, max_value: 999, cache: 5, cycle: true };
+        let def = Sequence {
+            type_sql: "bigint".into(),
+            start: 100,
+            increment: 10,
+            min_value: 100,
+            max_value: 999,
+            cache: 5,
+            cycle: true,
+        };
         let plan = plan_of(vec![Change::AlterSequence { seq, def }]);
         let sql = emit(&plan, &EmitOptions::default()).sql;
         let clamp = pos(&sql, "SELECT setval(");
@@ -1152,7 +1483,11 @@ mod ordering_tests {
 
     #[test]
     fn make_serial_emits_sequence_default_ownership_and_setval() {
-        let plan = plan_of(vec![Change::MakeSerial { table: QName::new("public", "a"), column: "id".into(), type_sql: "integer".into() }]);
+        let plan = plan_of(vec![Change::MakeSerial {
+            table: QName::new("public", "a"),
+            column: "id".into(),
+            type_sql: "integer".into(),
+        }]);
         let sql = emit(&plan, &EmitOptions::default()).sql;
         assert!(sql.contains("CREATE SEQUENCE IF NOT EXISTS \"public\".\"a_id_seq\""));
         assert!(sql.contains("SET DEFAULT nextval"));
@@ -1190,20 +1525,59 @@ mod ordering_tests {
             collation: None,
             hidden: false,
         };
-        let plan = plan_of(vec![Change::RegenerateColumn { table: QName::new("public", "posts"), def: col }]);
-        let script = emit(&plan, &EmitOptions { allow_destructive: true, ..Default::default() });
+        let plan = plan_of(vec![Change::RegenerateColumn {
+            table: QName::new("public", "posts"),
+            def: col,
+        }]);
+        let script = emit(
+            &plan,
+            &EmitOptions {
+                allow_destructive: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(script.destructive_count, 1);
         let sql = script.sql;
-        assert!(pos(&sql, "DROP COLUMN IF EXISTS \"title_len\"") < pos(&sql, "ADD COLUMN \"title_len\" integer GENERATED ALWAYS AS (length(title)) STORED"));
+        assert!(
+            pos(&sql, "DROP COLUMN IF EXISTS \"title_len\"")
+                < pos(
+                    &sql,
+                    "ADD COLUMN \"title_len\" integer GENERATED ALWAYS AS (length(title)) STORED"
+                )
+        );
     }
 
     #[test]
     fn create_table_inlines_non_fk_constraints_and_defers_fks() {
         let mut constraints = BTreeMap::new();
-        constraints.insert("c_pkey".into(), Constraint { name: "c_pkey".into(), kind: ConstraintKind::PrimaryKey, def: "PRIMARY KEY (id)".into() });
-        constraints.insert("c_fk".into(), Constraint { name: "c_fk".into(), kind: ConstraintKind::ForeignKey, def: "FOREIGN KEY (p) REFERENCES public.p(id)".into() });
+        constraints.insert(
+            "c_pkey".into(),
+            Constraint {
+                name: "c_pkey".into(),
+                kind: ConstraintKind::PrimaryKey,
+                def: "PRIMARY KEY (id)".into(),
+            },
+        );
+        constraints.insert(
+            "c_fk".into(),
+            Constraint {
+                name: "c_fk".into(),
+                kind: ConstraintKind::ForeignKey,
+                def: "FOREIGN KEY (p) REFERENCES public.p(id)".into(),
+            },
+        );
         let table = Table {
-            columns: vec![Column { name: "id".into(), type_sql: "bigint".into(), not_null: true, default: None, identity: None, generated: None, is_serial: false, collation: None, hidden: false }],
+            columns: vec![Column {
+                name: "id".into(),
+                type_sql: "bigint".into(),
+                not_null: true,
+                default: None,
+                identity: None,
+                generated: None,
+                is_serial: false,
+                collation: None,
+                hidden: false,
+            }],
             constraints,
             indexes: BTreeMap::new(),
             partition_by: None,
@@ -1211,12 +1585,21 @@ mod ordering_tests {
             rls_forced: false,
             policies: BTreeMap::new(),
         };
-        let plan = plan_of(vec![Change::CreateTable { table: QName::new("public", "c"), def: table }]);
+        let plan = plan_of(vec![Change::CreateTable {
+            table: QName::new("public", "c"),
+            def: table,
+        }]);
         let sql = emit(&plan, &EmitOptions::default()).sql;
         let create = pos(&sql, "CREATE TABLE IF NOT EXISTS \"public\".\"c\"");
         let fk = pos(&sql, "ADD CONSTRAINT \"c_fk\"");
-        assert!(sql[create..fk].contains("CONSTRAINT \"c_pkey\" PRIMARY KEY (id)"), "PK inline in CREATE TABLE");
-        assert!(!sql[create..fk].contains("c_fk\" FOREIGN KEY") || fk > create, "FK deferred to FK phase");
+        assert!(
+            sql[create..fk].contains("CONSTRAINT \"c_pkey\" PRIMARY KEY (id)"),
+            "PK inline in CREATE TABLE"
+        );
+        assert!(
+            !sql[create..fk].contains("c_fk\" FOREIGN KEY") || fk > create,
+            "FK deferred to FK phase"
+        );
         // FK on a brand-new (empty) table is single-step: no NOT VALID.
         assert!(!sql.contains("\"c_fk\" FOREIGN KEY (p) REFERENCES public.p(id) NOT VALID"));
     }
