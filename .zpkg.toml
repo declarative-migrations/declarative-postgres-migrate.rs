@@ -2,9 +2,9 @@
 org = "declarative-migrations"
 name = "declarative-postgres-migrate"
 version = "0.3.2"
-description = "Declarative PostgreSQL and CockroachDB schema diff library and dpm command-line tool"
+description = "Declarative PostgreSQL and CockroachDB schema diff library, CLI, and hardened HTTP server"
 license = "MIT"
-keywords = ["cli", "postgres", "migration", "schema", "global-tool"]
+keywords = ["cli", "server", "postgres", "migration", "schema", "global-tool"]
 language = "rust"
 
 [package.repository]
@@ -12,16 +12,17 @@ vcs = "git"
 url = "https://github.com/declarative-migrations/declarative-postgres-migrate.rs"
 
 [build]
-command = "cargo build --release --locked"
-outputs = ["target/release/dpm"]
+command = "cargo build --release --locked --bins"
+outputs = ["target/release/dpm", "target/release/dpm-server"]
 
 [bin]
 dpm = "target/release/dpm"
+dpm-server = "target/release/dpm-server"
 
 [publish]
 include_readme = true
 tag_format = "v{version}"
-smoke_test = "test -x \"$ZED_PKG_TEST_TARGET/target/release/dpm\" && \"$ZED_PKG_TEST_TARGET/target/release/dpm\" --help >/dev/null"
+smoke_test = "test -x \"$ZED_PKG_TEST_TARGET/target/release/dpm\" && test -x \"$ZED_PKG_TEST_TARGET/target/release/dpm-server\" && \"$ZED_PKG_TEST_TARGET/target/release/dpm\" --help >/dev/null && \"$ZED_PKG_TEST_TARGET/target/release/dpm-server\" --help >/dev/null"
 exclude = [".env", ".env.*", ".direnv/**", ".zed/**", ".zed-pack/**", "target/**", "tmp/**", "**/*.log", ".DS_Store", "tests/**", "scripts/publish/**"]
 
 [publish.native]
