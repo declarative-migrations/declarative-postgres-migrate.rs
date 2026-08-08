@@ -70,9 +70,7 @@ impl<'sql> ValidatedScript<'sql> {
                 .iter()
                 .find(|token| normalized.contains(**token))
             {
-                bail!(
-                    "migration scripts may not control their execution lease: found {forbidden}"
-                );
+                bail!("migration scripts may not control their execution lease: found {forbidden}");
             }
         }
         let fingerprint = stable_fingerprint(sql.as_bytes());
@@ -192,7 +190,10 @@ impl PostgresMigrationLease {
             .await
             .context("closing PostgreSQL migration lease connection")?;
         if !unlocked {
-            bail!("PostgreSQL reported migration lease {} was not held", self.key);
+            bail!(
+                "PostgreSQL reported migration lease {} was not held",
+                self.key
+            );
         }
         Ok(PostgresLeaseReceipt {
             key: self.key,
@@ -239,6 +240,9 @@ mod tests {
         assert!(ValidatedScript::parse("SELECT pg_advisory_unlock_all();").is_err());
         let script = ValidatedScript::parse("SELECT 1; SELECT 2;").unwrap();
         assert_eq!(script.statement_count(), 2);
-        assert_eq!(script.fingerprint(), stable_fingerprint(script.sql().as_bytes()));
+        assert_eq!(
+            script.fingerprint(),
+            stable_fingerprint(script.sql().as_bytes())
+        );
     }
 }
