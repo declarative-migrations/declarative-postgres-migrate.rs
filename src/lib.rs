@@ -13,6 +13,7 @@
 //! - [`introspect`]: live database → `Catalog` (canonical `search_path = ''`
 //!   deparsing, extension-owned objects excluded).
 //! - [`diff()`]: `Catalog` × `Catalog` → typed [`diff::Plan`]. Pure.
+//! - [`plan_safety`]: typed-plan resource borrows and exact plan certificates.
 //! - [`emit()`]: `Plan` → ordered SQL script with destructive-change gating.
 //! - [`apply`]: statement-splitting executor.
 //! - [`formal`]: typestate capabilities and a bounded migration model checker.
@@ -35,6 +36,7 @@ pub mod formal;
 pub mod introspect;
 pub mod lease;
 pub mod model;
+pub mod plan_safety;
 pub mod source;
 pub mod verify;
 
@@ -42,3 +44,7 @@ pub use diff::{diff, Change, Plan};
 pub use emit::{emit, EmitOptions, Script};
 pub use introspect::{introspect_url, IntrospectOptions};
 pub use model::{Catalog, DatabaseFlavor, RoutineKind, TriggerMode};
+pub use plan_safety::{
+    certify_plan, check_parallel_changes, BorrowConflict, BorrowMode, BorrowScope, CertifiedPlan,
+    PlanCertificate, ResourceBorrow, ResourcePath,
+};
