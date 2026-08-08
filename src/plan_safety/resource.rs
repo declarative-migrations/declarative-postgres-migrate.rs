@@ -124,8 +124,7 @@ impl ResourceBorrow {
             return true;
         }
         (self.scope == BorrowScope::Subtree && self.resource.is_prefix_of(&other.resource))
-            || (other.scope == BorrowScope::Subtree
-                && other.resource.is_prefix_of(&self.resource))
+            || (other.scope == BorrowScope::Subtree && other.resource.is_prefix_of(&self.resource))
     }
 }
 
@@ -276,7 +275,10 @@ fn change_borrows(change: &Change) -> BTreeSet<ResourceBorrow> {
             exclusive!(ResourcePath::object(&view.schema, "view", &view.name));
         }
         Change::CreateFunction { key, .. } => {
-            let schema = key.split_once('.').map(|(schema, _)| schema).unwrap_or("<unknown>");
+            let schema = key
+                .split_once('.')
+                .map(|(schema, _)| schema)
+                .unwrap_or("<unknown>");
             exclusive!(ResourcePath::object(schema, "routine", key));
         }
         Change::DropFunction { key, schema, .. } => {
@@ -400,38 +402,31 @@ mod tests {
     #[test]
     fn shared_borrows_can_coexist() {
         let resource = ResourcePath::object("public", "table", "users");
-        assert!(
-            !ResourceBorrow::shared(resource.clone())
-                .conflicts_with(&ResourceBorrow::shared(resource))
-        );
+        assert!(!ResourceBorrow::shared(resource.clone())
+            .conflicts_with(&ResourceBorrow::shared(resource)));
     }
 
     #[test]
     fn exclusive_borrow_conflicts_with_shared_borrow() {
         let resource = ResourcePath::object("public", "table", "users");
-        assert!(
-            ResourceBorrow::exclusive(resource.clone())
-                .conflicts_with(&ResourceBorrow::shared(resource))
-        );
+        assert!(ResourceBorrow::exclusive(resource.clone())
+            .conflicts_with(&ResourceBorrow::shared(resource)));
     }
 
     #[test]
     fn schema_subtree_conflicts_with_child_table() {
         let schema = ResourceBorrow::exclusive_subtree(ResourcePath::schema("public"));
-        let table =
-            ResourceBorrow::exclusive(ResourcePath::object("public", "table", "users"));
+        let table = ResourceBorrow::exclusive(ResourcePath::object("public", "table", "users"));
         assert!(schema.conflicts_with(&table));
         assert!(table.conflicts_with(&schema));
     }
 
     #[test]
     fn sibling_tables_do_not_conflict() {
-        let left = ResourceBorrow::exclusive_subtree(ResourcePath::object(
-            "public", "table", "users",
-        ));
-        let right = ResourceBorrow::exclusive_subtree(ResourcePath::object(
-            "public", "table", "orders",
-        ));
+        let left =
+            ResourceBorrow::exclusive_subtree(ResourcePath::object("public", "table", "users"));
+        let right =
+            ResourceBorrow::exclusive_subtree(ResourcePath::object("public", "table", "orders"));
         assert!(!left.conflicts_with(&right));
     }
 }
