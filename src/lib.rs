@@ -15,6 +15,8 @@
 //! - [`diff()`]: `Catalog` × `Catalog` → typed [`diff::Plan`]. Pure.
 //! - [`emit()`]: `Plan` → ordered SQL script with destructive-change gating.
 //! - [`apply`]: statement-splitting executor.
+//! - [`formal`]: typestate capabilities and a bounded migration model checker.
+//! - [`lease`]: borrow-checked PostgreSQL advisory leases and validated scripts.
 //! - [`verify`]: replay the migration on a shadow replica and prove
 //!   convergence; optional external cross-checkers (migra, pgdiff, ...).
 //! - [`advisor`]: non-DDL advice (foreign keys lacking supporting indexes).
@@ -25,11 +27,16 @@ pub mod advisor;
 pub mod ai;
 pub mod apply;
 pub mod canonicalize;
+// `DirBuilder::mode` mutates the scratch-directory builder only on Unix. Keep
+// Windows strict-lint builds focused while preserving mode 0o700 on Unix.
+#[cfg_attr(windows, allow(unused_mut))]
 pub mod crosscheck;
 pub mod diff;
 pub mod emit;
 pub mod flagenv;
+pub mod formal;
 pub mod introspect;
+pub mod lease;
 pub mod model;
 pub mod source;
 pub mod verify;

@@ -54,7 +54,9 @@ jobs:
             exit 0
           fi
           printf 'Checking %s\n' "${rust_files[@]}"
-          rustfmt --edition 2021 --check "${rust_files[@]}"
+          for file in "${rust_files[@]}"; do
+            rustfmt --edition 2021 --check --config skip_children=true "$file"
+          done
       - name: clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: unit tests
