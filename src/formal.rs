@@ -144,10 +144,7 @@ impl<T> Migration<T, Draft> {
     }
 
     /// Cross an infallible validation boundary.
-    pub fn validate(
-        self,
-        validate: impl FnOnce(&T) -> ValidationProof,
-    ) -> Migration<T, Validated> {
+    pub fn validate(self, validate: impl FnOnce(&T) -> ValidationProof) -> Migration<T, Validated> {
         let proof = validate(&self.payload);
         Migration {
             payload: self.payload,
@@ -297,10 +294,7 @@ impl LeaseState {
                 epoch: self.epoch,
             });
         }
-        let epoch = self
-            .epoch
-            .checked_add(1)
-            .ok_or(LeaseError::EpochOverflow)?;
+        let epoch = self.epoch.checked_add(1).ok_or(LeaseError::EpochOverflow)?;
         self.epoch = epoch;
         self.owner = Some(owner.clone());
         Ok(LeaseGuard {
@@ -475,11 +469,12 @@ impl ModelState {
                 });
             }
         };
-        next.check_invariants().map_err(|violation| TransitionError {
-            state: violation.state,
-            action,
-            reason: violation.reason,
-        })?;
+        next.check_invariants()
+            .map_err(|violation| TransitionError {
+                state: violation.state,
+                action,
+                reason: violation.reason,
+            })?;
         Ok(next)
     }
 
@@ -540,7 +535,11 @@ pub struct InvariantViolation {
 
 impl fmt::Display for InvariantViolation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "state {:?} violates invariant: {}", self.state, self.reason)
+        write!(
+            f,
+            "state {:?} violates invariant: {}",
+            self.state, self.reason
+        )
     }
 }
 
@@ -562,11 +561,7 @@ pub struct Counterexample {
 
 impl fmt::Display for Counterexample {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "counterexample {:?}: {}",
-            self.trace, self.violation
-        )
+        write!(f, "counterexample {:?}: {}", self.trace, self.violation)
     }
 }
 
@@ -612,10 +607,12 @@ fn visit_model(
     report: &mut ModelCheckReport,
 ) -> Result<(), Counterexample> {
     report.states_checked += 1;
-    state.check_invariants().map_err(|violation| Counterexample {
-        trace: trace.clone(),
-        violation,
-    })?;
+    state
+        .check_invariants()
+        .map_err(|violation| Counterexample {
+            trace: trace.clone(),
+            violation,
+        })?;
     if remaining == 0 {
         return Ok(());
     }
