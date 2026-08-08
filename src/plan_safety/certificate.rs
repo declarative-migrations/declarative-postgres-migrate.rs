@@ -8,9 +8,7 @@ use serde::Serialize;
 use crate::diff::{Change, Plan};
 use crate::formal::{stable_fingerprint, Migration, Validated, ValidationProof};
 
-use super::resource::{
-    first_conflict, step_conflicts_with_any, BorrowConflict, BorrowedStep,
-};
+use super::resource::{first_conflict, step_conflicts_with_any, BorrowConflict, BorrowedStep};
 use super::PLAN_SAFETY_MODEL_VERSION;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -131,9 +129,7 @@ impl CertifiedPlan {
         let encoded = serde_json::to_vec(&self.certificate)
             .expect("PlanCertificate serialization is infallible");
         let checked_items = self.certificate.change_count;
-        Migration::new(self).validate(move |_| {
-            ValidationProof::for_bytes(&encoded, checked_items)
-        })
+        Migration::new(self).validate(move |_| ValidationProof::for_bytes(&encoded, checked_items))
     }
 }
 
