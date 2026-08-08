@@ -79,9 +79,7 @@ fn certified_plan_bridges_to_linear_typestate_and_lease_owner() {
     assert_eq!(migration.proof().checked_items(), 1);
 
     let mut leases = LeaseState::default();
-    let guard = leases
-        .acquire(OwnerId::new("planner-a").unwrap())
-        .unwrap();
+    let guard = leases.acquire(OwnerId::new("planner-a").unwrap()).unwrap();
     let applied = migration.authorize(&guard).finish();
     let certified = applied.into_inner();
     assert_eq!(certified.certificate().change_count, 1);
