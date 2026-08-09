@@ -23,7 +23,10 @@ pub fn advise_fk_indexes(cat: &Catalog) -> Vec<FkIndexAdvice> {
     for (q, table) in &cat.tables {
         let mut covered: Vec<String> = Vec::new();
         for con in table.constraints.values() {
-            if matches!(con.kind, ConstraintKind::PrimaryKey | ConstraintKind::Unique) {
+            if matches!(
+                con.kind,
+                ConstraintKind::PrimaryKey | ConstraintKind::Unique
+            ) {
                 if let Some(col) = leading_column_of_key_list(&con.def) {
                     covered.push(col);
                 }
@@ -39,7 +42,9 @@ pub fn advise_fk_indexes(cat: &Catalog) -> Vec<FkIndexAdvice> {
             if con.kind != ConstraintKind::ForeignKey {
                 continue;
             }
-            let Some(col) = leading_column_of_key_list(&con.def) else { continue };
+            let Some(col) = leading_column_of_key_list(&con.def) else {
+                continue;
+            };
             if covered.iter().any(|c| c.eq_ignore_ascii_case(&col)) {
                 continue;
             }
@@ -151,7 +156,10 @@ mod tests {
             leading_column_of_key_list("FOREIGN KEY (user_id) REFERENCES public.users(id)"),
             Some("user_id".to_string())
         );
-        assert_eq!(leading_column_of_key_list("PRIMARY KEY (id, org)"), Some("id".to_string()));
+        assert_eq!(
+            leading_column_of_key_list("PRIMARY KEY (id, org)"),
+            Some("id".to_string())
+        );
         assert_eq!(
             leading_column_of_indexdef(
                 "CREATE INDEX t_idx ON public.t USING btree (org_id, created_at)"
@@ -159,7 +167,9 @@ mod tests {
             Some("org_id".to_string())
         );
         assert_eq!(
-            leading_column_of_indexdef("CREATE INDEX t_expr ON public.t USING btree (lower(email))"),
+            leading_column_of_indexdef(
+                "CREATE INDEX t_expr ON public.t USING btree (lower(email))"
+            ),
             Some("lower(email)".to_string())
         );
     }

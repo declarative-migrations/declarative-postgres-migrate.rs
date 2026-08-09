@@ -160,7 +160,11 @@ async fn canonicalize_on(
             let gen_exprs: Vec<(String, String)> = table
                 .columns
                 .iter()
-                .filter_map(|c| c.generated.as_ref().map(|g| (c.type_sql.clone(), g.clone())))
+                .filter_map(|c| {
+                    c.generated
+                        .as_ref()
+                        .map(|g| (c.type_sql.clone(), g.clone()))
+                })
                 .filter(|(_, expr)| !canonical.contains_key(&(sig.clone(), expr.clone())))
                 .collect();
 
@@ -414,10 +418,7 @@ async fn round_trip_generated(
 /// read back `pg_get_viewdef`, drop it again. `def` is the stored view body
 /// (the SELECT from `pg_get_viewdef`); a regular view suffices to canonicalize
 /// a materialized view's body since the deparse form is identical.
-async fn round_trip_view(
-    conn: &mut sqlx::postgres::PgConnection,
-    def: &str,
-) -> Result<String> {
+async fn round_trip_view(conn: &mut sqlx::postgres::PgConnection, def: &str) -> Result<String> {
     sqlx::raw_sql("DROP VIEW IF EXISTS public._dpm_canon_view")
         .execute(&mut *conn)
         .await

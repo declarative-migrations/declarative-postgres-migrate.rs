@@ -58,7 +58,8 @@ impl Serialize for QName {
 impl<'de> Deserialize<'de> for QName {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
-        parse_qname(&raw).ok_or_else(|| serde::de::Error::custom(format!("invalid qualified name: {raw:?}")))
+        parse_qname(&raw)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid qualified name: {raw:?}")))
     }
 }
 
@@ -90,7 +91,10 @@ pub fn parse_qname(raw: &str) -> Option<QName> {
 
 impl QName {
     pub fn new(schema: impl Into<String>, name: impl Into<String>) -> Self {
-        Self { schema: schema.into(), name: name.into() }
+        Self {
+            schema: schema.into(),
+            name: name.into(),
+        }
     }
 
     /// Quoted, schema-qualified identifier for emitted DDL.
@@ -333,11 +337,7 @@ impl Function {
         if self.name.is_empty() {
             self.signature.clone()
         } else {
-            format!(
-                "{}({})",
-                quote_ident(&self.name),
-                self.identity_arguments
-            )
+            format!("{}({})", quote_ident(&self.name), self.identity_arguments)
         }
     }
 }
@@ -508,7 +508,10 @@ mod tests {
     #[test]
     fn catalog_json_round_trip() {
         let mut cat = Catalog::empty_with_schemas(["public".to_string()]);
-        cat.enums.insert(QName::new("public", "mood"), vec!["sad".into(), "ok".into()]);
+        cat.enums.insert(
+            QName::new("public", "mood"),
+            vec!["sad".into(), "ok".into()],
+        );
         let json = serde_json::to_string(&cat).unwrap();
         let back: Catalog = serde_json::from_str(&json).unwrap();
         assert_eq!(cat, back);
