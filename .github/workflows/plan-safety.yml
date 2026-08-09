@@ -1,0 +1,45 @@
+name: typed plan safety
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plan-safety-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  borrow-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Format plan-safety files
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in src/lib.rs src/plan_safety/*.rs tests/plan_safety.rs; do
+            rustfmt --edition 2021 --check --config skip_children=true "$file"
+          done
+      - name: Lint plan-safety targets
+        run: cargo clippy --locked --lib --test plan_safety -- -D warnings
+      - name: Check module and compile-time contracts
+        run: |
+          cargo test --locked --lib plan_safety::
+          cargo test --locked --doc
+      - name: Run high-volume generated-plan properties
+        env:
+          PROPTEST_CASES: 4096
+        run: cargo test --locked --test plan_safety
