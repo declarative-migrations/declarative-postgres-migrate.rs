@@ -42,6 +42,7 @@ pub mod lease;
 pub mod model;
 pub mod plan_safety;
 pub mod source;
+pub mod sync;
 pub mod verify;
 
 pub use diff::{diff, Change, Plan};
