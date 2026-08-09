@@ -41,6 +41,7 @@ pub mod introspect;
 pub mod lease;
 pub mod model;
 pub mod plan_safety;
+pub mod server;
 pub mod source;
 pub mod sync;
 pub mod verify;

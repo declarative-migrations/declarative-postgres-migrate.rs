@@ -19,6 +19,10 @@ path = "src/lib.rs"
 name = "dpm"
 path = "src/main.rs"
 
+[[bin]]
+name = "dpm-server"
+path = "src/bin/dpm-server.rs"
+
 [dependencies]
 anyhow = "1"
 libloading = "0.9"
@@ -34,7 +38,14 @@ sqlx = { version = "0.8", default-features = false, features = [
   "postgres",
   "macros",
 ] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "io-util",
+  "signal",
+  "sync",
+] }
 toml = "1.1"
 
 [dev-dependencies]
