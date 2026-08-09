@@ -36,11 +36,14 @@ pub mod diff;
 pub mod emit;
 pub mod flagenv;
 pub mod formal;
+pub mod interfaces;
 pub mod introspect;
 pub mod lease;
 pub mod model;
 pub mod plan_safety;
+pub mod server;
 pub mod source;
+pub mod sync;
 pub mod verify;
 
 pub use diff::{diff, Change, Plan};
