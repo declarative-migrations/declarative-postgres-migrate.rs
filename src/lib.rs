@@ -36,6 +36,7 @@ pub mod diff;
 pub mod emit;
 pub mod flagenv;
 pub mod formal;
+pub mod interfaces;
 pub mod introspect;
 pub mod lease;
 pub mod model;
