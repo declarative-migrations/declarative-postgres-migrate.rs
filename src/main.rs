@@ -578,7 +578,9 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
         let refreshed_inputs = load_sides(r, false).await?;
         let (refreshed_plan, refreshed_script, _) = render(r, &refreshed_inputs, policy.sql);
         if refreshed_plan.is_empty() {
-            eprintln!("dpm: target converged before the execution lease was acquired — nothing to apply");
+            eprintln!(
+                "dpm: target converged before the execution lease was acquired — nothing to apply"
+            );
             release_migration_lease(lease).await?;
             return Ok(0);
         }
