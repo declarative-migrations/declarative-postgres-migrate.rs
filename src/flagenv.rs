@@ -82,9 +82,14 @@ pub fn load_config() -> Result<FlagConfig> {
     // Prefer a project-local .cli-flags.toml (flags-2-env convention), fall
     // back to the one embedded at build time so the installed binary works
     // from any directory.
-    let text = std::fs::read_to_string(".cli-flags.toml").unwrap_or_else(|_| EMBEDDED_CLI_FLAGS_TOML.to_string());
+    let text = std::fs::read_to_string(".cli-flags.toml")
+        .unwrap_or_else(|_| EMBEDDED_CLI_FLAGS_TOML.to_string());
     let parsed: CliFlagsFile = toml::from_str(&text).context("invalid .cli-flags.toml")?;
-    let config = FlagConfig { flags: parsed.flags, commands: parsed.commands, parse: parsed.parse };
+    let config = FlagConfig {
+        flags: parsed.flags,
+        commands: parsed.commands,
+        parse: parsed.parse,
+    };
     config.audit_commands()?;
     Ok(config)
 }
@@ -147,7 +152,10 @@ impl FlagConfig {
 /// Parse `argv` (excluding program name and subcommand) into an env-override
 /// map. Uses the native flags2env core when loadable, otherwise the built-in
 /// parser. Also returns leftover positionals.
-pub fn parse(config: &FlagConfig, argv: &[String]) -> Result<(HashMap<String, String>, Vec<String>)> {
+pub fn parse(
+    config: &FlagConfig,
+    argv: &[String],
+) -> Result<(HashMap<String, String>, Vec<String>)> {
     if let Some(map) = try_native(argv) {
         // Native core consumed the flags; recompute positionals with the
         // fallback tokenizer (the core reports flags only).
@@ -190,7 +198,10 @@ fn try_native(argv: &[String]) -> Option<HashMap<String, String>> {
 // Built-in fallback parser (same .cli-flags.toml contract).
 // ---------------------------------------------------------------------------
 
-fn parse_fallback(config: &FlagConfig, argv: &[String]) -> Result<(HashMap<String, String>, Vec<String>)> {
+fn parse_fallback(
+    config: &FlagConfig,
+    argv: &[String],
+) -> Result<(HashMap<String, String>, Vec<String>)> {
     // alias -> flag key; short -> flag key
     let mut by_alias: HashMap<String, &str> = HashMap::new();
     let mut by_short: HashMap<String, &str> = HashMap::new();
@@ -222,7 +233,8 @@ fn parse_fallback(config: &FlagConfig, argv: &[String]) -> Result<(HashMap<Strin
             continue;
         }
 
-        let (key, inline_value): (&str, Option<String>) = if let Some(long) = tok.strip_prefix("--") {
+        let (key, inline_value): (&str, Option<String>) = if let Some(long) = tok.strip_prefix("--")
+        {
             let (name, val) = match long.split_once('=') {
                 Some((n, v)) => (n, Some(v.to_string())),
                 None => (long, None),
@@ -308,7 +320,10 @@ impl Resolved {
                 defaults.insert(spec.env.clone(), v);
             }
         }
-        Self { overrides, defaults }
+        Self {
+            overrides,
+            defaults,
+        }
     }
 
     pub fn get(&self, env_key: &str) -> Option<String> {
@@ -331,7 +346,12 @@ impl Resolved {
 
     pub fn get_bool(&self, env_key: &str) -> bool {
         self.get(env_key)
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "t" | "1" | "yes" | "y"))
+            .map(|v| {
+                matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "true" | "t" | "1" | "yes" | "y"
+                )
+            })
             .unwrap_or(false)
     }
 }
@@ -364,11 +384,29 @@ pub fn help_table(config: &FlagConfig) -> String {
             spec.help.clone().unwrap_or_default(),
         ));
     }
-    let w0 = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max("options".len());
-    let w1 = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max("env".len());
-    let w2 = rows.iter().map(|r| r.2.len()).max().unwrap_or(0).max("default".len());
+    let w0 = rows
+        .iter()
+        .map(|r| r.0.len())
+        .max()
+        .unwrap_or(0)
+        .max("options".len());
+    let w1 = rows
+        .iter()
+        .map(|r| r.1.len())
+        .max()
+        .unwrap_or(0)
+        .max("env".len());
+    let w2 = rows
+        .iter()
+        .map(|r| r.2.len())
+        .max()
+        .unwrap_or(0)
+        .max("default".len());
     let mut out = String::new();
-    out.push_str(&format!("  {:w0$}  {:w1$}  {:w2$}  description\n", "options", "env", "default"));
+    out.push_str(&format!(
+        "  {:w0$}  {:w1$}  {:w2$}  description\n",
+        "options", "env", "default"
+    ));
     for (a, b, c, d) in rows {
         out.push_str(&format!("  {a:w0$}  {b:w1$}  {c:w2$}  {d}\n"));
     }
@@ -400,7 +438,11 @@ aliases = ["jobs"]
 type = "integer"
 "#;
         let parsed: CliFlagsFile = toml::from_str(text).unwrap();
-        FlagConfig { flags: parsed.flags, commands: parsed.commands, parse: parsed.parse }
+        FlagConfig {
+            flags: parsed.flags,
+            commands: parsed.commands,
+            parse: parsed.parse,
+        }
     }
 
     fn args(list: &[&str]) -> Vec<String> {
@@ -418,7 +460,11 @@ type = "integer"
             args(&["-spostgres://x"]),
         ] {
             let (map, _) = parse_fallback(&cfg, &argv).unwrap();
-            assert_eq!(map.get("SOURCE_DATABASE_URL").map(String::as_str), Some("postgres://x"), "argv: {argv:?}");
+            assert_eq!(
+                map.get("SOURCE_DATABASE_URL").map(String::as_str),
+                Some("postgres://x"),
+                "argv: {argv:?}"
+            );
         }
     }
 
@@ -426,9 +472,15 @@ type = "integer"
     fn bool_flags_and_integers() {
         let cfg = config();
         let (map, _) = parse_fallback(&cfg, &args(&["--allow-destructive"])).unwrap();
-        assert_eq!(map.get("DPM_ALLOW_DESTRUCTIVE").map(String::as_str), Some("true"));
+        assert_eq!(
+            map.get("DPM_ALLOW_DESTRUCTIVE").map(String::as_str),
+            Some("true")
+        );
         let (map, _) = parse_fallback(&cfg, &args(&["--allow-destructive=0"])).unwrap();
-        assert_eq!(map.get("DPM_ALLOW_DESTRUCTIVE").map(String::as_str), Some("false"));
+        assert_eq!(
+            map.get("DPM_ALLOW_DESTRUCTIVE").map(String::as_str),
+            Some("false")
+        );
         assert!(parse_fallback(&cfg, &args(&["--jobs", "abc"])).is_err());
     }
 
@@ -448,7 +500,10 @@ type = "integer"
         let resolved = Resolved::new(&cfg, map);
         assert!(resolved.get_bool("DPM_ALLOW_DESTRUCTIVE"));
         let resolved = Resolved::new(&cfg, HashMap::new());
-        assert_eq!(resolved.get("DPM_ALLOW_DESTRUCTIVE").as_deref(), Some("false"));
+        assert_eq!(
+            resolved.get("DPM_ALLOW_DESTRUCTIVE").as_deref(),
+            Some("false")
+        );
     }
 }
 
@@ -461,8 +516,13 @@ mod contract_tests {
     /// internally consistent: no duplicate env keys, aliases, or shorts.
     #[test]
     fn embedded_cli_flags_contract_is_consistent() {
-        let parsed: CliFlagsFile = toml::from_str(EMBEDDED_CLI_FLAGS_TOML).expect("embedded .cli-flags.toml parses");
-        assert!(parsed.flags.len() >= 25, "expected a rich contract, got {}", parsed.flags.len());
+        let parsed: CliFlagsFile =
+            toml::from_str(EMBEDDED_CLI_FLAGS_TOML).expect("embedded .cli-flags.toml parses");
+        assert!(
+            parsed.flags.len() >= 25,
+            "expected a rich contract, got {}",
+            parsed.flags.len()
+        );
 
         let mut envs = HashSet::new();
         let mut aliases = HashSet::new();
@@ -470,7 +530,10 @@ mod contract_tests {
         for (key, spec) in &parsed.flags {
             assert!(envs.insert(spec.env.clone()), "duplicate env {}", spec.env);
             assert!(
-                spec.env.starts_with("DPM_") || spec.env.ends_with("_URL") || spec.env.ends_with("_FILE") || spec.env.ends_with("_JSON"),
+                spec.env.starts_with("DPM_")
+                    || spec.env.ends_with("_URL")
+                    || spec.env.ends_with("_FILE")
+                    || spec.env.ends_with("_JSON"),
                 "unconventional env name {} for flag {key}",
                 spec.env
             );
@@ -481,7 +544,10 @@ mod contract_tests {
                 assert!(shorts.insert(s.clone()), "short -{s} claimed twice");
                 assert_eq!(s.len(), 1, "short -{s} must be one char");
             }
-            assert!(matches!(spec.r#type.as_str(), "string" | "bool" | "integer" | "json"), "bad type for {key}");
+            assert!(
+                matches!(spec.r#type.as_str(), "string" | "bool" | "integer" | "json"),
+                "bad type for {key}"
+            );
             assert!(spec.help.is_some(), "flag {key} has no help text");
         }
     }
@@ -491,8 +557,15 @@ mod contract_tests {
         let config = load_config().unwrap();
         let table = help_table(&config);
         for (key, spec) in &config.flags {
-            assert!(table.contains(&format!("--{key}")), "help table missing --{key}");
-            assert!(table.contains(&spec.env), "help table missing env {}", spec.env);
+            assert!(
+                table.contains(&format!("--{key}")),
+                "help table missing --{key}"
+            );
+            assert!(
+                table.contains(&spec.env),
+                "help table missing env {}",
+                spec.env
+            );
         }
     }
 
@@ -500,11 +573,21 @@ mod contract_tests {
     fn get_first_prefers_earlier_keys() {
         let config = load_config().unwrap();
         let mut overrides = std::collections::HashMap::new();
-        overrides.insert("TARGET_DATABASE_URL".to_string(), "postgres://t".to_string());
+        overrides.insert(
+            "TARGET_DATABASE_URL".to_string(),
+            "postgres://t".to_string(),
+        );
         overrides.insert("DATABASE_URL".to_string(), "postgres://d".to_string());
         let r = Resolved::new(&config, overrides);
-        assert_eq!(r.get_first(&["TARGET_DATABASE_URL", "DATABASE_URL"]).as_deref(), Some("postgres://t"));
-        assert_eq!(r.get_first(&["NOPE_XYZ_123", "DATABASE_URL"]).as_deref(), Some("postgres://d"));
+        assert_eq!(
+            r.get_first(&["TARGET_DATABASE_URL", "DATABASE_URL"])
+                .as_deref(),
+            Some("postgres://t")
+        );
+        assert_eq!(
+            r.get_first(&["NOPE_XYZ_123", "DATABASE_URL"]).as_deref(),
+            Some("postgres://d")
+        );
     }
 
     #[test]
@@ -515,10 +598,16 @@ mod contract_tests {
         let config = load_config().unwrap();
         let mut declared: Vec<&str> = config.commands.keys().map(String::as_str).collect();
         declared.sort_unstable();
-        assert_eq!(declared, ["apply", "bootstrap", "diff", "dump", "review", "verify"]);
+        assert_eq!(
+            declared,
+            ["apply", "bootstrap", "diff", "dump", "review", "verify"]
+        );
         assert_eq!(config.command_env_key(), Some("FLAGS2ENV_COMMAND"));
         for name in &declared {
-            assert!(config.command_marker_env(name).is_some(), "command `{name}` has no marker env");
+            assert!(
+                config.command_marker_env(name).is_some(),
+                "command `{name}` has no marker env"
+            );
         }
     }
 
@@ -526,7 +615,10 @@ mod contract_tests {
     fn command_tokens_canonicalize_and_reject_unknowns() {
         let config = load_config().unwrap();
         assert_eq!(config.canonical_command("apply").as_deref(), Some("apply"));
-        assert_eq!(config.canonical_command("verify").as_deref(), Some("verify"));
+        assert_eq!(
+            config.canonical_command("verify").as_deref(),
+            Some("verify")
+        );
         assert_eq!(config.canonical_command("not-a-command"), None);
     }
 
@@ -536,7 +628,11 @@ mod contract_tests {
         // `flags2env audit`), so the contract can't ship an ambiguous key.
         let text = "[flags.source]\nenv = \"SOURCE_DATABASE_URL\"\n\n[commands.diff]\nenv = \"SOURCE_DATABASE_URL\"\n";
         let parsed: CliFlagsFile = toml::from_str(text).unwrap();
-        let config = FlagConfig { flags: parsed.flags, commands: parsed.commands, parse: parsed.parse };
+        let config = FlagConfig {
+            flags: parsed.flags,
+            commands: parsed.commands,
+            parse: parsed.parse,
+        };
         let err = config.audit_commands().unwrap_err().to_string();
         assert!(err.contains("collides with a flag env"), "{err}");
     }
@@ -545,7 +641,11 @@ mod contract_tests {
     fn command_audit_rejects_duplicate_aliases() {
         let text = "[commands.diff]\nenv = \"DPM_CMD_DIFF\"\naliases = [\"d\"]\n\n[commands.dump]\nenv = \"DPM_CMD_DUMP\"\naliases = [\"d\"]\n";
         let parsed: CliFlagsFile = toml::from_str(text).unwrap();
-        let config = FlagConfig { flags: parsed.flags, commands: parsed.commands, parse: parsed.parse };
+        let config = FlagConfig {
+            flags: parsed.flags,
+            commands: parsed.commands,
+            parse: parsed.parse,
+        };
         assert!(config.audit_commands().is_err());
     }
 }
