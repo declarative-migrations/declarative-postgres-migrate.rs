@@ -31,17 +31,17 @@ fn last(body: &str, needle: &str) -> usize {
 fn postgres_apply_confirms_then_leases_revalidates_and_executes() {
     let body = apply_body();
     let confirmation = first(body, "if !r.get_bool(\"DPM_YES\")");
-    let acquisition = first(
-        body,
-        "Some(acquire_migration_lease(target_url).await?)",
-    );
+    let acquisition = first(body, "Some(acquire_migration_lease(target_url).await?)");
     let refresh = first(body, "let refreshed_inputs = load_sides(r, false).await?");
     let stale_plan_guard = first(body, "if refreshed_script.sql != script.sql");
     let validation = first(body, "ValidatedScript::parse(&script.sql)");
     let execution = first(body, "lease.apply(&validated).await?");
 
     assert!(confirmation < acquisition, "lease must follow confirmation");
-    assert!(acquisition < refresh, "fresh catalogs require an owned lease");
+    assert!(
+        acquisition < refresh,
+        "fresh catalogs require an owned lease"
+    );
     assert!(refresh < stale_plan_guard, "fresh plan must be compared");
     assert!(
         stale_plan_guard < validation,
@@ -55,7 +55,10 @@ fn postgres_and_cockroach_execution_paths_are_explicit() {
     let body = apply_body();
     let leased_arm = first(body, "Some(lease) =>");
     let leased_execution = first(body, "lease.apply(&validated).await?");
-    let fallback = first(body, "None => dpm::apply::apply_script(target_url, &script.sql).await?");
+    let fallback = first(
+        body,
+        "None => dpm::apply::apply_script(target_url, &script.sql).await?",
+    );
 
     assert!(leased_arm < leased_execution);
     assert!(leased_execution < fallback);
