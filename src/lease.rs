@@ -52,9 +52,7 @@ fn normalize_owner(owner: String) -> Result<String> {
         bail!("migration lease owner must not be empty");
     }
     if owner.len() > MAX_LEASE_OWNER_BYTES {
-        bail!(
-            "migration lease owner exceeds {MAX_LEASE_OWNER_BYTES} UTF-8 bytes"
-        );
+        bail!("migration lease owner exceeds {MAX_LEASE_OWNER_BYTES} UTF-8 bytes");
     }
     if owner.chars().any(char::is_control) {
         bail!("migration lease owner must not contain control characters");
@@ -98,15 +96,11 @@ async fn ensure_session_lease_held(
     .fetch_one(&mut *conn)
     .await
     .with_context(|| {
-        format!(
-            "verifying PostgreSQL migration lease {key} for owner {owner} {boundary}"
-        )
+        format!("verifying PostgreSQL migration lease {key} for owner {owner} {boundary}")
     })?;
 
     if !held {
-        bail!(
-            "PostgreSQL migration lease {key} was lost for owner {owner} {boundary}"
-        );
+        bail!("PostgreSQL migration lease {key} was lost for owner {owner} {boundary}");
     }
     Ok(())
 }
@@ -193,8 +187,7 @@ impl PostgresMigrationLease {
         }
 
         if let Err(error) =
-            ensure_session_lease_held(&mut conn, key, &owner, "immediately after acquisition")
-                .await
+            ensure_session_lease_held(&mut conn, key, &owner, "immediately after acquisition").await
         {
             let _ = conn.close().await;
             return Err(error);
@@ -252,11 +245,7 @@ impl PostgresMigrationLease {
             }
             executed += 1;
 
-            let after = format!(
-                "after statement {}/{}",
-                index + 1,
-                script.statement_count()
-            );
+            let after = format!("after statement {}/{}", index + 1, script.statement_count());
             if let Err(error) = ensure_session_lease_held(conn, key, &owner, &after).await {
                 let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await;
                 return Err(error);
@@ -340,7 +329,10 @@ mod tests {
 
     #[test]
     fn lease_owner_is_trimmed_bounded_and_control_free() {
-        assert_eq!(normalize_owner("  migrator-a  ".to_string()).unwrap(), "migrator-a");
+        assert_eq!(
+            normalize_owner("  migrator-a  ".to_string()).unwrap(),
+            "migrator-a"
+        );
         assert!(normalize_owner(" \t\n ".to_string()).is_err());
         assert!(normalize_owner("migrator\nspoof".to_string()).is_err());
         assert!(normalize_owner("x".repeat(MAX_LEASE_OWNER_BYTES + 1)).is_err());
