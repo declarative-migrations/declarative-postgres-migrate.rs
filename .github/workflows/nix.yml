@@ -22,7 +22,7 @@ jobs:
         with:
           persist-credentials: false
       # v3.21.8; pin the installer rather than following a mutable major tag.
-      - uses: DeterminateSystems/determinate-nix-action@61cbfe2efc2d4e7a8a6d56967c3c1058e846c858
+      - uses: DeterminateSystems/determinate-nix-action@527f17dd63d2d60d3e5552934bc84b9a33a14d11
       - name: Validate flake outputs
         run: nix flake check --no-update-lock-file --print-build-logs
       - name: Run the noninteractive agent contract
