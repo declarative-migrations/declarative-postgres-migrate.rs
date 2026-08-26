@@ -81,6 +81,7 @@ fn main() {
 
 fn run() -> Result<i32> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut process_env = std::env::vars().collect::<std::collections::HashMap<_, _>>();
     let (raw_command, rest) = match argv.split_first() {
         Some((c, rest)) if !c.starts_with('-') => (c.clone(), rest.to_vec()),
         _ => ("help".to_string(), argv.clone()),
@@ -114,22 +115,20 @@ fn run() -> Result<i32> {
     if config.commands.contains_key(&command) {
         if let Some(key) = config.command_env_key() {
             overrides.insert(key.to_string(), command.clone());
-            std::env::set_var(key, &command);
         }
         // A parent shell may contain markers from an earlier invocation.
         // Clear every declared marker before publishing the selected one,
         // so spawned reviewers and cross-checkers see one canonical path.
         for spec in config.commands.values() {
             if let Some(marker) = spec.env.as_deref() {
-                std::env::remove_var(marker);
+                process_env.remove(marker);
             }
         }
         if let Some(marker) = config.command_marker_env(&command) {
             overrides.insert(marker.to_string(), "true".to_string());
-            std::env::set_var(marker, "true");
         }
     }
-    let resolved = Resolved::new(&config, overrides);
+    let resolved = Resolved::new(&config, process_env, overrides);
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
