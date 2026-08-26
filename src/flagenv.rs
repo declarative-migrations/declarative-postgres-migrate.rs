@@ -339,8 +339,13 @@ impl Resolved {
     }
 
     pub fn get(&self, env_key: &str) -> Option<String> {
-        if let Some(v) = self.env.get(env_key).filter(|value| !value.is_empty()) {
-            return Some(v.clone());
+        if let Some(v) = self
+            .env
+            .get(env_key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            return Some(v.to_string());
         }
         self.defaults.get(env_key).cloned()
     }
@@ -522,6 +527,52 @@ type = "integer"
         );
         assert_eq!(env.get("DPM_FORMAT").map(String::as_str), Some("json"));
         assert_eq!(std::env::var_os("DPM_FORMAT"), before);
+    }
+
+    #[test]
+    fn empty_and_whitespace_overrides_are_absent_from_get() {
+        let cfg = config();
+        for raw in ["", " ", "\t"] {
+            let resolved = Resolved::new(
+                &cfg,
+                HashMap::from([("DPM_ALLOW_DESTRUCTIVE".into(), raw.into())]),
+                HashMap::new(),
+            );
+            assert_eq!(
+                resolved.get("DPM_ALLOW_DESTRUCTIVE").as_deref(),
+                Some("false"),
+                "raw={raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_reads_the_snapshot_not_process_env() {
+        let before = std::env::var_os("DPM_JOBS");
+        let cfg = config();
+        let resolved = Resolved::new(
+            &cfg,
+            HashMap::from([("DPM_JOBS".into(), "1".into())]),
+            HashMap::from([("DPM_JOBS".into(), "4".into())]),
+        );
+        assert_eq!(resolved.get("DPM_JOBS").as_deref(), Some("4"));
+        assert_eq!(std::env::var_os("DPM_JOBS"), before);
+    }
+
+    #[test]
+    fn unknown_flag_parse_failure_does_not_mutate_process_environment() {
+        let before = std::env::var_os("DPM_JOBS");
+        let cfg = config();
+        assert!(parse_fallback(&cfg, &args(&["--nope"])).is_err());
+        assert_eq!(std::env::var_os("DPM_JOBS"), before);
+    }
+
+    #[test]
+    fn source_does_not_mutate_process_environment() {
+        const SRC: &str = include_str!("flagenv.rs");
+        let production = SRC.split("#[cfg(test)]").next().unwrap_or(SRC);
+        assert!(!production.contains("std::env::set_var"));
+        assert!(!production.contains("env::set_var"));
     }
 }
 
