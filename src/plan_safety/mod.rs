@@ -33,8 +33,8 @@ mod certificate;
 mod resource;
 
 pub use certificate::{
-    certify_plan, check_parallel_changes, check_parallel_steps, CertificateError, CertifiedPlan,
-    ExecutionWave, PlanCertificate,
+    certify_plan, check_parallel_changes, check_parallel_steps, checksums_match,
+    reviewed_plan_checksum, CertificateError, CertifiedPlan, ExecutionWave, PlanCertificate,
 };
 pub use resource::{
     BorrowConflict, BorrowMode, BorrowScope, BorrowedStep, ResourceBorrow, ResourcePath,
