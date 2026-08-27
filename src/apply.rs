@@ -18,32 +18,30 @@ fn is_identifier_byte(byte: u8) -> bool {
 }
 
 fn single_quote_uses_backslash_escapes(bytes: &[u8], quote: usize) -> bool {
-    if quote >= 1
+    let e_string = quote >= 1
         && matches!(bytes[quote - 1], b'e' | b'E')
-        && (quote == 1 || !is_identifier_byte(bytes[quote - 2]))
-    {
-        return true;
-    }
-    quote >= 2
+        && (quote == 1 || !is_identifier_byte(bytes[quote - 2]));
+    let unicode_escape = quote >= 2
         && matches!(bytes[quote - 2], b'u' | b'U')
         && bytes[quote - 1] == b'&'
-        && (quote == 2 || !is_identifier_byte(bytes[quote - 3]))
+        && (quote == 2 || !is_identifier_byte(bytes[quote - 3]));
+    e_string || unicode_escape
 }
 
 fn dollar_quote_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut end = start.checked_add(1)?;
-    if end >= bytes.len() {
-        return None;
-    }
-    if bytes[end] != b'$' {
-        if !(bytes[end].is_ascii_alphabetic() || bytes[end] == b'_') {
-            return None;
+    let tag_start = start.checked_add(1)?;
+    let end = match bytes.get(tag_start).copied()? {
+        b'$' => tag_start,
+        b if b.is_ascii_alphabetic() || b == b'_' => {
+            let rest_start = tag_start + 1;
+            rest_start
+                + bytes[rest_start..]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+                    .count()
         }
-        end += 1;
-        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
-            end += 1;
-        }
-    }
+        _ => return None,
+    };
     (end < bytes.len() && bytes[end] == b'$').then_some(end)
 }
 
@@ -129,21 +127,20 @@ pub fn split_statements(sql: &str) -> Vec<String> {
                 }
             }
             b';' => {
-                let stmt = sql[start..i].trim();
-                if !only_comments(stmt) {
-                    statements.push(stmt.to_string());
-                }
+                statements.extend(executable_statement(&sql[start..i]));
                 i += 1;
                 start = i;
             }
             _ => i += 1,
         }
     }
-    let tail = sql[start..].trim();
-    if !only_comments(tail) {
-        statements.push(tail.to_string());
-    }
+    statements.extend(executable_statement(&sql[start..]));
     statements
+}
+
+fn executable_statement(fragment: &str) -> Option<String> {
+    let stmt = fragment.trim();
+    (!only_comments(stmt)).then(|| stmt.to_string())
 }
 
 /// True when the fragment contains no executable tokens (only whitespace and
@@ -256,19 +253,16 @@ pub fn strip_psql_meta_commands(sql: &str) -> String {
         }
     }
 
-    let mut out = String::with_capacity(sql.len());
-    let mut offset = 0usize;
-    for line in sql.split_inclusive('\n') {
-        let line_start = offset;
-        offset += line.len();
-        let trimmed = line.trim_start();
-        let is_meta =
-            trimmed.starts_with('\\') && !in_quote.get(line_start).copied().unwrap_or(false);
-        if !is_meta {
-            out.push_str(line);
-        }
-    }
-    out
+    sql.split_inclusive('\n')
+        .scan(0usize, |offset, line| {
+            let line_start = *offset;
+            *offset += line.len();
+            let is_meta = line.trim_start().starts_with('\\')
+                && !in_quote.get(line_start).copied().unwrap_or(false);
+            Some((!is_meta).then_some(line))
+        })
+        .flatten()
+        .collect()
 }
 
 /// True for statements that depend on roles/ownership and are skipped when
@@ -276,23 +270,27 @@ pub fn strip_psql_meta_commands(sql: &str) -> String {
 /// or grants; a fresh shadow db lacks the production roles).
 pub fn is_role_dependent_statement(stmt: &str) -> bool {
     let upper = stmt.trim_start().to_ascii_uppercase();
-    upper.starts_with("GRANT ")
-        || upper.starts_with("REVOKE ")
-        || upper.starts_with("SET SESSION AUTHORIZATION")
-        || upper.starts_with("SET ROLE")
-        || (upper.starts_with("ALTER ") && upper.contains(" OWNER TO "))
+    match upper.as_str() {
+        s if s.starts_with("GRANT ") => true,
+        s if s.starts_with("REVOKE ") => true,
+        s if s.starts_with("SET SESSION AUTHORIZATION") => true,
+        s if s.starts_with("SET ROLE") => true,
+        s if s.starts_with("ALTER ") => s.contains(" OWNER TO "),
+        _ => false,
+    }
 }
 
 pub fn truncate_sql(stmt: &str) -> String {
     const MAX: usize = 500;
-    if stmt.len() <= MAX {
-        stmt.to_string()
-    } else {
-        let mut end = MAX;
-        while !stmt.is_char_boundary(end) {
-            end -= 1;
+    match stmt.len() <= MAX {
+        true => stmt.to_string(),
+        false => {
+            let end = (0..=MAX)
+                .rev()
+                .find(|&end| stmt.is_char_boundary(end))
+                .unwrap_or(0);
+            format!("{}… [{} bytes]", &stmt[..end], stmt.len())
         }
-        format!("{}… [{} bytes]", &stmt[..end], stmt.len())
     }
 }
 
