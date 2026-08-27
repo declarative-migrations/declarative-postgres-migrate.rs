@@ -51,6 +51,6 @@ pub use emit::{emit, EmitOptions, Script};
 pub use introspect::{introspect_url, IntrospectOptions};
 pub use model::{Catalog, DatabaseFlavor, RoutineKind, TriggerMode};
 pub use plan_safety::{
-    certify_plan, check_parallel_changes, BorrowConflict, BorrowMode, BorrowScope, CertifiedPlan,
-    PlanCertificate, ResourceBorrow, ResourcePath,
+    certify_plan, check_parallel_changes, checksums_match, reviewed_plan_checksum, BorrowConflict,
+    BorrowMode, BorrowScope, CertifiedPlan, PlanCertificate, ResourceBorrow, ResourcePath,
 };

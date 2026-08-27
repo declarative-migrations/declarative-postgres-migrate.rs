@@ -38,6 +38,8 @@ The `Change` matches are exhaustive. Adding a new change variant fails compilati
 
 `PlanCertificate::validate()` checks certificate structure, wave numbering, step ordering, and pairwise borrow compatibility. `validate_for(&plan)` recomputes the entire certificate and rejects reuse or tampering across plans.
 
+`reviewed_plan_checksum(plan, sql)` folds the certificate fingerprint together with the emitted SQL into a hex identity checksum. `dpm diff` and `dpm apply` print it. `dpm apply --require-plan-checksum <hex>` refuses before confirmation if the reviewed plan does not match the pinned digest. After the PostgreSQL lease is held, apply recomputes the checksum from a fresh plan and refuses writes on drift.
+
 The scheduler only groups adjacent compatible changes. It never moves one change ahead of another, so the dependency ordering established by the diff and emitter remains authoritative. The current SQL executor is still sequential; waves are a checked contract for orchestration layers rather than a silent behavior change.
 
 ## Linear capability bridge

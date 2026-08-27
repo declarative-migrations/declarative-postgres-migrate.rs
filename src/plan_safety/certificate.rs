@@ -249,3 +249,26 @@ pub fn check_parallel_steps(steps: &[BorrowedStep]) -> Result<(), BorrowConflict
     }
     Ok(())
 }
+
+/// Identity checksum of a reviewed typed plan plus its emitted SQL.
+///
+/// This is not a cryptographic signature. Callers that need cross-process
+/// trust still pin immutable commits and signed artifacts. Apply refuses
+/// writes when this value drifts after the lease is held, or when
+/// `--require-plan-checksum` does not match.
+pub fn reviewed_plan_checksum(plan: &Plan, sql: &str) -> String {
+    let certificate = certify_plan(plan);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&super::PLAN_SAFETY_MODEL_VERSION.to_le_bytes());
+    payload.extend_from_slice(&certificate.fingerprint.to_le_bytes());
+    payload.extend_from_slice(&stable_fingerprint(sql.as_bytes()).to_le_bytes());
+    payload.extend_from_slice(&(sql.len() as u64).to_le_bytes());
+    payload.extend_from_slice(sql.as_bytes());
+    format!("{:016x}", stable_fingerprint(&payload))
+}
+
+/// Compare operator-supplied and computed plan checksums without regard to
+/// surrounding whitespace or hex case.
+pub fn checksums_match(expected: &str, actual: &str) -> bool {
+    expected.trim().eq_ignore_ascii_case(actual.trim())
+}

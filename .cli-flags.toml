@@ -145,6 +145,12 @@ type = "bool"
 default = "false"
 help = "Exit 2 when differences exist (like git diff --exit-code; for CI gates)."
 
+[flags.require-plan-checksum]
+env = "DPM_REQUIRE_PLAN_CHECKSUM"
+aliases = ["require-checksum", "expected-plan-checksum"]
+type = "string"
+help = "Refuse writes unless the reviewed plan identity checksum matches this hex digest. Printed by `dpm diff` / `dpm apply` as `dpm: reviewed plan checksum …`."
+
 [flags.advise-fk-indexes]
 env = "DPM_ADVISE_FK_INDEXES"
 type = "bool"
