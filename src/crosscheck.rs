@@ -53,7 +53,13 @@ impl CheckReport {
     }
 
     fn error(name: &str, command: String, err: impl std::fmt::Display) -> Self {
-        Self { name: name.into(), command, agreed: false, output: String::new(), error: Some(err.to_string()) }
+        Self {
+            name: name.into(),
+            command,
+            agreed: false,
+            output: String::new(),
+            error: Some(err.to_string()),
+        }
     }
 }
 
@@ -122,8 +128,21 @@ pub fn binary_exists(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn redact_secrets(value: &str, secrets: &[&str]) -> String {
+    let mut redacted = value.to_string();
+    for secret in secrets.iter().copied().filter(|secret| !secret.is_empty()) {
+        redacted = redacted.replace(&shell_quote(secret), "'***'");
+        redacted = redacted.replace(secret, "***");
+    }
+    redacted
+}
+
+fn reported_url(url: &str) -> String {
+    crate::introspect::redact_url(url)
 }
 
 fn run_shell(command: &str, extra_env: &[(String, String)]) -> Result<(bool, String, String)> {
@@ -132,7 +151,7 @@ fn run_shell(command: &str, extra_env: &[(String, String)]) -> Result<(bool, Str
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    let output = cmd.output().with_context(|| format!("running: {command}"))?;
+    let output = cmd.output().context("running cross-check command")?;
     Ok((
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).to_string(),
@@ -155,7 +174,7 @@ pub fn parse_postgres_url(url: &str) -> Result<UrlParts> {
     let rest = url
         .split_once("://")
         .map(|(_, r)| r)
-        .with_context(|| format!("not a URL: {url:?}"))?;
+        .context("not a PostgreSQL URL")?;
     let (main, query) = match rest.split_once('?') {
         Some((m, q)) => (m, Some(q)),
         None => (rest, None),
@@ -192,7 +211,11 @@ pub fn parse_postgres_url(url: &str) -> Result<UrlParts> {
     Ok(UrlParts {
         user,
         password,
-        host: if host.is_empty() { "localhost".into() } else { host.into() },
+        host: if host.is_empty() {
+            "localhost".into()
+        } else {
+            host.into()
+        },
         port: port.to_string(),
         dbname: dbname.to_string(),
         sslmode,
@@ -232,11 +255,56 @@ fn libpq_env(parts: &UrlParts) -> Vec<(String, String)> {
 
 static SCRATCH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn scratch_dir(label: &str) -> Result<std::path::PathBuf> {
-    let n = SCRATCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("dpm-crosscheck-{label}-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+struct ScratchDir {
+    path: std::path::PathBuf,
+}
+
+impl ScratchDir {
+    fn create(label: &str) -> Result<Self> {
+        let parent = std::env::temp_dir();
+        for _ in 0..64 {
+            let counter = SCRATCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            let path = parent.join(format!(
+                ".dpm-crosscheck-{label}-{:x}-{nonce:x}-{counter:x}",
+                std::process::id()
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "creating secure cross-check scratch directory {}",
+                            path.display()
+                        )
+                    });
+                }
+            }
+        }
+        anyhow::bail!("unable to allocate a unique cross-check scratch directory")
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -251,24 +319,46 @@ pub fn run_migra(bin: &str, migrated_url: &str, source_url: &str) -> CheckReport
     if !binary_exists(bin) {
         return CheckReport::missing(name, bin, "pip/pipx install migra");
     }
+    let migrated = normalize_pg_scheme(migrated_url);
+    let source = normalize_pg_scheme(source_url);
     let command = format!(
         "{} --unsafe {} {}",
         shell_quote(bin),
-        shell_quote(&normalize_pg_scheme(migrated_url)),
-        shell_quote(&normalize_pg_scheme(source_url))
+        shell_quote(&migrated),
+        shell_quote(&source)
     );
+    let reported_command = format!(
+        "{} --unsafe {} {}",
+        shell_quote(bin),
+        shell_quote(&reported_url(&migrated)),
+        shell_quote(&reported_url(&source))
+    );
+    let secrets = [migrated.as_str(), source.as_str()];
     match run_shell(&command, &[]) {
         Ok((success, stdout, stderr)) => {
-            let out = stdout.trim().to_string();
+            let out = redact_secrets(stdout.trim(), &secrets);
+            let error = redact_secrets(stderr.trim(), &secrets);
             if out.is_empty() && success {
-                CheckReport { name: name.into(), command, agreed: true, output: out, error: None }
+                CheckReport {
+                    name: name.into(),
+                    command: reported_command,
+                    agreed: true,
+                    output: out,
+                    error: None,
+                }
             } else if !out.is_empty() {
-                CheckReport { name: name.into(), command, agreed: false, output: out, error: None }
+                CheckReport {
+                    name: name.into(),
+                    command: reported_command,
+                    agreed: false,
+                    output: out,
+                    error: None,
+                }
             } else {
-                CheckReport::error(name, command, format!("migra failed: {}", stderr.trim()))
+                CheckReport::error(name, reported_command, format!("migra failed: {error}"))
             }
         }
-        Err(e) => CheckReport::error(name, command, format!("{e:#}")),
+        Err(error) => CheckReport::error(name, reported_command, format!("{error:#}")),
     }
 }
 
@@ -278,8 +368,14 @@ pub fn run_migra(bin: &str, migrated_url: &str, source_url: &str) -> CheckReport
 
 /// Aspects supported by pgdiff 0.9.x, excluding role/grant/ownership (out of
 /// dpm's scope).
-pub const PGDIFF_SCHEMA_TYPES: &[&str] =
-    &["SEQUENCE", "TABLE", "COLUMN", "VIEW", "INDEX", "FOREIGN_KEY"];
+pub const PGDIFF_SCHEMA_TYPES: &[&str] = &[
+    "SEQUENCE",
+    "TABLE",
+    "COLUMN",
+    "VIEW",
+    "INDEX",
+    "FOREIGN_KEY",
+];
 
 /// pgdiff takes paired single-letter flags (upper = db1, lower = db2):
 /// `-U/-u user, -H/-h host, -P/-p port, -D/-d dbname`, one aspect per run.
@@ -289,7 +385,10 @@ pub fn run_pgdiff(bin: &str, migrated_url: &str, source_url: &str) -> CheckRepor
     if !binary_exists(bin) {
         return CheckReport::missing(name, bin, "go install github.com/joncrlsn/pgdiff@latest");
     }
-    let (a, b) = match (parse_postgres_url(migrated_url), parse_postgres_url(source_url)) {
+    let (a, b) = match (
+        parse_postgres_url(migrated_url),
+        parse_postgres_url(source_url),
+    ) {
         (Ok(a), Ok(b)) => (a, b),
         (Err(e), _) | (_, Err(e)) => return CheckReport::error(name, bin.into(), format!("{e:#}")),
     };
@@ -334,7 +433,11 @@ pub fn run_pgdiff(bin: &str, migrated_url: &str, source_url: &str) -> CheckRepor
         command: format!("{base} <{} aspects>", PGDIFF_SCHEMA_TYPES.len()),
         agreed: all_sql.is_empty() && errors.is_empty(),
         output: all_sql.trim().to_string(),
-        error: if errors.is_empty() { None } else { Some(errors.join("; ")) },
+        error: if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("; "))
+        },
     }
 }
 
@@ -351,27 +454,54 @@ pub fn run_atlas(bin: &str, migrated_url: &str, source_url: &str) -> CheckReport
     if !binary_exists(bin) {
         return CheckReport::missing(name, bin, "brew install ariga/tap/atlas");
     }
+    let migrated = ensure_sslmode(migrated_url);
+    let source = ensure_sslmode(source_url);
     let command = format!(
         "{} schema diff --from {} --to {}",
         shell_quote(bin),
-        shell_quote(&ensure_sslmode(migrated_url)),
-        shell_quote(&ensure_sslmode(source_url))
+        shell_quote(&migrated),
+        shell_quote(&source)
     );
+    let reported_command = format!(
+        "{} schema diff --from {} --to {}",
+        shell_quote(bin),
+        shell_quote(&reported_url(&migrated)),
+        shell_quote(&reported_url(&source))
+    );
+    let secrets = [migrated.as_str(), source.as_str()];
     match run_shell(&command, &[]) {
         Ok((success, stdout, stderr)) => {
-            let out = stdout.trim().to_string();
+            let out = redact_secrets(stdout.trim(), &secrets);
+            let error = redact_secrets(stderr.trim(), &secrets);
+            let lower = out.to_ascii_lowercase();
             let synced = out.is_empty()
-                || out.to_ascii_lowercase().contains("schemas are synced")
-                || out.to_ascii_lowercase().contains("no changes to be made");
+                || lower.contains("schemas are synced")
+                || lower.contains("no changes to be made");
             if success && synced {
-                CheckReport { name: name.into(), command, agreed: true, output: String::new(), error: None }
+                CheckReport {
+                    name: name.into(),
+                    command: reported_command,
+                    agreed: true,
+                    output: String::new(),
+                    error: None,
+                }
             } else if success {
-                CheckReport { name: name.into(), command, agreed: false, output: out, error: None }
+                CheckReport {
+                    name: name.into(),
+                    command: reported_command,
+                    agreed: false,
+                    output: out,
+                    error: None,
+                }
             } else {
-                CheckReport::error(name, command, format!("atlas failed: {} {}", out, stderr.trim()))
+                CheckReport::error(
+                    name,
+                    reported_command,
+                    format!("atlas failed: {out} {error}"),
+                )
             }
         }
-        Err(e) => CheckReport::error(name, command, format!("{e:#}")),
+        Err(error) => CheckReport::error(name, reported_command, format!("{error:#}")),
     }
 }
 
@@ -383,32 +513,68 @@ pub fn run_atlas(bin: &str, migrated_url: &str, source_url: &str) -> CheckReport
 /// `pg-schema-diff plan --from-dsn <migrated> --to-dsn <source>`.
 /// An empty plan = agreement. Plan validation (its own shadow processing)
 /// runs against the from-side connection automatically.
-pub fn run_pg_schema_diff(bin: &str, _pg_dump: &str, migrated_url: &str, source_url: &str) -> CheckReport {
+pub fn run_pg_schema_diff(
+    bin: &str,
+    _pg_dump: &str,
+    migrated_url: &str,
+    source_url: &str,
+) -> CheckReport {
     let name = "pg-schema-diff";
     if !binary_exists(bin) {
-        return CheckReport::missing(name, bin, "go install github.com/stripe/pg-schema-diff/cmd/pg-schema-diff@latest");
+        return CheckReport::missing(
+            name,
+            bin,
+            "go install github.com/stripe/pg-schema-diff/cmd/pg-schema-diff@latest",
+        );
     }
+    let migrated = ensure_sslmode(migrated_url);
+    let source = ensure_sslmode(source_url);
     let command = format!(
         "{} plan --from-dsn {} --to-dsn {}",
         shell_quote(bin),
-        shell_quote(&ensure_sslmode(migrated_url)),
-        shell_quote(&ensure_sslmode(source_url))
+        shell_quote(&migrated),
+        shell_quote(&source)
     );
+    let reported_command = format!(
+        "{} plan --from-dsn {} --to-dsn {}",
+        shell_quote(bin),
+        shell_quote(&reported_url(&migrated)),
+        shell_quote(&reported_url(&source))
+    );
+    let secrets = [migrated.as_str(), source.as_str()];
     match run_shell(&command, &[]) {
         Ok((success, stdout, stderr)) => {
-            let out = stdout.trim().to_string();
+            let out = redact_secrets(stdout.trim(), &secrets);
+            let error = redact_secrets(stderr.trim(), &secrets);
             let lower = out.to_ascii_lowercase();
-            let empty_plan =
-                out.is_empty() || lower.contains("schema matches expected") || lower.contains("no changes");
+            let empty_plan = out.is_empty()
+                || lower.contains("schema matches expected")
+                || lower.contains("no changes");
             if success && empty_plan {
-                CheckReport { name: name.into(), command, agreed: true, output: String::new(), error: None }
+                CheckReport {
+                    name: name.into(),
+                    command: reported_command,
+                    agreed: true,
+                    output: String::new(),
+                    error: None,
+                }
             } else if success {
-                CheckReport { name: name.into(), command, agreed: false, output: out, error: None }
+                CheckReport {
+                    name: name.into(),
+                    command: reported_command,
+                    agreed: false,
+                    output: out,
+                    error: None,
+                }
             } else {
-                CheckReport::error(name, command, format!("pg-schema-diff failed: {} {}", out, stderr.trim()))
+                CheckReport::error(
+                    name,
+                    reported_command,
+                    format!("pg-schema-diff failed: {out} {error}"),
+                )
             }
         }
-        Err(e) => CheckReport::error(name, command, format!("{e:#}")),
+        Err(error) => CheckReport::error(name, reported_command, format!("{error:#}")),
     }
 }
 
@@ -423,35 +589,64 @@ pub fn run_liquibase(bin: &str, migrated_url: &str, source_url: &str) -> CheckRe
     if !binary_exists(bin) {
         return CheckReport::missing(name, bin, "brew install liquibase");
     }
-    let (a, b) = match (parse_postgres_url(migrated_url), parse_postgres_url(source_url)) {
+    let (a, b) = match (
+        parse_postgres_url(migrated_url),
+        parse_postgres_url(source_url),
+    ) {
         (Ok(a), Ok(b)) => (a, b),
-        (Err(e), _) | (_, Err(e)) => return CheckReport::error(name, bin.into(), format!("{e:#}")),
+        (Err(error), _) | (_, Err(error)) => {
+            return CheckReport::error(name, bin.into(), format!("{error:#}"));
+        }
     };
-    let jdbc = |p: &UrlParts| {
+    let jdbc = |parts: &UrlParts| {
         format!(
             "jdbc:postgresql://{}:{}/{}?sslmode={}",
-            p.host, p.port, p.dbname, p.sslmode
+            parts.host, parts.port, parts.dbname, parts.sslmode
         )
     };
     let command = format!(
         "{bin} --show-banner=false diff \
-         --url {url} --username {user} --password {pw} \
-         --reference-url {rurl} --reference-username {ruser} --reference-password {rpw}",
+         --url {url} --username {user} \
+         --reference-url {reference_url} --reference-username {reference_user}",
         bin = shell_quote(bin),
         url = shell_quote(&jdbc(&a)),
         user = shell_quote(&a.user),
-        pw = shell_quote(a.password.as_deref().unwrap_or("")),
-        rurl = shell_quote(&jdbc(&b)),
-        ruser = shell_quote(&b.user),
-        rpw = shell_quote(b.password.as_deref().unwrap_or("")),
+        reference_url = shell_quote(&jdbc(&b)),
+        reference_user = shell_quote(&b.user),
     );
-    match run_shell(&command, &[]) {
+    let mut env = Vec::new();
+    if let Some(password) = &a.password {
+        env.push((
+            "LIQUIBASE_COMMAND_PASSWORD".to_string(),
+            password.to_string(),
+        ));
+    }
+    if let Some(password) = &b.password {
+        env.push((
+            "LIQUIBASE_COMMAND_REFERENCE_PASSWORD".to_string(),
+            password.to_string(),
+        ));
+    }
+    let secrets: Vec<&str> = [a.password.as_deref(), b.password.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    match run_shell(&command, &env) {
         Ok((success, stdout, stderr)) => {
+            let stdout = redact_secrets(&stdout, &secrets);
+            let stderr = redact_secrets(&stderr, &secrets);
             if !success {
                 return CheckReport::error(
                     name,
                     command,
-                    format!("liquibase failed: {}", if stderr.trim().is_empty() { stdout } else { stderr }),
+                    format!(
+                        "liquibase failed: {}",
+                        if stderr.trim().is_empty() {
+                            stdout
+                        } else {
+                            stderr
+                        }
+                    ),
                 );
             }
             let violations = liquibase_violations(&stdout);
@@ -463,7 +658,7 @@ pub fn run_liquibase(bin: &str, migrated_url: &str, source_url: &str) -> CheckRe
                 error: None,
             }
         }
-        Err(e) => CheckReport::error(name, command, format!("{e:#}")),
+        Err(error) => CheckReport::error(name, command, format!("{error:#}")),
     }
 }
 
@@ -490,19 +685,20 @@ fn liquibase_violations(stdout: &str) -> Vec<String> {
     let mut category: Option<String> = None;
     let mut entry: Option<Entry> = None;
 
-    let flush = |category: &Option<String>, entry: &mut Option<Entry>, violations: &mut Vec<String>| {
-        if let (Some(cat), Some(e)) = (category, entry.take()) {
-            let order_only = !e.details.is_empty()
-                && e.details.iter().all(|d| d.contains("order changed from"));
-            if cat.starts_with("Changed Column(s)") && order_only {
-                return; // ordinal drift is by-design
+    let flush =
+        |category: &Option<String>, entry: &mut Option<Entry>, violations: &mut Vec<String>| {
+            if let (Some(cat), Some(e)) = (category, entry.take()) {
+                let order_only = !e.details.is_empty()
+                    && e.details.iter().all(|d| d.contains("order changed from"));
+                if cat.starts_with("Changed Column(s)") && order_only {
+                    return; // ordinal drift is by-design
+                }
+                violations.push(format!("{cat} {}", e.object));
+                for d in &e.details {
+                    violations.push(format!("    {d}"));
+                }
             }
-            violations.push(format!("{cat} {}", e.object));
-            for d in &e.details {
-                violations.push(format!("    {d}"));
-            }
-        }
-    };
+        };
 
     for line in stdout.lines() {
         let trimmed = line.trim_end();
@@ -514,12 +710,19 @@ fn liquibase_violations(stdout: &str) -> Vec<String> {
             let noise = trimmed.ends_with("NONE")
                 || trimmed.ends_with("EQUAL")
                 || trimmed.starts_with("Changed Catalog(s)");
-            category = if noise { None } else { Some(trimmed.trim_end_matches(':').to_string()) };
+            category = if noise {
+                None
+            } else {
+                Some(trimmed.trim_end_matches(':').to_string())
+            };
         } else if category.is_some() && line.starts_with(' ') && !line.trim().is_empty() {
             let depth = line.len() - line.trim_start().len();
             if depth <= 6 {
                 flush(&category, &mut entry, &mut violations);
-                entry = Some(Entry { object: line.trim().to_string(), details: Vec::new() });
+                entry = Some(Entry {
+                    object: line.trim().to_string(),
+                    details: Vec::new(),
+                });
             } else if let Some(e) = entry.as_mut() {
                 e.details.push(line.trim().to_string());
             }
@@ -543,23 +746,35 @@ pub fn run_apgdiff(bin: &str, pg_dump: &str, migrated_url: &str, source_url: &st
         return CheckReport::missing(name, bin, "brew install apgdiff");
     }
     if !binary_exists(pg_dump) {
-        return CheckReport::error(name, bin.into(), format!("{pg_dump} (pg_dump) not found on PATH"));
+        return CheckReport::error(
+            name,
+            bin.into(),
+            format!("{pg_dump} (pg_dump) not found on PATH"),
+        );
     }
-    let dir = match scratch_dir("apgdiff") {
-        Ok(d) => d,
-        Err(e) => return CheckReport::error(name, bin.into(), format!("{e:#}")),
+    let dir = match ScratchDir::create("apgdiff") {
+        Ok(directory) => directory,
+        Err(error) => return CheckReport::error(name, bin.into(), format!("{error:#}")),
     };
+    let migrated_dsn = normalize_pg_scheme(migrated_url);
+    let source_dsn = normalize_pg_scheme(source_url);
     let dump = |url: &str, file: &std::path::Path| {
         run_shell(
             &format!(
                 "{} --schema-only --no-owner --no-privileges {} > {}",
                 shell_quote(pg_dump),
-                shell_quote(&normalize_pg_scheme(url)),
+                shell_quote(url),
                 shell_quote(&file.display().to_string())
             ),
             &[],
         )
-        .and_then(|(ok, _, err)| if ok { Ok(()) } else { anyhow::bail!("pg_dump failed: {err}") })
+        .and_then(|(ok, _, error)| {
+            if ok {
+                Ok(())
+            } else {
+                anyhow::bail!("pg_dump failed: {error}")
+            }
+        })
         .and_then(|_| {
             // apgdiff predates the psql \restrict/\unrestrict dump headers
             // (2025 security releases) and cannot parse them.
@@ -568,11 +783,16 @@ pub fn run_apgdiff(bin: &str, pg_dump: &str, migrated_url: &str, source_url: &st
             Ok(())
         })
     };
-    let migrated_file = dir.join("migrated.sql");
-    let source_file = dir.join("source.sql");
-    if let Err(e) = dump(migrated_url, &migrated_file).and_then(|_| dump(source_url, &source_file)) {
-        let _ = std::fs::remove_dir_all(&dir);
-        return CheckReport::error(name, bin.into(), format!("{e:#}"));
+    let migrated_file = dir.path().join("migrated.sql");
+    let source_file = dir.path().join("source.sql");
+    if let Err(error) =
+        dump(&migrated_dsn, &migrated_file).and_then(|_| dump(&source_dsn, &source_file))
+    {
+        let message = redact_secrets(
+            &format!("{error:#}"),
+            &[migrated_dsn.as_str(), source_dsn.as_str()],
+        );
+        return CheckReport::error(name, bin.into(), message);
     }
 
     let command = format!(
@@ -581,29 +801,40 @@ pub fn run_apgdiff(bin: &str, pg_dump: &str, migrated_url: &str, source_url: &st
         shell_quote(&migrated_file.display().to_string()),
         shell_quote(&source_file.display().to_string())
     );
-    let report = match run_shell(&command, &[]) {
+    match run_shell(&command, &[]) {
         Ok((success, stdout, stderr)) => {
             let out: String = stdout
                 .lines()
-                .filter(|l| {
-                    let t = l.trim();
-                    // apgdiff always emits SET/search_path chatter.
-                    !t.is_empty() && !t.starts_with("SET ") && !t.starts_with("--")
+                .filter(|line| {
+                    let trimmed = line.trim();
+                    !trimmed.is_empty()
+                        && !trimmed.starts_with("SET ")
+                        && !trimmed.starts_with("--")
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
             if success && out.is_empty() {
-                CheckReport { name: name.into(), command, agreed: true, output: String::new(), error: None }
+                CheckReport {
+                    name: name.into(),
+                    command,
+                    agreed: true,
+                    output: String::new(),
+                    error: None,
+                }
             } else if success {
-                CheckReport { name: name.into(), command, agreed: false, output: out, error: None }
+                CheckReport {
+                    name: name.into(),
+                    command,
+                    agreed: false,
+                    output: out,
+                    error: None,
+                }
             } else {
                 CheckReport::error(name, command, format!("apgdiff failed: {}", stderr.trim()))
             }
         }
-        Err(e) => CheckReport::error(name, command, format!("{e:#}")),
-    };
-    let _ = std::fs::remove_dir_all(&dir);
-    report
+        Err(error) => CheckReport::error(name, command, format!("{error:#}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -619,33 +850,46 @@ pub fn run_flyway(bin: &str, replica_url: &str, migration_sql: &str) -> CheckRep
         return CheckReport::missing(name, bin, "brew install flyway");
     }
     let parts = match parse_postgres_url(replica_url) {
-        Ok(p) => p,
-        Err(e) => return CheckReport::error(name, bin.into(), format!("{e:#}")),
+        Ok(parts) => parts,
+        Err(error) => return CheckReport::error(name, bin.into(), format!("{error:#}")),
     };
-    let dir = match scratch_dir("flyway") {
-        Ok(d) => d,
-        Err(e) => return CheckReport::error(name, bin.into(), format!("{e:#}")),
+    let dir = match ScratchDir::create("flyway") {
+        Ok(directory) => directory,
+        Err(error) => return CheckReport::error(name, bin.into(), format!("{error:#}")),
     };
-    if let Err(e) = std::fs::write(dir.join("V1__dpm_migration.sql"), migration_sql) {
-        return CheckReport::error(name, bin.into(), format!("{e:#}"));
+    if let Err(error) = std::fs::write(dir.path().join("V1__dpm_migration.sql"), migration_sql) {
+        return CheckReport::error(name, bin.into(), format!("{error:#}"));
     }
     let jdbc = format!(
         "jdbc:postgresql://{}:{}/{}?sslmode={}",
         parts.host, parts.port, parts.dbname, parts.sslmode
     );
     let command = format!(
-        "{bin} -url={url} -user={user} -password={pw} -locations=filesystem:{dir} \
-         -mixed=true -baselineOnMigrate=true -validateMigrationNaming=true migrate",
+        "{bin} -url={url} -user={user} \
+         -locations=filesystem:{directory} -mixed=true -baselineOnMigrate=true \
+         -validateMigrationNaming=true migrate",
         bin = shell_quote(bin),
         url = shell_quote(&jdbc),
         user = shell_quote(&parts.user),
-        pw = shell_quote(parts.password.as_deref().unwrap_or("")),
-        dir = shell_quote(&dir.display().to_string()),
+        directory = shell_quote(&dir.path().display().to_string()),
     );
-    let report = match run_shell(&command, &[]) {
+    let mut env = Vec::new();
+    if let Some(password) = &parts.password {
+        env.push(("FLYWAY_PASSWORD".to_string(), password.to_string()));
+    }
+    let secrets: Vec<&str> = parts.password.as_deref().into_iter().collect();
+    match run_shell(&command, &env) {
         Ok((success, stdout, stderr)) => {
+            let stdout = redact_secrets(&stdout, &secrets);
+            let stderr = redact_secrets(&stderr, &secrets);
             if success {
-                CheckReport { name: name.into(), command, agreed: true, output: String::new(), error: None }
+                CheckReport {
+                    name: name.into(),
+                    command,
+                    agreed: true,
+                    output: String::new(),
+                    error: None,
+                }
             } else {
                 let tail: String = stdout
                     .lines()
@@ -657,13 +901,17 @@ pub fn run_flyway(bin: &str, replica_url: &str, migration_sql: &str) -> CheckRep
                     .rev()
                     .collect::<Vec<_>>()
                     .join("\n");
-                CheckReport { name: name.into(), command, agreed: false, output: tail, error: None }
+                CheckReport {
+                    name: name.into(),
+                    command,
+                    agreed: false,
+                    output: tail,
+                    error: None,
+                }
             }
         }
-        Err(e) => CheckReport::error(name, command, format!("{e:#}")),
-    };
-    let _ = std::fs::remove_dir_all(&dir);
-    report
+        Err(error) => CheckReport::error(name, command, format!("{error:#}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -702,13 +950,23 @@ pub fn run_diff_checks(
         reports.push(run_atlas(&bins.atlas, migrated_url, source_url));
     }
     if want(sel.pg_schema_diff, &bins.pg_schema_diff).unwrap_or(false) {
-        reports.push(run_pg_schema_diff(&bins.pg_schema_diff, &bins.pg_dump, migrated_url, source_url));
+        reports.push(run_pg_schema_diff(
+            &bins.pg_schema_diff,
+            &bins.pg_dump,
+            migrated_url,
+            source_url,
+        ));
     }
     if want(sel.liquibase, &bins.liquibase).unwrap_or(false) {
         reports.push(run_liquibase(&bins.liquibase, migrated_url, source_url));
     }
     if want(sel.apgdiff, &bins.apgdiff).unwrap_or(false) {
-        reports.push(run_apgdiff(&bins.apgdiff, &bins.pg_dump, migrated_url, source_url));
+        reports.push(run_apgdiff(
+            &bins.apgdiff,
+            &bins.pg_dump,
+            migrated_url,
+            source_url,
+        ));
     }
     reports
 }
@@ -719,7 +977,9 @@ mod tests {
 
     #[test]
     fn url_parsing_covers_common_shapes() {
-        let p = parse_postgres_url("postgres://alice:s3cr3t@db.example.com:6432/appdb?sslmode=require").unwrap();
+        let p =
+            parse_postgres_url("postgres://alice:s3cr3t@db.example.com:6432/appdb?sslmode=require")
+                .unwrap();
         assert_eq!(p.user, "alice");
         assert_eq!(p.password.as_deref(), Some("s3cr3t"));
         assert_eq!(p.host, "db.example.com");
@@ -738,21 +998,84 @@ mod tests {
     }
 
     #[test]
+    fn url_parse_errors_do_not_echo_input_credentials() {
+        let error = parse_postgres_url("not-a-url-super-secret")
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("super-secret"), "{error}");
+    }
+
+    #[test]
+    fn scratch_directories_are_private_and_removed() {
+        let path;
+        {
+            let directory = ScratchDir::create("test").unwrap();
+            path = directory.path.clone();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o700);
+            }
+        }
+        assert!(
+            !path.exists(),
+            "scratch directory should be removed on drop"
+        );
+    }
+
+    #[test]
     fn scheme_normalization() {
-        assert_eq!(normalize_pg_scheme("postgres://u@h/db"), "postgresql://u@h/db");
-        assert_eq!(normalize_pg_scheme("postgresql://u@h/db"), "postgresql://u@h/db");
+        assert_eq!(
+            normalize_pg_scheme("postgres://u@h/db"),
+            "postgresql://u@h/db"
+        );
+        assert_eq!(
+            normalize_pg_scheme("postgresql://u@h/db"),
+            "postgresql://u@h/db"
+        );
     }
 
     #[test]
     fn missing_binaries_report_error_not_panic() {
         for report in [
-            run_migra("definitely-not-installed-xyz", "postgres://a@h/x", "postgres://a@h/y"),
-            run_pgdiff("definitely-not-installed-xyz", "postgres://a@h/x", "postgres://a@h/y"),
-            run_atlas("definitely-not-installed-xyz", "postgres://a@h/x", "postgres://a@h/y"),
-            run_pg_schema_diff("definitely-not-installed-xyz", "pg_dump", "postgres://a@h/x", "postgres://a@h/y"),
-            run_liquibase("definitely-not-installed-xyz", "postgres://a@h/x", "postgres://a@h/y"),
-            run_apgdiff("definitely-not-installed-xyz", "pg_dump", "postgres://a@h/x", "postgres://a@h/y"),
-            run_flyway("definitely-not-installed-xyz", "postgres://a@h/x", "SELECT 1;"),
+            run_migra(
+                "definitely-not-installed-xyz",
+                "postgres://a@h/x",
+                "postgres://a@h/y",
+            ),
+            run_pgdiff(
+                "definitely-not-installed-xyz",
+                "postgres://a@h/x",
+                "postgres://a@h/y",
+            ),
+            run_atlas(
+                "definitely-not-installed-xyz",
+                "postgres://a@h/x",
+                "postgres://a@h/y",
+            ),
+            run_pg_schema_diff(
+                "definitely-not-installed-xyz",
+                "pg_dump",
+                "postgres://a@h/x",
+                "postgres://a@h/y",
+            ),
+            run_liquibase(
+                "definitely-not-installed-xyz",
+                "postgres://a@h/x",
+                "postgres://a@h/y",
+            ),
+            run_apgdiff(
+                "definitely-not-installed-xyz",
+                "pg_dump",
+                "postgres://a@h/x",
+                "postgres://a@h/y",
+            ),
+            run_flyway(
+                "definitely-not-installed-xyz",
+                "postgres://a@h/x",
+                "SELECT 1;",
+            ),
         ] {
             assert!(!report.agreed);
             assert!(report.error.is_some(), "{report:?}");
@@ -766,21 +1089,94 @@ mod tests {
         let agree = dir.join("migra-agree");
         let disagree = dir.join("migra-disagree");
         std::fs::write(&agree, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::write(&disagree, "#!/bin/sh\necho 'alter table t add column x integer;'\nexit 2\n").unwrap();
+        std::fs::write(
+            &disagree,
+            "#!/bin/sh\necho 'alter table t add column x integer;'\nexit 2\n",
+        )
+        .unwrap();
         for f in [&agree, &disagree] {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let r = run_migra(agree.to_str().unwrap(), "postgres://a@h/x", "postgres://a@h/y");
+        let r = run_migra(
+            agree.to_str().unwrap(),
+            "postgres://alice:migrated-secret@h/x?token=migrated-token",
+            "postgres://bob:source-secret@h/y?token=source-token",
+        );
         assert!(r.agreed, "{r:?}");
-        let r = run_migra(disagree.to_str().unwrap(), "postgres://a@h/x", "postgres://a@h/y");
+        for secret in [
+            "migrated-secret",
+            "source-secret",
+            "migrated-token",
+            "source-token",
+        ] {
+            assert!(
+                !r.command.contains(secret),
+                "leaked {secret}: {}",
+                r.command
+            );
+        }
+        let r = run_migra(
+            disagree.to_str().unwrap(),
+            "postgres://a@h/x",
+            "postgres://a@h/y",
+        );
         assert!(!r.agreed);
         assert!(r.output.contains("alter table"));
     }
 
     #[test]
+    fn liquibase_and_flyway_receive_passwords_only_through_environment() {
+        let directory = ScratchDir::create("credential-stubs").unwrap();
+        let liquibase = directory.path().join("liquibase-stub");
+        let flyway = directory.path().join("flyway-stub");
+        std::fs::write(
+            &liquibase,
+            "#!/bin/sh\n\
+             test \"$LIQUIBASE_COMMAND_PASSWORD\" = \"target-secret\" || exit 41\n\
+             test \"$LIQUIBASE_COMMAND_REFERENCE_PASSWORD\" = \"source-secret\" || exit 42\n\
+             printf 'Missing Table(s): NONE\\nUnexpected Table(s): NONE\\nChanged Table(s): NONE\\n'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &flyway,
+            "#!/bin/sh\n\
+             test \"$FLYWAY_PASSWORD\" = \"target-secret\" || exit 43\n\
+             exit 0\n",
+        )
+        .unwrap();
+        for executable in [&liquibase, &flyway] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let liquibase_report = run_liquibase(
+            liquibase.to_str().unwrap(),
+            "postgres://target:target-secret@db/target",
+            "postgres://source:source-secret@db/source",
+        );
+        assert!(liquibase_report.agreed, "{liquibase_report:?}");
+        assert!(!liquibase_report.command.contains("target-secret"));
+        assert!(!liquibase_report.command.contains("source-secret"));
+        assert!(!liquibase_report.command.contains("--password"));
+        assert!(!liquibase_report.command.contains("--reference-password"));
+
+        let flyway_report = run_flyway(
+            flyway.to_str().unwrap(),
+            "postgres://target:target-secret@db/target",
+            "SELECT 1;",
+        );
+        assert!(flyway_report.agreed, "{flyway_report:?}");
+        assert!(!flyway_report.command.contains("target-secret"));
+        assert!(!flyway_report.command.contains("-password"));
+    }
+
+    #[test]
     fn selection_semantics() {
-        let sel = CheckSelection { all: true, ..Default::default() };
+        let sel = CheckSelection {
+            all: true,
+            ..Default::default()
+        };
         assert!(sel.any());
         // --cross-check-all with nothing installed under fake names yields no
         // reports (skipped), not failures.
@@ -798,7 +1194,10 @@ mod tests {
         assert!(reports.is_empty(), "{reports:?}");
 
         // Explicitly requested + missing = failure report.
-        let sel = CheckSelection { atlas: true, ..Default::default() };
+        let sel = CheckSelection {
+            atlas: true,
+            ..Default::default()
+        };
         let reports = run_diff_checks(&sel, &bins, "postgres://a@h/x", "postgres://a@h/y");
         assert_eq!(reports.len(), 1);
         assert!(!reports[0].agreed);
@@ -877,13 +1276,25 @@ Unexpected Index(s): NONE
         assert!(text.contains("public.users.email"), "{text}");
         assert!(text.contains("type changed"), "{text}");
         assert!(text.contains("public.orders"), "{text}");
-        assert!(!text.contains("bio"), "order-only entry must be filtered: {text}");
+        assert!(
+            !text.contains("bio"),
+            "order-only entry must be filtered: {text}"
+        );
     }
 
     #[test]
     fn ensure_sslmode_respects_existing_choice_and_query() {
-        assert_eq!(ensure_sslmode("postgres://u@h/db"), "postgresql://u@h/db?sslmode=disable");
-        assert_eq!(ensure_sslmode("postgresql://u@h/db?x=1"), "postgresql://u@h/db?x=1&sslmode=disable");
-        assert_eq!(ensure_sslmode("postgresql://u@h/db?sslmode=require"), "postgresql://u@h/db?sslmode=require");
+        assert_eq!(
+            ensure_sslmode("postgres://u@h/db"),
+            "postgresql://u@h/db?sslmode=disable"
+        );
+        assert_eq!(
+            ensure_sslmode("postgresql://u@h/db?x=1"),
+            "postgresql://u@h/db?x=1&sslmode=disable"
+        );
+        assert_eq!(
+            ensure_sslmode("postgresql://u@h/db?sslmode=require"),
+            "postgresql://u@h/db?sslmode=require"
+        );
     }
 }

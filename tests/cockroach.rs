@@ -406,6 +406,62 @@ async fn cockroach_cli_apply_converges() {
 }
 
 #[tokio::test]
+async fn cockroach_cli_apply_exits_3_when_gated_destructive_change_remains() {
+    let Some(admin) = admin_url() else { return };
+    let source_db = fresh_db(&admin).await;
+    let target_db = fresh_db(&admin).await;
+    source_db.apply_sql(DESIRED_SCHEMA).await.unwrap();
+    target_db.apply_sql(DIVERGENT_SCHEMA).await.unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dpm"))
+        .args([
+            "apply",
+            "--source",
+            &source_db.url,
+            "--target",
+            &target_db.url,
+            "--yes",
+        ])
+        .output()
+        .expect("run gated dpm apply against CockroachDB");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout:
+{}
+stderr:
+{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("NOT CONVERGED"), "{error}");
+    assert!(error.contains("--- residual diff ---"), "{error}");
+
+    let opts = IntrospectOptions::default();
+    let source = introspect_url(&source_db.url, &opts).await.unwrap();
+    let migrated = introspect_url(&target_db.url, &opts).await.unwrap();
+    assert!(
+        !diff(&source, &migrated).is_empty(),
+        "gated CockroachDB apply must report the residual drift"
+    );
+    let mut conn = dpm::introspect::connect(&target_db.url).await.unwrap();
+    let stale_table_remains: bool = sqlx::query_scalar(
+        "SELECT count(*) > 0 FROM information_schema.tables          WHERE table_schema = 'public' AND table_name = 'stale_data'",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert!(
+        stale_table_remains,
+        "gated destructive table drop must not execute"
+    );
+
+    source_db.drop_db().await;
+    target_db.drop_db().await;
+}
+
+#[tokio::test]
 async fn cockroach_cli_dump_diff_verify_and_dialect_guards() {
     let Some(admin) = admin_url() else { return };
     let source_db = fresh_db(&admin).await;
@@ -413,10 +469,7 @@ async fn cockroach_cli_dump_diff_verify_and_dialect_guards() {
     source_db.apply_sql(DESIRED_SCHEMA).await.unwrap();
     target_db.apply_sql(DIVERGENT_SCHEMA).await.unwrap();
 
-    let scratch = std::env::temp_dir().join(format!(
-        "dpm-cockroach-cli-{}",
-        std::process::id()
-    ));
+    let scratch = std::env::temp_dir().join(format!("dpm-cockroach-cli-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();
     let dump_path = scratch.join("desired.json");
     let dump = Command::new(env!("CARGO_BIN_EXE_dpm"))
@@ -436,7 +489,13 @@ async fn cockroach_cli_dump_diff_verify_and_dialect_guards() {
     assert_eq!(dumped.database_flavor, DatabaseFlavor::Cockroach);
 
     let plan = Command::new(env!("CARGO_BIN_EXE_dpm"))
-        .args(["diff", "--format", "json", "--fail-on-diff", "--source-json"])
+        .args([
+            "diff",
+            "--format",
+            "json",
+            "--fail-on-diff",
+            "--source-json",
+        ])
         .arg(&dump_path)
         .args(["--target", &target_db.url])
         .output()
@@ -494,7 +553,10 @@ async fn cockroach_cli_dump_diff_verify_and_dialect_guards() {
         .expect("exercise the CLI cross-dialect guard");
     assert_eq!(cross_dialect.status.code(), Some(1));
     let error = String::from_utf8_lossy(&cross_dialect.stderr);
-    assert!(error.contains("source is PostgreSQL but target is CockroachDB"), "{error}");
+    assert!(
+        error.contains("source is PostgreSQL but target is CockroachDB"),
+        "{error}"
+    );
 
     source_db.drop_db().await;
     target_db.drop_db().await;

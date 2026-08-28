@@ -7,34 +7,87 @@ on:
   schedule:
     - cron: "0 6 * * 1" # weekly full cross-checker matrix
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: formatting (changed Rust files)
+        shell: bash
+        env:
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${GITHUB_BASE_REF:-}" ]]; then
+            base="$(git merge-base HEAD "origin/${GITHUB_BASE_REF}")"
+          elif [[ -n "${PUSH_BASE:-}" && ! "${PUSH_BASE}" =~ ^0+$ ]] \
+            && git cat-file -e "${PUSH_BASE}^{commit}" 2>/dev/null; then
+            base="${PUSH_BASE}"
+          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            base="HEAD^"
+          else
+            echo "No base commit is available; skipping the changed-file format check."
+            exit 0
+          fi
+
+          mapfile -d '' rust_files < <(
+            git diff --name-only --diff-filter=ACMRT -z "$base" HEAD -- '*.rs'
+          )
+          if ((${#rust_files[@]} == 0)); then
+            echo "No changed Rust files."
+            exit 0
+          fi
+          printf 'Checking %s\n' "${rust_files[@]}"
+          for file in "${rust_files[@]}"; do
+            rustfmt --edition 2021 --check --config skip_children=true "$file"
+          done
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: unit tests
-        run: cargo test --lib
+        run: cargo test --locked --lib
       - name: splitter property tests
-        run: cargo test --test fuzz_splitter
+        run: cargo test --locked --test fuzz_splitter
 
   package-contract:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Package crate and install CLI in isolation
         run: bash scripts/check-release-contract.sh
 
   postgres:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["16", "17"]
     services:
       postgres:
-        image: postgres:16
+        image: "postgres:${{ matrix.postgres }}"
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
         ports: ["5432:5432"]
@@ -44,19 +97,24 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: PostgreSQL convergence tests
         env:
           DPM_TEST_DATABASE_URL: postgres://postgres@localhost:5432/postgres
-        run: cargo test --test convergence -- --test-threads=4
+        run: cargo test --locked --test convergence -- --test-threads=4
 
   cli:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
-        image: postgres:16
+        image: postgres:17
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
         ports: ["5432:5432"]
@@ -66,20 +124,29 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: CLI contracts and PostgreSQL lifecycle
         env:
           DPM_TEST_DATABASE_URL: postgres://postgres@localhost:5432/postgres
-        run: cargo test --test cli -- --test-threads=1
+        run: cargo test --locked --test cli -- --test-threads=1
 
   cockroach:
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Start CockroachDB v25.2.4
         run: >-
           docker run --detach --name dpm-cockroach
@@ -99,15 +166,19 @@ jobs:
       - name: CockroachDB convergence and CLI tests
         env:
           DPM_TEST_COCKROACH_DATABASE_URL: postgresql://root@localhost:26257/defaultdb?sslmode=disable
-        run: cargo test --test cockroach -- --test-threads=1
+        run: cargo test --locked --test cockroach -- --test-threads=1
       - name: CockroachDB logs on failure
         if: failure()
         run: docker logs dpm-cockroach
+      - name: Stop CockroachDB
+        if: always()
+        run: docker rm -f dpm-cockroach >/dev/null 2>&1 || true
 
   crosscheck-matrix:
     # The full 7-tool countersigning matrix: every fixture verified by
     # migra, pgdiff, atlas, pg-schema-diff, liquibase, apgdiff, and flyway.
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:16
@@ -120,10 +191,14 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
       - name: Install the seven cross-checkers
@@ -154,4 +229,4 @@ jobs:
       - name: Run the cross-checker matrix
         env:
           DPM_TEST_DATABASE_URL: postgres://postgres@localhost:5432/postgres
-        run: cargo test --test convergence matrix_ -- --test-threads=4
+        run: cargo test --locked --test convergence matrix_ -- --test-threads=4

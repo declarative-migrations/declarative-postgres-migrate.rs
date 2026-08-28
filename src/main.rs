@@ -22,6 +22,7 @@ use dpm::diff::{diff, Plan};
 use dpm::emit::{emit, EmitOptions, Script};
 use dpm::flagenv::{self, Resolved};
 use dpm::introspect::IntrospectOptions;
+use dpm::lease::{PostgresMigrationLease, ValidatedScript, DEFAULT_MIGRATION_LOCK_KEY};
 use dpm::model::{Catalog, DatabaseFlavor};
 use dpm::source::{resolve, ResolveContext, SideSpec};
 use dpm::verify::{verify, VerifyParams};
@@ -55,6 +56,9 @@ DESTRUCTIVE CHANGES (two separate consents)
   --allow-destructive-ops   actually execute destructive statements during `dpm apply`
   --allow-destructive       legacy shorthand for both
 
+SCHEMA SAFETY
+  --require-plan-checksum   refuse apply unless the reviewed plan checksum matches (hex)
+
 CROSS-CHECKS (independent diff engines validate dpm's result; verify + apply)
   --cross-check-with-migra    run migra after migrating; agreement = no remaining diff
   --cross-check-with-pgdiff   run pgdiff (joncrlsn) across all schema aspects
@@ -80,12 +84,18 @@ fn main() {
 
 fn run() -> Result<i32> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let (command, rest) = match argv.split_first() {
+    let (raw_command, rest) = match argv.split_first() {
         Some((c, rest)) if !c.starts_with('-') => (c.clone(), rest.to_vec()),
         _ => ("help".to_string(), argv.clone()),
     };
 
     let config = flagenv::load_config()?;
+    // Canonicalize the command token against the flags-2-env command contract
+    // (resolves any declared command aliases). Non-command tokens like "help"
+    // pass through unchanged for the version/help and unknown-command paths.
+    let command = config
+        .canonical_command(&raw_command)
+        .unwrap_or(raw_command);
     if command == "version" || rest.iter().any(|a| a == "--version") {
         println!("dpm {}", env!("CARGO_PKG_VERSION"));
         return Ok(0);
@@ -97,9 +107,30 @@ fn run() -> Result<i32> {
         return Ok(0);
     }
 
-    let (overrides, positionals) = flagenv::parse(&config, &rest)?;
+    let (mut overrides, positionals) = flagenv::parse(&config, &rest)?;
     if !positionals.is_empty() {
         bail!("unexpected positional arguments: {positionals:?}");
+    }
+    // Publish the resolved command through the flags-2-env command env (and its
+    // per-command marker), so config reads and any child processes can switch
+    // on FLAGS2ENV_COMMAND without re-parsing argv.
+    if config.commands.contains_key(&command) {
+        if let Some(key) = config.command_env_key() {
+            overrides.insert(key.to_string(), command.clone());
+            std::env::set_var(key, &command);
+        }
+        // A parent shell may contain markers from an earlier invocation.
+        // Clear every declared marker before publishing the selected one,
+        // so spawned reviewers and cross-checkers see one canonical path.
+        for spec in config.commands.values() {
+            if let Some(marker) = spec.env.as_deref() {
+                std::env::remove_var(marker);
+            }
+        }
+        if let Some(marker) = config.command_marker_env(&command) {
+            overrides.insert(marker.to_string(), "true".to_string());
+            std::env::set_var(marker, "true");
+        }
     }
     let resolved = Resolved::new(&config, overrides);
 
@@ -179,14 +210,20 @@ fn side_spec(
         }
         return Ok(SideSpec::JsonPath(path));
     }
-    let raw = r
-        .get_first(generic_keys)
-        .with_context(|| format!("no {side}: pass --{side} (or the matching env var; run `dpm help`)"))?;
+    let raw = r.get_first(generic_keys).with_context(|| {
+        format!("no {side}: pass --{side} (or the matching env var; run `dpm help`)")
+    })?;
     SideSpec::parse(&raw)
 }
 
 fn source_spec(r: &Resolved) -> Result<SideSpec> {
-    side_spec(r, "SOURCE_SQL_FILE", "SOURCE_CATALOG_JSON", &["SOURCE_DATABASE_URL"], "source")
+    side_spec(
+        r,
+        "SOURCE_SQL_FILE",
+        "SOURCE_CATALOG_JSON",
+        &["SOURCE_DATABASE_URL"],
+        "source",
+    )
 }
 
 fn target_spec(r: &Resolved) -> Result<SideSpec> {
@@ -258,20 +295,33 @@ async fn load_sides(r: &Resolved, bootstrap: bool) -> Result<DiffInputs> {
             target_cat.database_flavor.label()
         );
     }
-    let mut inputs = DiffInputs { source_cat, target_cat, source_desc: source.describe(), target_desc };
+    let mut inputs = DiffInputs {
+        source_cat,
+        target_cat,
+        source_desc: source.describe(),
+        target_desc,
+    };
     // With a shadow server available, normalize CHECK and index defs to their
     // re-parse fixed point so string comparison is exact regardless of whether
     // a side was built from original SQL or from dpm's own emitted deparse.
     if let Some(shadow) = &ctx.shadow_url {
-        dpm::canonicalize::canonicalize_defs(&mut [&mut inputs.source_cat, &mut inputs.target_cat], shadow, ctx.verbose)
-            .await
-            .context("canonicalizing deparsed definitions on the shadow server")?;
+        dpm::canonicalize::canonicalize_defs(
+            &mut [&mut inputs.source_cat, &mut inputs.target_cat],
+            shadow,
+            ctx.verbose,
+        )
+        .await
+        .context("canonicalizing deparsed definitions on the shadow server")?;
     }
     Ok(inputs)
 }
 
 /// Migration script + optional FK-index advisory block.
-fn render(r: &Resolved, inputs: &DiffInputs, allow_destructive_sql: bool) -> (Plan, Script, String) {
+fn render(
+    r: &Resolved,
+    inputs: &DiffInputs,
+    allow_destructive_sql: bool,
+) -> (Plan, Script, String) {
     let plan = diff(&inputs.source_cat, &inputs.target_cat);
     let script = emit(
         &plan,
@@ -309,7 +359,8 @@ async fn maybe_ai_review(
     }
     let tool = r.get("DPM_AI_TOOL").unwrap_or_else(|| "claude".to_string());
     let custom = r.get("DPM_AI_CMD");
-    let transport = ai::Transport::parse(&r.get("DPM_AI_TRANSPORT").unwrap_or_else(|| "auto".into()))?;
+    let transport =
+        ai::Transport::parse(&r.get("DPM_AI_TRANSPORT").unwrap_or_else(|| "auto".into()))?;
     let model = r.get("DPM_AI_MODEL");
     let req = ReviewRequest {
         sql: script.sql.clone(),
@@ -336,13 +387,70 @@ async fn maybe_ai_review(
     match (&outcome.approved, &outcome.verdict) {
         (true, Some(v)) => eprintln!("dpm: ai review: {v}"),
         (_, Some(v)) => eprintln!("dpm: ai review REJECTED: {v}"),
-        (_, None) => eprintln!("dpm: ai review returned no parseable verdict (treated as rejection)"),
+        (_, None) => {
+            eprintln!("dpm: ai review returned no parseable verdict (treated as rejection)")
+        }
     }
     Ok(Some(outcome))
 }
 
 fn ai_strict(r: &Resolved) -> bool {
     r.get_bool("DPM_AI_STRICT")
+}
+
+fn migration_lease_owner() -> String {
+    let raw_host = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown-host".to_string());
+    let sanitized = raw_host
+        .chars()
+        .take(64)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let host = if sanitized.is_empty() {
+        "unknown-host".to_string()
+    } else {
+        sanitized
+    };
+    format!("dpm:{host}:{}", std::process::id())
+}
+
+async fn acquire_migration_lease(target_url: &str) -> Result<PostgresMigrationLease> {
+    let owner = migration_lease_owner();
+    let lease = PostgresMigrationLease::acquire(target_url, DEFAULT_MIGRATION_LOCK_KEY, owner)
+        .await
+        .context("acquiring the PostgreSQL migration execution lease")?;
+    eprintln!(
+        "dpm: acquired PostgreSQL migration lease {} as {}",
+        lease.key(),
+        lease.owner()
+    );
+    Ok(lease)
+}
+
+async fn release_migration_lease(lease: Option<PostgresMigrationLease>) -> Result<()> {
+    let Some(lease) = lease else {
+        return Ok(());
+    };
+    let receipt = lease.release().await?;
+    let fingerprint = receipt
+        .last_script_fingerprint()
+        .map(|value| format!("{value:016x}"))
+        .unwrap_or_else(|| "none".to_string());
+    eprintln!(
+        "dpm: released PostgreSQL migration lease {} (owner {}, statements {}, fingerprint {})",
+        receipt.key(),
+        receipt.owner(),
+        receipt.executed(),
+        fingerprint
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -356,10 +464,15 @@ async fn cmd_diff(r: &Resolved, bootstrap: bool) -> Result<i32> {
     let allow_sql = policy.sql || bootstrap;
     let (plan, script, text) = render(r, &inputs, allow_sql);
 
+    let plan_checksum = dpm::plan_safety::reviewed_plan_checksum(&plan, &script.sql);
+    eprintln!("dpm: reviewed plan checksum {plan_checksum}");
     if r.get("DPM_FORMAT").as_deref() == Some("json") {
+        let certificate = plan.borrow_check();
         let doc = serde_json::json!({
             "source": inputs.source_desc,
             "target": inputs.target_desc,
+            "planChecksum": plan_checksum,
+            "planFingerprint": certificate.fingerprint,
             "changes": plan.changes,
             "summary": {
                 "total": script.change_count,
@@ -389,9 +502,12 @@ async fn cmd_diff(r: &Resolved, bootstrap: bool) -> Result<i32> {
 async fn cmd_apply(r: &Resolved) -> Result<i32> {
     let target = target_spec(r)?;
     let SideSpec::Url(target_url) = &target else {
-        bail!("apply needs a live --target database URL (got {})", target.describe());
+        bail!(
+            "apply needs a live --target database URL (got {})",
+            target.describe()
+        );
     };
-    let inputs = load_sides(r, false).await?;
+    let mut inputs = load_sides(r, false).await?;
     let policy = destructive_policy(r);
     if inputs.source_cat.database_flavor == DatabaseFlavor::Cockroach && check_selection(r).any() {
         bail!(
@@ -403,6 +519,20 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
     if plan.is_empty() {
         eprintln!("dpm: no differences — nothing to apply");
         return Ok(0);
+    }
+
+    let plan_checksum = dpm::plan_safety::reviewed_plan_checksum(&plan, &script.sql);
+    eprintln!("dpm: reviewed plan checksum {plan_checksum}");
+    if let Some(expected) = r.get("DPM_REQUIRE_PLAN_CHECKSUM") {
+        if !expected.trim().is_empty()
+            && !dpm::plan_safety::checksums_match(&expected, &plan_checksum)
+        {
+            bail!(
+                "reviewed plan checksum {plan_checksum} does not match required checksum {}; \
+                 refusing writes",
+                expected.trim()
+            );
+        }
     }
 
     // Two-consent destructive model: generating live destructive SQL is one
@@ -429,7 +559,9 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
     if let Some(outcome) = maybe_ai_review(r, &plan, &script, &inputs, policy, false).await? {
         if !outcome.approved {
             if ai_strict(r) {
-                eprintln!("dpm: aborting apply (AI reviewer rejected; use --ai-strict=false to override)");
+                eprintln!(
+                    "dpm: aborting apply (AI reviewer rejected; use --ai-strict=false to override)"
+                );
                 eprintln!("--- reviewer transcript ---\n{}", outcome.transcript);
                 return Ok(4);
             }
@@ -454,7 +586,47 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
         }
     }
 
-    let report = dpm::apply::apply_script(target_url, &script.sql).await?;
+    // PostgreSQL execution is serialized by a session-scoped advisory lease.
+    // Re-introspect and re-render while holding it so the reviewed preview can
+    // never be applied after another migrator changes the desired/current
+    // catalogs. CockroachDB retains its existing convergence/recovery path
+    // until it has an equivalent distributed lease primitive.
+    let mut lease = if inputs.source_cat.database_flavor == DatabaseFlavor::Postgres {
+        Some(acquire_migration_lease(target_url).await?)
+    } else {
+        None
+    };
+    if lease.is_some() {
+        let refreshed_inputs = load_sides(r, false).await?;
+        let (refreshed_plan, refreshed_script, _) = render(r, &refreshed_inputs, policy.sql);
+        if refreshed_plan.is_empty() {
+            eprintln!(
+                "dpm: target converged before the execution lease was acquired — nothing to apply"
+            );
+            release_migration_lease(lease).await?;
+            return Ok(0);
+        }
+        let refreshed_checksum =
+            dpm::plan_safety::reviewed_plan_checksum(&refreshed_plan, &refreshed_script.sql);
+        if refreshed_script.sql != script.sql || refreshed_checksum != plan_checksum {
+            release_migration_lease(lease).await?;
+            bail!(
+                "the source or target schema changed after the migration was reviewed \
+                 (plan checksum {plan_checksum} -> {refreshed_checksum}); \
+                 nothing was applied — re-run dpm apply to review the fresh plan"
+            );
+        }
+        inputs = refreshed_inputs;
+    }
+
+    let report = match lease.as_mut() {
+        Some(lease) => {
+            let validated = ValidatedScript::parse(&script.sql)
+                .context("validating the reviewed migration before leased execution")?;
+            lease.apply(&validated).await?
+        }
+        None => dpm::apply::apply_script(target_url, &script.sql).await?,
+    };
     eprintln!(
         "dpm: applied {} statement(s) to {}",
         report.executed,
@@ -465,20 +637,42 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
     let opts = introspect_options(r);
     let mut migrated = dpm::introspect::introspect_url(target_url, &opts).await?;
     if let Some(shadow) = r.get("SHADOW_DATABASE_URL") {
-        dpm::canonicalize::canonicalize_defs(&mut [&mut migrated], &shadow, r.get_bool("DPM_VERBOSE"))
-            .await
-            .context("canonicalizing deparsed definitions on the shadow server")?;
+        dpm::canonicalize::canonicalize_defs(
+            &mut [&mut migrated],
+            &shadow,
+            r.get_bool("DPM_VERBOSE"),
+        )
+        .await
+        .context("canonicalizing deparsed definitions on the shadow server")?;
     }
     let residual = diff(&inputs.source_cat, &migrated);
-    let residual_real: Vec<_> = residual.changes.iter().filter(|c| !c.is_manual()).collect();
-    if residual_real.is_empty() {
+    let converged = residual.is_empty();
+    let residual_sql = if converged {
+        None
+    } else {
+        Some(
+            emit(
+                &residual,
+                &EmitOptions {
+                    database_flavor: inputs.source_cat.database_flavor,
+                    ..Default::default()
+                },
+            )
+            .sql,
+        )
+    };
+    if converged {
         eprintln!("dpm: converged — target now matches the source");
     } else {
         eprintln!(
-            "dpm: warning: {} change(s) remain after apply (gated destructive or manual items)",
-            residual_real.len()
+            "dpm: NOT CONVERGED — {} change(s) remain after apply",
+            residual.changes.len()
         );
+        if let Some(sql) = &residual_sql {
+            eprintln!("--- residual diff ---\n{sql}");
+        }
     }
+    let mut exit_code = if converged { 0 } else { 3 };
 
     // Optional independent cross-checks of the freshly migrated target.
     // (flyway is verify-only: it validates the script on a replica, and the
@@ -521,28 +715,32 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
             },
         };
         if let Some(compare_url) = compare_url {
-            let checks = dpm::crosscheck::run_diff_checks(&selection, &check_bins(r), target_url, &compare_url);
+            let checks = dpm::crosscheck::run_diff_checks(
+                &selection,
+                &check_bins(r),
+                target_url,
+                &compare_url,
+            );
             report_checks(&checks);
-            let scan_ok = maybe_ai_discrepancy_scan(
-                r,
-                residual_real.is_empty(),
-                None,
-                &checks,
-            )
-            .await?
-            .unwrap_or(true);
+            let scan_ok = maybe_ai_discrepancy_scan(r, converged, residual_sql.as_deref(), &checks)
+                .await?
+                .unwrap_or(true);
             if let Some(db) = source_replica {
                 db.drop_db().await;
             }
             if !checks.iter().all(|c| c.agreed) {
-                return Ok(3);
+                exit_code = 3;
             }
             if !scan_ok && ai_strict(r) {
-                return Ok(4);
+                exit_code = 4;
             }
         }
     }
-    Ok(0)
+
+    // Keep the PostgreSQL lease through convergence and independent checks so
+    // the emitted evidence describes one stable execution epoch.
+    release_migration_lease(lease).await?;
+    Ok(exit_code)
 }
 
 async fn cmd_dump(r: &Resolved) -> Result<i32> {
@@ -606,7 +804,8 @@ async fn maybe_ai_discrepancy_scan(
     }
     let tool = r.get("DPM_AI_TOOL").unwrap_or_else(|| "claude".to_string());
     let custom = r.get("DPM_AI_CMD");
-    let transport = ai::Transport::parse(&r.get("DPM_AI_TRANSPORT").unwrap_or_else(|| "auto".into()))?;
+    let transport =
+        ai::Transport::parse(&r.get("DPM_AI_TRANSPORT").unwrap_or_else(|| "auto".into()))?;
     let model = r.get("DPM_AI_MODEL");
     let reports: Vec<(String, bool, String, Option<String>)> = checks
         .iter()
@@ -614,11 +813,24 @@ async fn maybe_ai_discrepancy_scan(
         .collect();
     let payload = ai::build_discrepancy_payload(converged, residual_sql, &reports);
     eprintln!("dpm: ai discrepancy scan via {tool} ...");
-    let outcome = ai::run_payload(&tool, custom.as_deref(), transport, model.as_deref(), &payload, r.get_bool("DPM_VERBOSE")).await?;
+    let outcome = ai::run_payload(
+        &tool,
+        custom.as_deref(),
+        transport,
+        model.as_deref(),
+        &payload,
+        r.get_bool("DPM_VERBOSE"),
+    )
+    .await?;
     match (&outcome.approved, &outcome.verdict) {
         (true, Some(v)) => eprintln!("dpm: ai discrepancy scan: {v}"),
-        (_, Some(v)) => eprintln!("dpm: ai discrepancy scan REJECTED: {v}\n{}", outcome.transcript),
-        (_, None) => eprintln!("dpm: ai discrepancy scan returned no parseable verdict (treated as rejection)"),
+        (_, Some(v)) => eprintln!(
+            "dpm: ai discrepancy scan REJECTED: {v}\n{}",
+            outcome.transcript
+        ),
+        (_, None) => eprintln!(
+            "dpm: ai discrepancy scan returned no parseable verdict (treated as rejection)"
+        ),
     }
     Ok(Some(outcome.approved))
 }
@@ -679,8 +891,13 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
 
     // AI discrepancy scan over the cross-check reports.
     let mut ai_ok = true;
-    if let Some(approved) =
-        maybe_ai_discrepancy_scan(r, outcome.converged, outcome.residual_sql.as_deref(), &outcome.checks).await?
+    if let Some(approved) = maybe_ai_discrepancy_scan(
+        r,
+        outcome.converged,
+        outcome.residual_sql.as_deref(),
+        &outcome.checks,
+    )
+    .await?
     {
         ai_ok &= approved || !ai_strict(r);
     }
@@ -705,14 +922,21 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
     if !ai_ok {
         return Ok(4);
     }
-    Ok(if outcome.converged && outcome.all_checks_agreed() { 0 } else { 3 })
+    Ok(if outcome.converged && outcome.all_checks_agreed() {
+        0
+    } else {
+        3
+    })
 }
 
 fn report_checks(checks: &[dpm::crosscheck::CheckReport]) {
     for c in checks {
         match (&c.error, c.agreed) {
             (Some(err), _) => eprintln!("dpm: cross-check {} ERROR: {err}", c.name),
-            (None, true) => eprintln!("dpm: cross-check {} agreed (no remaining differences)", c.name),
+            (None, true) => eprintln!(
+                "dpm: cross-check {} agreed (no remaining differences)",
+                c.name
+            ),
             (None, false) => eprintln!(
                 "dpm: cross-check {} DISAGREED — it still sees differences:\n{}",
                 c.name, c.output
@@ -732,7 +956,8 @@ async fn cmd_review(r: &Resolved) -> Result<i32> {
     }
     summarize(&script);
 
-    let outcome = maybe_ai_review(r, &plan, &script, &inputs, policy, true).await?
+    let outcome = maybe_ai_review(r, &plan, &script, &inputs, policy, true)
+        .await?
         .expect("review command forces AI review");
     println!("{}", outcome.transcript.trim_end());
     if outcome.approved {

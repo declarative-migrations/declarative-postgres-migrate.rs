@@ -12,9 +12,8 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use crate::interfaces::{
-    ApplyRequest, ApplyResponse, DiffRequest, DiffResponse, ErrorResponse,
-    HealthResponse, VersionResponse, APPLY_PATH, DIFF_PATH, HEALTH_PATH,
-    VERSION_PATH,
+    ApplyRequest, ApplyResponse, DiffRequest, DiffResponse, ErrorResponse, HealthResponse,
+    VersionResponse, APPLY_PATH, DIFF_PATH, HEALTH_PATH, VERSION_PATH,
 };
 
 #[derive(Clone)]
@@ -113,11 +112,7 @@ fn normalize_base_url(raw: &str) -> Result<String> {
     Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
-fn decode_response<T: DeserializeOwned>(
-    status: StatusCode,
-    body: &[u8],
-    path: &str,
-) -> Result<T> {
+fn decode_response<T: DeserializeOwned>(status: StatusCode, body: &[u8], path: &str) -> Result<T> {
     if status.is_success() {
         return serde_json::from_slice(body)
             .with_context(|| format!("dpm-server returned invalid JSON for {path}"));

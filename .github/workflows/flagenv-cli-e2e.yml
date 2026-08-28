@@ -1,0 +1,77 @@
+name: flags-2-env CLI E2E
+
+on:
+  pull_request:
+    paths:
+      - '.cli-flags.toml'
+      - 'src/main.rs'
+      - 'src/flagenv.rs'
+      - 'src/ai.rs'
+      - 'src/verify.rs'
+      - 'tests/flagenv_cli_e2e.rs'
+      - '.github/workflows/flagenv-cli-e2e.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.cli-flags.toml'
+      - 'src/main.rs'
+      - 'src/flagenv.rs'
+      - 'src/ai.rs'
+      - 'src/verify.rs'
+      - 'tests/flagenv_cli_e2e.rs'
+      - '.github/workflows/flagenv-cli-e2e.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flagenv-cli-e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  command-environment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Validate workflow
+        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+        with:
+          args: .github/workflows/flagenv-cli-e2e.yml
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Check E2E formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint E2E target
+        run: cargo clippy --locked --test flagenv_cli_e2e -- -D warnings
+
+      - name: Run command-environment E2E journeys
+        env:
+          DPM_TEST_DATABASE_URL: postgres://postgres@localhost:5432/postgres
+        run: cargo test --locked --test flagenv_cli_e2e -- --test-threads=1

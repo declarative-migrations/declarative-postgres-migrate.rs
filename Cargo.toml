@@ -25,7 +25,7 @@ path = "src/bin/dpm-server.rs"
 
 [dependencies]
 anyhow = "1"
-libloading = "0.8"
+libloading = "0.9"
 reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
   "json",
@@ -46,7 +46,7 @@ tokio = { version = "1", features = [
   "signal",
   "sync",
 ] }
-toml = "0.8"
+toml = "1.1"
 
 [dev-dependencies]
 proptest = "1"

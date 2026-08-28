@@ -45,8 +45,19 @@ fn help_shows_commands_and_flag_table() {
     let out = dpm().arg("help").output().unwrap();
     assert!(out.status.success());
     let text = stdout(&out);
-    for needle in ["diff", "apply", "verify", "review", "bootstrap", "dump",
-                   "--cross-check-all", "SOURCE_DATABASE_URL", "DPM_AI_TRANSPORT"] {
+    for needle in [
+        "diff",
+        "apply",
+        "verify",
+        "review",
+        "bootstrap",
+        "dump",
+        "--cross-check-all",
+        "SOURCE_DATABASE_URL",
+        "DPM_AI_TRANSPORT",
+        "--require-plan-checksum",
+        "DPM_REQUIRE_PLAN_CHECKSUM",
+    ] {
         assert!(text.contains(needle), "help missing {needle:?}");
     }
 }
@@ -88,7 +99,10 @@ fn unknown_command_and_unknown_flag_error_cleanly() {
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("unknown command"));
 
-    let out = dpm().args(["diff", "--definitely-not-a-flag"]).output().unwrap();
+    let out = dpm()
+        .args(["diff", "--definitely-not-a-flag"])
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("unknown option"));
 }
@@ -109,7 +123,15 @@ fn diff_without_source_is_a_clear_error() {
 #[test]
 fn conflicting_kind_flags_error() {
     let out = dpm()
-        .args(["diff", "--source-sql", "a.sql", "--source-json", "b.json", "--target", "postgres://x@y/z"])
+        .args([
+            "diff",
+            "--source-sql",
+            "a.sql",
+            "--source-json",
+            "b.json",
+            "--target",
+            "postgres://x@y/z",
+        ])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
@@ -119,14 +141,26 @@ fn conflicting_kind_flags_error() {
 #[test]
 fn explicit_side_kinds_validate_extensions() {
     let out = dpm()
-        .args(["diff", "--source-sql", "desired.json", "--target", "postgres://x@y/z"])
+        .args([
+            "diff",
+            "--source-sql",
+            "desired.json",
+            "--target",
+            "postgres://x@y/z",
+        ])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("must point at a .sql file"));
 
     let out = dpm()
-        .args(["diff", "--source-json", "desired.sql", "--target", "postgres://x@y/z"])
+        .args([
+            "diff",
+            "--source-json",
+            "desired.sql",
+            "--target",
+            "postgres://x@y/z",
+        ])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
@@ -155,7 +189,48 @@ fn apply_rejects_non_live_targets_before_loading_sides() {
 // ---------------------------------------------------------------------------
 
 const CLI_SOURCE: &str = "CREATE TABLE widgets (id bigserial PRIMARY KEY, name text NOT NULL, price numeric(10,2) NOT NULL DEFAULT 0);\nCREATE INDEX widgets_name_idx ON widgets (name);";
-const CLI_TARGET: &str = "CREATE TABLE widgets (id bigserial PRIMARY KEY, name text NOT NULL, obsolete boolean);";
+const CLI_TARGET: &str =
+    "CREATE TABLE widgets (id bigserial PRIMARY KEY, name text NOT NULL, obsolete boolean);";
+
+#[test]
+fn apply_exits_3_when_gated_destructive_change_leaves_residual_drift() {
+    let Some(admin) = admin_url() else { return };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let target = rt.block_on(async {
+        let db = dpm::source::ShadowDb::create(&admin, false).await.unwrap();
+        db.apply_sql(CLI_TARGET).await.unwrap();
+        db
+    });
+    let source_sql = scratch("gated-residual.sql");
+    std::fs::write(&source_sql, CLI_SOURCE).unwrap();
+
+    let out = dpm()
+        .args(["apply", "--yes", "--source"])
+        .arg(&source_sql)
+        .args(["--target", &target.url, "--shadow", &admin])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
+    let error = stderr(&out);
+    assert!(error.contains("NOT CONVERGED"), "{error}");
+    assert!(error.contains("--- residual diff ---"), "{error}");
+
+    let columns: (i64, i64) = rt.block_on(async {
+        let mut conn = dpm::introspect::connect(&target.url).await.unwrap();
+        sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE column_name = 'price')::bigint,                     count(*) FILTER (WHERE column_name = 'obsolete')::bigint                FROM information_schema.columns               WHERE table_schema = 'public' AND table_name = 'widgets'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap()
+    });
+    assert_eq!(
+        columns,
+        (1, 1),
+        "non-destructive work should apply while the gated destructive column remains"
+    );
+    rt.block_on(target.drop_db());
+}
 
 #[test]
 fn full_cli_lifecycle_sql_to_live() {
@@ -181,7 +256,10 @@ fn full_cli_lifecycle_sql_to_live() {
     assert!(out.status.success(), "{}", stderr(&out));
     let sql = stdout(&out);
     assert!(sql.contains("ADD COLUMN IF NOT EXISTS \"price\""), "{sql}");
-    assert!(sql.contains("-- ALTER TABLE") && sql.contains("DROP COLUMN"), "destructive gated: {sql}");
+    assert!(
+        sql.contains("-- ALTER TABLE") && sql.contains("DROP COLUMN"),
+        "destructive gated: {sql}"
+    );
 
     // 2. --fail-on-diff exits 2 while drift exists.
     let out = dpm()
@@ -201,7 +279,11 @@ fn full_cli_lifecycle_sql_to_live() {
         .unwrap();
     let doc: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert!(doc["summary"]["total"].as_u64().unwrap() >= 2);
-    assert!(doc["changes"].as_array().unwrap().iter().any(|c| c["op"] == "add_column"));
+    assert!(doc["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["op"] == "add_column"));
 
     // 4. two-consent gate: sql-consent without ops-consent refuses pre-write.
     let out = dpm()
@@ -215,14 +297,28 @@ fn full_cli_lifecycle_sql_to_live() {
 
     // 5. review with a fake AI: reject => exit 4, approve => exit 0.
     let out = dpm()
-        .args(["review", "--ai-tool", "custom", "--ai-cmd", "echo 'DPM_VERDICT: REJECT nope'", "--source"])
+        .args([
+            "review",
+            "--ai-tool",
+            "custom",
+            "--ai-cmd",
+            "echo 'DPM_VERDICT: REJECT nope'",
+            "--source",
+        ])
         .arg(&source_sql)
         .args(["--target", &target.url, "--shadow", &admin])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
     let out = dpm()
-        .args(["review", "--ai-tool", "custom", "--ai-cmd", "echo 'DPM_VERDICT: APPROVE'", "--source"])
+        .args([
+            "review",
+            "--ai-tool",
+            "custom",
+            "--ai-cmd",
+            "echo 'DPM_VERDICT: APPROVE'",
+            "--source",
+        ])
         .arg(&source_sql)
         .args(["--target", &target.url, "--shadow", &admin])
         .output()
@@ -244,7 +340,12 @@ fn full_cli_lifecycle_sql_to_live() {
         .args(["--target", &target.url, "--shadow", &admin])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(0), "post-apply drift: {}", stdout(&out));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "post-apply drift: {}",
+        stdout(&out)
+    );
 
     // 7. dump -> catalog.json usable as a side; json↔live now identical.
     let dump_path = scratch("target.json");
@@ -266,7 +367,13 @@ fn full_cli_lifecycle_sql_to_live() {
     let out = dpm()
         .args(["verify", "--source"])
         .arg(&source_sql)
-        .args(["--target", &target.url, "--shadow", &admin, "--allow-destructive-sql"])
+        .args([
+            "--target",
+            &target.url,
+            "--shadow",
+            &admin,
+            "--allow-destructive-sql",
+        ])
         .args(["--external-check", "true"])
         .output()
         .unwrap();
@@ -402,10 +509,19 @@ fn apply_interactive_abort_leaves_target_untouched() {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.as_mut().unwrap().write_all(answer.as_bytes()).unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(answer.as_bytes())
+            .unwrap();
         let out = child.wait_with_output().unwrap();
         assert_eq!(out.status.code(), Some(1), "answer {answer:?} must abort");
-        assert!(stderr(&out).contains("aborted"), "answer {answer:?}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("aborted"),
+            "answer {answer:?}: {}",
+            stderr(&out)
+        );
     }
 
     // Nothing was applied: the price column from the source must not exist.
@@ -438,14 +554,30 @@ fn schemas_flag_scopes_the_cli_diff() {
 
     // Unscoped: drift exists -> exit 2.
     let out = dpm()
-        .args(["diff", "--fail-on-diff", "--source", &a.url, "--target", &b.url])
+        .args([
+            "diff",
+            "--fail-on-diff",
+            "--source",
+            &a.url,
+            "--target",
+            &b.url,
+        ])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
 
     // Scoped to `keep`: identical -> exit 0.
     let out = dpm()
-        .args(["diff", "--fail-on-diff", "--schemas", "keep", "--source", &a.url, "--target", &b.url])
+        .args([
+            "diff",
+            "--fail-on-diff",
+            "--schemas",
+            "keep",
+            "--source",
+            &a.url,
+            "--target",
+            &b.url,
+        ])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));

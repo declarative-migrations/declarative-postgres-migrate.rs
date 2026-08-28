@@ -151,6 +151,7 @@ Built-in templates: `claude -p < {file}`, `codex exec - < {file}`, `gemini < {fi
 ## Safety model (house rules)
 
 - **Reviewable SQL only.** `dpm diff` prints SQL; it never executes. `dpm apply` requires an interactive `yes` or an explicit `--yes`.
+- **Plan checksums fail closed.** `dpm diff` and `dpm apply` print `dpm: reviewed plan checksum <hex>` — an identity digest of the typed plan certificate plus emitted SQL, not a cryptographic signature. `dpm apply --require-plan-checksum <hex>` (or `DPM_REQUIRE_PLAN_CHECKSUM`) aborts before confirmation if the digest does not match. After the execution lease is acquired, apply recomputes the digest from a fresh introspection and refuses writes if the source, target, or plan drifted.
 - **Destructive changes need two separate consents.** Drops of tables, columns, enums, sequences, functions/procedures, standalone views/triggers/policies, and integrity-weakening drops (PK/unique/exclusion constraints, unique indexes) are:
   1. emitted **commented out** unless `--allow-destructive-sql` (`DPM_ALLOW_DESTRUCTIVE_SQL`) — the consent to *generate* destructive SQL;
   2. refused at execution time by `dpm apply` unless `--allow-destructive-ops` (`DPM_ALLOW_DESTRUCTIVE_OPS`) — the consent to *run* it. A script containing live destructive statements without ops-consent aborts before any statement executes.
@@ -186,6 +187,7 @@ Flags follow the [flags-2-env](https://github.com/ORESoftware/flags-2-env) conve
 | `--allow-destructive` (legacy: implies both) | `DPM_ALLOW_DESTRUCTIVE` |
 | `--ai-review`, `--ai-tool`, `--ai-cmd`, `--ai-strict` | `DPM_AI_REVIEW`, `DPM_AI_TOOL`, `DPM_AI_CMD`, `DPM_AI_STRICT` |
 | `--format`, `-o/--out`, `--yes`, `--fail-on-diff`, `--keep-shadow`, `--verbose` | `DPM_FORMAT`, `DPM_OUT`, `DPM_YES`, `DPM_FAIL_ON_DIFF`, `DPM_KEEP_SHADOW`, `DPM_VERBOSE` |
+| `--require-plan-checksum` | `DPM_REQUIRE_PLAN_CHECKSUM` |
 | `--advise-fk-indexes` | `DPM_ADVISE_FK_INDEXES` |
 | `--external-check` | `DPM_EXTERNAL_CHECK` |
 

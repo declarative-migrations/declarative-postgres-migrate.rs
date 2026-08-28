@@ -10,6 +10,7 @@ on:
       - "src/server/**"
       - "src/sync.rs"
       - "src/bin/dpm-server.rs"
+      - "tests/server_process.rs"
       - "openapi/**"
       - ".github/workflows/server.yml"
   pull_request:
@@ -20,6 +21,7 @@ on:
       - "src/server/**"
       - "src/sync.rs"
       - "src/bin/dpm-server.rs"
+      - "tests/server_process.rs"
       - "openapi/**"
       - ".github/workflows/server.yml"
   workflow_dispatch:
@@ -30,125 +32,40 @@ permissions:
 jobs:
   contract-and-process:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.97.1
+          components: clippy,rustfmt
       - name: Formatting
         run: cargo fmt --all -- --check
-      - name: Unit and contract tests
-        run: cargo test --locked --all-targets
+      - name: Server unit and wire-contract tests
+        run: |
+          cargo test --locked --lib server::
+          cargo test --locked --lib interfaces::
+          cargo test --locked --lib sync::
+      - name: Real-process HTTP contract
+        run: cargo test --locked --test server_process -- --test-threads=1
       - name: Strict lint
         run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Build server
+      - name: Locked server build
         run: cargo build --locked --bin dpm-server
-      - name: Validate OpenAPI JSON
-        run: python -m json.tool openapi/dpm-server-v1.json >/dev/null
-      - name: Real-process HTTP smoke test
-        shell: bash
-        run: |
-          set -euo pipefail
-          port="$(python - <<'PY'
-          import socket
-          with socket.socket() as listener:
-              listener.bind(("127.0.0.1", 0))
-              print(listener.getsockname()[1])
-          PY
-          )"
-          token='server-smoke-token-0123456789'
-          export DPM_SERVER_BIND="127.0.0.1:${port}"
-          export DPM_SERVER_TOKEN="${token}"
-          export DPM_SERVER_DATABASES_JSON='{"primary":"postgres://127.0.0.1:9/unused"}'
-          export DPM_SERVER_ALLOW_APPLY=false
-          target/debug/dpm-server >server.log 2>&1 &
-          server_pid=$!
-          trap 'kill "${server_pid}" 2>/dev/null || true; wait "${server_pid}" 2>/dev/null || true' EXIT
+      - name: Validate checked-in OpenAPI 3.1 document
+        run: python3 -m json.tool openapi/dpm-server-v1.json >/dev/null
 
-          for _ in {1..50}; do
-            if curl --silent --fail "http://127.0.0.1:${port}/healthz" >health.json; then
-              break
-            fi
-            sleep 0.1
-          done
-          python - <<'PY'
-          import json
-          with open("health.json", encoding="utf-8") as stream:
-              payload = json.load(stream)
-          assert payload["status"] == "ok"
-          assert payload["service"] == "dpm-server"
-          assert payload["api_version"] == "v1"
-          PY
-
-          curl --silent --fail "http://127.0.0.1:${port}/openapi.json" >served-openapi.json
-          cmp openapi/dpm-server-v1.json served-openapi.json
-
-          cat >diff.json <<'JSON'
-          {
-            "source": {
-              "kind": "catalog",
-              "catalog": {
-                "format_version": 1,
-                "server_version_num": 0,
-                "database_flavor": "postgres",
-                "schemas": [],
-                "extensions": [],
-                "enums": {},
-                "sequences": {},
-                "tables": {},
-                "views": {},
-                "functions": {},
-                "triggers": {}
-              }
-            },
-            "target": {
-              "kind": "catalog",
-              "catalog": {
-                "format_version": 1,
-                "server_version_num": 0,
-                "database_flavor": "postgres",
-                "schemas": [],
-                "extensions": [],
-                "enums": {},
-                "sequences": {},
-                "tables": {},
-                "views": {},
-                "functions": {},
-                "triggers": {}
-              }
-            }
-          }
-          JSON
-
-          unauthenticated_status="$(curl --silent --output unauthenticated.json \
-            --write-out '%{http_code}' \
-            -H 'Content-Type: application/json' \
-            --data @diff.json \
-            "http://127.0.0.1:${port}/v1/diff")"
-          test "${unauthenticated_status}" = 401
-
-          curl --silent --fail \
-            -H "Authorization: Bearer ${token}" \
-            -H 'Content-Type: application/json' \
-            --data @diff.json \
-            "http://127.0.0.1:${port}/v1/diff" >diff-response.json
-          python - <<'PY'
-          import json
-          with open("diff-response.json", encoding="utf-8") as stream:
-              payload = json.load(stream)
-          assert payload["api_version"] == "v1"
-          assert payload["summary"]["change_count"] == 0
-          assert payload["plan"]["changes"] == []
-          PY
-
-          apply_status="$(curl --silent --output apply-disabled.json \
-            --write-out '%{http_code}' \
-            -H "Authorization: Bearer ${token}" \
-            -H 'Content-Type: application/json' \
-            --data '{"source":{"kind":"catalog","catalog":{"format_version":1,"server_version_num":0,"database_flavor":"postgres","schemas":[],"extensions":[],"enums":{},"sequences":{},"tables":{},"views":{},"functions":{},"triggers":{}}},"target":"primary","dry_run":false,"confirmation":"apply:primary"}' \
-            "http://127.0.0.1:${port}/v1/apply")"
-          test "${apply_status}" = 503
-          grep -q 'apply_disabled' apply-disabled.json
-      - name: Server log on failure
-        if: failure()
-        run: cat server.log 2>/dev/null || true
+  compiler-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.88.0", "1.89.0", "1.90.0", "1.91.0", "stable"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: ${{ matrix.rust }}
+      - name: Compile all targets with the locked dependency graph
+        run: cargo +${{ matrix.rust }} check --locked --all-targets

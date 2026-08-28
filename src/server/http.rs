@@ -112,7 +112,9 @@ pub(crate) async fn read_request(
             .await
             .map_err(|error| ReadError::bad_request(format!("failed to read request: {error}")))?;
         if read == 0 {
-            return Err(ReadError::bad_request("connection closed before request headers"));
+            return Err(ReadError::bad_request(
+                "connection closed before request headers",
+            ));
         }
         buffer.extend_from_slice(&chunk[..read]);
     };
@@ -142,7 +144,9 @@ pub(crate) async fn read_request(
             .await
             .map_err(|error| ReadError::bad_request(format!("failed to read body: {error}")))?;
         if read == 0 {
-            return Err(ReadError::bad_request("connection closed before request body"));
+            return Err(ReadError::bad_request(
+                "connection closed before request body",
+            ));
         }
         buffer.extend_from_slice(&chunk[..read]);
     }
@@ -240,10 +244,7 @@ fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-pub(crate) async fn write_response(
-    stream: &mut TcpStream,
-    response: Response,
-) -> io::Result<()> {
+pub(crate) async fn write_response(stream: &mut TcpStream, response: Response) -> io::Result<()> {
     let reason = reason_phrase(response.status);
     let mut head = format!(
         concat!(
@@ -297,10 +298,9 @@ mod tests {
 
     #[test]
     fn parses_request_head_and_strips_query() {
-        let parsed = parse_head(
-            b"POST /v1/diff?trace=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2",
-        )
-        .unwrap();
+        let parsed =
+            parse_head(b"POST /v1/diff?trace=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2")
+                .unwrap();
         assert_eq!(parsed.method, "POST");
         assert_eq!(parsed.path, "/v1/diff");
         assert_eq!(parsed.content_length, 2);
@@ -308,18 +308,15 @@ mod tests {
 
     #[test]
     fn rejects_conflicting_content_lengths() {
-        let error = parse_head(
-            b"POST /v1/diff HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 3",
-        )
-        .unwrap_err();
+        let error = parse_head(b"POST /v1/diff HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 3")
+            .unwrap_err();
         assert_eq!(error.status, 400);
     }
 
     #[test]
     fn rejects_chunked_requests() {
         let error =
-            parse_head(b"POST /v1/diff HTTP/1.1\r\nTransfer-Encoding: chunked")
-                .unwrap_err();
+            parse_head(b"POST /v1/diff HTTP/1.1\r\nTransfer-Encoding: chunked").unwrap_err();
         assert_eq!(error.status, 501);
     }
 
