@@ -306,6 +306,10 @@ fn normalize_bool(v: &str) -> Result<String> {
 pub struct Resolved {
     env: HashMap<String, String>,
     defaults: HashMap<String, String>,
+    /// Command-marker keys that a parent shell may still hold. Child processes
+    /// must unset these before the selected marker is applied.
+    child_unset: Vec<String>,
+    command_env_key: Option<String>,
 }
 
 pub fn merge_env(
@@ -335,6 +339,30 @@ impl Resolved {
         Self {
             env: merge_env(process_env, overrides),
             defaults,
+            child_unset: config
+                .commands
+                .values()
+                .filter_map(|spec| spec.env.clone())
+                .collect(),
+            command_env_key: config.command_env_key().map(str::to_owned),
+        }
+    }
+
+    /// Project command identity onto a spawned checker or reviewer without
+    /// writing the parent process environment.
+    pub fn apply_to_child(&self, cmd: &mut std::process::Command) {
+        for key in &self.child_unset {
+            cmd.env_remove(key);
+        }
+        if let Some(key) = &self.command_env_key {
+            if let Some(value) = self.get(key) {
+                cmd.env(key, value);
+            }
+        }
+        for key in &self.child_unset {
+            if let Some(value) = self.get(key) {
+                cmd.env(key, value);
+            }
         }
     }
 
@@ -573,6 +601,58 @@ type = "integer"
         let production = SRC.split("#[cfg(test)]").next().unwrap_or(SRC);
         assert!(!production.contains("std::env::set_var"));
         assert!(!production.contains("env::set_var"));
+    }
+
+    #[test]
+    fn apply_to_child_replaces_stale_command_markers() {
+        let cfg = {
+            let text = r#"
+[parse]
+command_env = "FLAGS2ENV_COMMAND"
+
+[commands.diff]
+env = "DPM_CMD_DIFF"
+
+[commands.verify]
+env = "DPM_CMD_VERIFY"
+
+[flags.jobs]
+env = "DPM_JOBS"
+type = "integer"
+"#;
+            let parsed: CliFlagsFile = toml::from_str(text).unwrap();
+            FlagConfig {
+                flags: parsed.flags,
+                commands: parsed.commands,
+                parse: parsed.parse,
+            }
+        };
+        let resolved = Resolved::new(
+            &cfg,
+            HashMap::from([
+                ("FLAGS2ENV_COMMAND".into(), "diff".into()),
+                ("DPM_CMD_DIFF".into(), "true".into()),
+            ]),
+            HashMap::from([
+                ("FLAGS2ENV_COMMAND".into(), "verify".into()),
+                ("DPM_CMD_VERIFY".into(), "true".into()),
+            ]),
+        );
+        let mut cmd = std::process::Command::new("true");
+        resolved.apply_to_child(&mut cmd);
+        let env = cmd.get_envs().collect::<Vec<_>>();
+        let as_strings: Vec<(String, Option<String>)> = env
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(as_strings.iter().any(|(k, v)| k == "FLAGS2ENV_COMMAND" && v.as_deref() == Some("verify")));
+        assert!(as_strings.iter().any(|(k, v)| k == "DPM_CMD_VERIFY" && v.as_deref() == Some("true")));
+        assert!(as_strings.iter().any(|(k, v)| k == "DPM_CMD_DIFF" && v.is_none()));
     }
 }
 

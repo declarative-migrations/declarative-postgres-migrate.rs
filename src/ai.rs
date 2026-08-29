@@ -246,6 +246,7 @@ pub async fn run_review(
     model_override: Option<&str>,
     req: &ReviewRequest,
     verbose: bool,
+    command_env: Option<&crate::flagenv::Resolved>,
 ) -> Result<ReviewOutcome> {
     let payload = build_payload(req);
     run_payload(
@@ -255,6 +256,7 @@ pub async fn run_review(
         model_override,
         &payload,
         verbose,
+        command_env,
     )
     .await
 }
@@ -269,6 +271,7 @@ pub async fn run_payload(
     model_override: Option<&str>,
     payload: &str,
     verbose: bool,
+    command_env: Option<&crate::flagenv::Resolved>,
 ) -> Result<ReviewOutcome> {
     let provider = if custom_cmd.is_some() {
         Provider::Custom
@@ -303,7 +306,14 @@ pub async fn run_payload(
         }
         run_review_api(provider, &key, &model, payload).await
     } else {
-        run_review_cli(tool, custom_cmd, payload, payload.len(), verbose)
+        run_review_cli(
+            tool,
+            custom_cmd,
+            payload,
+            payload.len(),
+            verbose,
+            command_env,
+        )
     }
 }
 
@@ -603,6 +613,7 @@ fn run_review_cli(
     payload: &str,
     tag: usize,
     verbose: bool,
+    command_env: Option<&crate::flagenv::Resolved>,
 ) -> Result<ReviewOutcome> {
     let template = tool_command_template(tool, custom_cmd)?;
     let payload_file = ReviewPayloadFile::create(payload, tag)?;
@@ -616,10 +627,12 @@ fn run_review_cli(
     // driven from inside a Claude Code session (the guard exists for
     // interactive sessions sharing runtime resources, and its own error
     // message documents this bypass).
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&command)
-        .env_remove("CLAUDECODE")
+    let mut child = std::process::Command::new("sh");
+    child.arg("-c").arg(&command).env_remove("CLAUDECODE");
+    if let Some(resolved) = command_env {
+        resolved.apply_to_child(&mut child);
+    }
+    let output = child
         .output()
         .with_context(|| format!("running AI reviewer: {command}"))?;
 
@@ -769,6 +782,7 @@ mod tests {
             None,
             &req(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -781,6 +795,7 @@ mod tests {
             None,
             &req(),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -794,6 +809,7 @@ mod tests {
             None,
             &req(),
             false,
+            None,
         )
         .await
         .unwrap();
