@@ -381,6 +381,7 @@ async fn maybe_ai_review(
         model.as_deref(),
         &req,
         r.get_bool("DPM_VERBOSE"),
+        Some(r),
     )
     .await?;
     match (&outcome.approved, &outcome.verdict) {
@@ -819,6 +820,7 @@ async fn maybe_ai_discrepancy_scan(
         model.as_deref(),
         &payload,
         r.get_bool("DPM_VERBOSE"),
+        Some(r),
     )
     .await?;
     match (&outcome.approved, &outcome.verdict) {
@@ -867,6 +869,7 @@ async fn cmd_verify(r: &Resolved) -> Result<i32> {
         keep_shadow: r.get_bool("DPM_KEEP_SHADOW"),
         verbose: r.get_bool("DPM_VERBOSE"),
         introspect: &opts,
+        command_env: Some(r),
     })
     .await?;
 

@@ -373,6 +373,7 @@ async fn verify_reports_convergence() {
         keep_shadow: false,
         verbose: false,
         introspect: &opts(),
+        command_env: None,
     })
     .await
     .expect("verify run");
@@ -604,6 +605,7 @@ async fn verify_with_all_checkers(admin: &str, label: &str, source_sql: &str, ta
         keep_shadow: false,
         verbose: false,
         introspect: &opts(),
+        command_env: None,
     })
     .await
     .unwrap_or_else(|e| panic!("[{label}] verify failed: {e:#}"));
@@ -1304,6 +1306,7 @@ async fn verify_leaves_no_shadow_databases_behind() {
             keep_shadow: false,
             verbose: false,
             introspect: &opts(),
+            command_env: None,
         })
         .await
         .unwrap();
