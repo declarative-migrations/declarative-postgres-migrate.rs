@@ -304,12 +304,24 @@ fn normalize_bool(v: &str) -> Result<String> {
 
 /// Layered configuration: flag overrides > process env > declared defaults.
 pub struct Resolved {
-    overrides: HashMap<String, String>,
+    env: HashMap<String, String>,
     defaults: HashMap<String, String>,
 }
 
+pub fn merge_env(
+    mut initial: HashMap<String, String>,
+    overrides: impl IntoIterator<Item = (String, String)>,
+) -> HashMap<String, String> {
+    initial.extend(overrides);
+    initial
+}
+
 impl Resolved {
-    pub fn new(config: &FlagConfig, overrides: HashMap<String, String>) -> Self {
+    pub fn new(
+        config: &FlagConfig,
+        process_env: HashMap<String, String>,
+        overrides: HashMap<String, String>,
+    ) -> Self {
         let mut defaults = HashMap::new();
         for spec in config.flags.values() {
             if let Some(d) = &spec.default {
@@ -321,19 +333,19 @@ impl Resolved {
             }
         }
         Self {
-            overrides,
+            env: merge_env(process_env, overrides),
             defaults,
         }
     }
 
     pub fn get(&self, env_key: &str) -> Option<String> {
-        if let Some(v) = self.overrides.get(env_key) {
-            return Some(v.clone());
-        }
-        if let Ok(v) = std::env::var(env_key) {
-            if !v.is_empty() {
-                return Some(v);
-            }
+        if let Some(v) = self
+            .env
+            .get(env_key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            return Some(v.to_string());
         }
         self.defaults.get(env_key).cloned()
     }
@@ -497,13 +509,70 @@ type = "integer"
     fn resolution_precedence_flag_over_env_over_default() {
         let cfg = config();
         let (map, _) = parse_fallback(&cfg, &args(&["--allow-destructive"])).unwrap();
-        let resolved = Resolved::new(&cfg, map);
+        let resolved = Resolved::new(&cfg, HashMap::new(), map);
         assert!(resolved.get_bool("DPM_ALLOW_DESTRUCTIVE"));
-        let resolved = Resolved::new(&cfg, HashMap::new());
+        let resolved = Resolved::new(&cfg, HashMap::new(), HashMap::new());
         assert_eq!(
             resolved.get("DPM_ALLOW_DESTRUCTIVE").as_deref(),
             Some("false")
         );
+    }
+
+    #[test]
+    fn overrides_win_without_mutating_process_environment() {
+        let before = std::env::var_os("DPM_FORMAT");
+        let env = merge_env(
+            HashMap::from([("DPM_FORMAT".into(), "sql".into())]),
+            [("DPM_FORMAT".into(), "json".into())],
+        );
+        assert_eq!(env.get("DPM_FORMAT").map(String::as_str), Some("json"));
+        assert_eq!(std::env::var_os("DPM_FORMAT"), before);
+    }
+
+    #[test]
+    fn empty_and_whitespace_overrides_are_absent_from_get() {
+        let cfg = config();
+        for raw in ["", " ", "\t"] {
+            let resolved = Resolved::new(
+                &cfg,
+                HashMap::from([("DPM_ALLOW_DESTRUCTIVE".into(), raw.into())]),
+                HashMap::new(),
+            );
+            assert_eq!(
+                resolved.get("DPM_ALLOW_DESTRUCTIVE").as_deref(),
+                Some("false"),
+                "raw={raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_reads_the_snapshot_not_process_env() {
+        let before = std::env::var_os("DPM_JOBS");
+        let cfg = config();
+        let resolved = Resolved::new(
+            &cfg,
+            HashMap::from([("DPM_JOBS".into(), "1".into())]),
+            HashMap::from([("DPM_JOBS".into(), "4".into())]),
+        );
+        assert_eq!(resolved.get("DPM_JOBS").as_deref(), Some("4"));
+        assert_eq!(std::env::var_os("DPM_JOBS"), before);
+    }
+
+    #[test]
+    fn unknown_flag_parse_failure_does_not_mutate_process_environment() {
+        let before = std::env::var_os("DPM_JOBS");
+        let cfg = config();
+        assert!(parse_fallback(&cfg, &args(&["--nope"])).is_err());
+        assert_eq!(std::env::var_os("DPM_JOBS"), before);
+    }
+
+    #[test]
+    fn source_does_not_mutate_process_environment() {
+        const SRC: &str = include_str!("flagenv.rs");
+        let production = SRC.split("#[cfg(test)]").next().unwrap_or(SRC);
+        assert!(!production.contains("std::env::set_var"));
+        assert!(!production.contains("env::set_var"));
     }
 }
 
@@ -578,7 +647,7 @@ mod contract_tests {
             "postgres://t".to_string(),
         );
         overrides.insert("DATABASE_URL".to_string(), "postgres://d".to_string());
-        let r = Resolved::new(&config, overrides);
+        let r = Resolved::new(&config, HashMap::new(), overrides);
         assert_eq!(
             r.get_first(&["TARGET_DATABASE_URL", "DATABASE_URL"])
                 .as_deref(),
