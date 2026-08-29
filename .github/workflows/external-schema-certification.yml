@@ -1,0 +1,233 @@
+name: external-schema-certification
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/external-schema-certification.yml"
+      - "scripts/certify-external-schema.sh"
+      - "docs/external-schema-certification.md"
+      - "tests/fixtures/external-consumer-schema.sql"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/external-schema-certification.yml"
+      - "scripts/certify-external-schema.sh"
+      - "docs/external-schema-certification.md"
+      - "tests/fixtures/external-consumer-schema.sql"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: external-schema-certification-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  certify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dpm_external
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d dpm_external"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TARGET_ADMIN_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/dpm_external
+      TARGET_DATABASE_URL: postgres://dpm_reader:reader@127.0.0.1:5432/dpm_external
+      SHADOW_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Provision and prove the read-only target role
+        shell: bash
+        run: |
+          set -euo pipefail
+          PGPASSWORD=postgres psql \
+            --host 127.0.0.1 \
+            --username postgres \
+            --dbname dpm_external \
+            --set ON_ERROR_STOP=1 <<'SQL'
+          create role dpm_reader login password 'reader';
+          grant connect on database dpm_external to dpm_reader;
+          grant usage on schema public to dpm_reader;
+          grant select on all tables in schema public to dpm_reader;
+          grant select on all sequences in schema public to dpm_reader;
+          SQL
+          if PGPASSWORD=reader psql \
+            --host 127.0.0.1 \
+            --username dpm_reader \
+            --dbname dpm_external \
+            --set ON_ERROR_STOP=1 \
+            --command 'create table public.must_not_exist(id integer)'; then
+            echo "read-only target role unexpectedly accepted DDL" >&2
+            exit 1
+          fi
+      - name: Validate source and build the exact dpm binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --all-targets
+          cargo build --locked --release --bin dpm
+      - name: Plan and verify an externally owned schema fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/certify-external-schema.sh \
+            --dpm target/release/dpm \
+            --source-sql tests/fixtures/external-consumer-schema.sql \
+            --target "$TARGET_DATABASE_URL" \
+            --shadow "$SHADOW_DATABASE_URL" \
+            --output-dir test-results/external-schema
+      - name: Validate the bounded non-secret evidence contract
+        shell: python
+        run: |
+          import json
+          from pathlib import Path
+
+          root = Path("test-results/external-schema")
+          path = root / "external-schema-certification.json"
+          report = json.loads(path.read_text(encoding="utf-8"))
+          plan = json.loads((root / "migration-plan.json").read_text(encoding="utf-8"))
+          assert report["version"] == 1
+          assert report["evidenceClass"] == "external-schema-read-only-plan-certification"
+          assert report["decisionEligible"] is False
+          assert report["reviewRequired"] is True
+          assert report["targetSnapshottedReadOnly"] is True
+          assert report["applied"] is False
+          assert report["verified"] is True
+          assert report["destructiveSqlEnabled"] is False
+          assert report["sourceSqlBytes"] > 0
+          assert report["planChecksum"] == plan["planChecksum"]
+          assert report["planSummary"] == plan["summary"]
+          assert report["planSummary"]["total"] > 0
+          assert report["planSummary"]["destructive"] == 0
+          for key in (
+              "sourceSqlSha256",
+              "targetCatalogSha256",
+              "dpmSha256",
+              "planSha256",
+              "verifyLogSha256",
+              "evidenceDigest",
+          ):
+              assert len(report[key]) == 64
+              int(report[key], 16)
+          assert len(report["planChecksum"]) == 16
+          int(report["planChecksum"], 16)
+          serialized = "\n".join(
+              candidate.read_text(encoding="utf-8")
+              for candidate in root.iterdir()
+              if candidate.is_file()
+          )
+          assert "postgres://" not in serialized
+          assert "postgresql://" not in serialized
+          assert "postgres:postgres" not in serialized
+          assert "dpm_reader:reader" not in serialized
+      - name: Prove the target was not mutated
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_state="$(
+            PGPASSWORD=postgres psql \
+              --host 127.0.0.1 \
+              --username postgres \
+              --dbname dpm_external \
+              --tuples-only \
+              --no-align \
+              --command "select to_regclass('external_service.jobs') is null"
+          )"
+          test "$target_state" = "t"
+      - name: Prove destructive drift requires explicit SQL-generation consent
+        shell: bash
+        run: |
+          set -euo pipefail
+          PGPASSWORD=postgres psql \
+            --host 127.0.0.1 \
+            --username postgres \
+            --dbname dpm_external \
+            --set ON_ERROR_STOP=1 \
+            --command 'create table public.obsolete(id integer primary key)' \
+            --command 'grant select on public.obsolete to dpm_reader'
+
+          default_dir="test-results/destructive-default"
+          if bash scripts/certify-external-schema.sh \
+            --dpm target/release/dpm \
+            --source-sql tests/fixtures/external-consumer-schema.sql \
+            --target "$TARGET_DATABASE_URL" \
+            --shadow "$SHADOW_DATABASE_URL" \
+            --output-dir "$default_dir"; then
+            echo "destructive drift unexpectedly certified without consent" >&2
+            exit 1
+          fi
+          test ! -e "$default_dir/external-schema-certification.json"
+
+          allowed_dir="test-results/destructive-allowed"
+          bash scripts/certify-external-schema.sh \
+            --dpm target/release/dpm \
+            --source-sql tests/fixtures/external-consumer-schema.sql \
+            --target "$TARGET_DATABASE_URL" \
+            --shadow "$SHADOW_DATABASE_URL" \
+            --output-dir "$allowed_dir" \
+            --allow-destructive-sql
+
+          python3 - "$default_dir" "$allowed_dir" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          default_root = pathlib.Path(sys.argv[1])
+          allowed_root = pathlib.Path(sys.argv[2])
+          default_plan = json.loads((default_root / "migration-plan.json").read_text())
+          report = json.loads(
+              (allowed_root / "external-schema-certification.json").read_text()
+          )
+          assert default_plan["summary"]["destructive"] > 0
+          assert default_plan["summary"]["gated"] > 0
+          assert report["destructiveSqlEnabled"] is True
+          assert report["planSummary"]["destructive"] > 0
+          assert report["planSummary"]["gated"] == 0
+          assert report["applied"] is False
+          assert report["verified"] is True
+          PY
+
+          target_state="$(
+            PGPASSWORD=postgres psql \
+              --host 127.0.0.1 \
+              --username postgres \
+              --dbname dpm_external \
+              --tuples-only \
+              --no-align \
+              --command "select to_regclass('public.obsolete') is not null and to_regclass('external_service.jobs') is null"
+          )"
+          test "$target_state" = "t"
+      - name: Upload non-secret external-schema evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: external-schema-certification-${{ github.run_id }}
+          path: test-results/external-schema/
+          if-no-files-found: error
+          retention-days: 14
