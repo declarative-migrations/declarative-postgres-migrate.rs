@@ -55,6 +55,8 @@ fn help_shows_commands_and_flag_table() {
         "--cross-check-all",
         "SOURCE_DATABASE_URL",
         "DPM_AI_TRANSPORT",
+        "--require-plan-checksum",
+        "DPM_REQUIRE_PLAN_CHECKSUM",
     ] {
         assert!(text.contains(needle), "help missing {needle:?}");
     }

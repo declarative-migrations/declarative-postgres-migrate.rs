@@ -56,6 +56,9 @@ DESTRUCTIVE CHANGES (two separate consents)
   --allow-destructive-ops   actually execute destructive statements during `dpm apply`
   --allow-destructive       legacy shorthand for both
 
+SCHEMA SAFETY
+  --require-plan-checksum   refuse apply unless the reviewed plan checksum matches (hex)
+
 CROSS-CHECKS (independent diff engines validate dpm's result; verify + apply)
   --cross-check-with-migra    run migra after migrating; agreement = no remaining diff
   --cross-check-with-pgdiff   run pgdiff (joncrlsn) across all schema aspects
@@ -460,10 +463,15 @@ async fn cmd_diff(r: &Resolved, bootstrap: bool) -> Result<i32> {
     let allow_sql = policy.sql || bootstrap;
     let (plan, script, text) = render(r, &inputs, allow_sql);
 
+    let plan_checksum = dpm::plan_safety::reviewed_plan_checksum(&plan, &script.sql);
+    eprintln!("dpm: reviewed plan checksum {plan_checksum}");
     if r.get("DPM_FORMAT").as_deref() == Some("json") {
+        let certificate = plan.borrow_check();
         let doc = serde_json::json!({
             "source": inputs.source_desc,
             "target": inputs.target_desc,
+            "planChecksum": plan_checksum,
+            "planFingerprint": certificate.fingerprint,
             "changes": plan.changes,
             "summary": {
                 "total": script.change_count,
@@ -510,6 +518,20 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
     if plan.is_empty() {
         eprintln!("dpm: no differences — nothing to apply");
         return Ok(0);
+    }
+
+    let plan_checksum = dpm::plan_safety::reviewed_plan_checksum(&plan, &script.sql);
+    eprintln!("dpm: reviewed plan checksum {plan_checksum}");
+    if let Some(expected) = r.get("DPM_REQUIRE_PLAN_CHECKSUM") {
+        if !expected.trim().is_empty()
+            && !dpm::plan_safety::checksums_match(&expected, &plan_checksum)
+        {
+            bail!(
+                "reviewed plan checksum {plan_checksum} does not match required checksum {}; \
+                 refusing writes",
+                expected.trim()
+            );
+        }
     }
 
     // Two-consent destructive model: generating live destructive SQL is one
@@ -583,10 +605,13 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
             release_migration_lease(lease).await?;
             return Ok(0);
         }
-        if refreshed_script.sql != script.sql {
+        let refreshed_checksum =
+            dpm::plan_safety::reviewed_plan_checksum(&refreshed_plan, &refreshed_script.sql);
+        if refreshed_script.sql != script.sql || refreshed_checksum != plan_checksum {
             release_migration_lease(lease).await?;
             bail!(
-                "the source or target schema changed after the migration was reviewed; \
+                "the source or target schema changed after the migration was reviewed \
+                 (plan checksum {plan_checksum} -> {refreshed_checksum}); \
                  nothing was applied — re-run dpm apply to review the fresh plan"
             );
         }

@@ -31,12 +31,18 @@ fn last(body: &str, needle: &str) -> usize {
 fn postgres_apply_confirms_then_leases_revalidates_and_executes() {
     let body = apply_body();
     let confirmation = first(body, "if !r.get_bool(\"DPM_YES\")");
+    let checksum_pin = first(body, "DPM_REQUIRE_PLAN_CHECKSUM");
     let acquisition = first(body, "Some(acquire_migration_lease(target_url).await?)");
     let refresh = first(body, "let refreshed_inputs = load_sides(r, false).await?");
     let stale_plan_guard = first(body, "if refreshed_script.sql != script.sql");
+    let checksum_guard = first(body, "refreshed_checksum != plan_checksum");
     let validation = first(body, "ValidatedScript::parse(&script.sql)");
     let execution = first(body, "lease.apply(&validated).await?");
 
+    assert!(
+        checksum_pin < confirmation,
+        "pinned plan checksums must fail before confirmation"
+    );
     assert!(confirmation < acquisition, "lease must follow confirmation");
     assert!(
         acquisition < refresh,
@@ -44,7 +50,11 @@ fn postgres_apply_confirms_then_leases_revalidates_and_executes() {
     );
     assert!(refresh < stale_plan_guard, "fresh plan must be compared");
     assert!(
-        stale_plan_guard < validation,
+        stale_plan_guard < checksum_guard,
+        "SQL and checksum drift must both refuse writes"
+    );
+    assert!(
+        checksum_guard < validation,
         "stale reviewed plans must fail before validation"
     );
     assert!(validation < execution, "only validated SQL may execute");

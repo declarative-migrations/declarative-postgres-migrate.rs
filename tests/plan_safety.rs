@@ -69,6 +69,31 @@ fn certificate_is_deterministic_and_exact_plan_bound() {
 }
 
 #[test]
+fn reviewed_plan_checksum_refuses_edited_or_reordered_plans() {
+    let left = Plan {
+        changes: vec![Change::EnableRls {
+            table: table("public", "users"),
+        }],
+    };
+    let right = Plan {
+        changes: vec![Change::EnableRls {
+            table: table("public", "orders"),
+        }],
+    };
+    let sql = "ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;";
+    let first = dpm::reviewed_plan_checksum(&left, sql);
+    let second = dpm::reviewed_plan_checksum(&left, sql);
+    assert_eq!(first, second);
+    assert!(dpm::checksums_match(&first, &second));
+    assert_ne!(first, dpm::reviewed_plan_checksum(&right, sql));
+    assert_ne!(
+        first,
+        dpm::reviewed_plan_checksum(&left, "ALTER TABLE public.users ENABLE ROW LEVEL SECURITY")
+    );
+    assert!(!dpm::checksums_match("deadbeef", &first));
+}
+
+#[test]
 fn certified_plan_bridges_to_linear_typestate_and_lease_owner() {
     let plan = Plan {
         changes: vec![Change::EnableRls {
