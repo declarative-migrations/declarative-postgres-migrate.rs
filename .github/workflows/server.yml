@@ -1,0 +1,71 @@
+name: dpm-server
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/interfaces.rs"
+      - "src/server/**"
+      - "src/sync.rs"
+      - "src/bin/dpm-server.rs"
+      - "tests/server_process.rs"
+      - "openapi/**"
+      - ".github/workflows/server.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/interfaces.rs"
+      - "src/server/**"
+      - "src/sync.rs"
+      - "src/bin/dpm-server.rs"
+      - "tests/server_process.rs"
+      - "openapi/**"
+      - ".github/workflows/server.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract-and-process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.97.1
+          components: clippy,rustfmt
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Server unit and wire-contract tests
+        run: |
+          cargo test --locked --lib server::
+          cargo test --locked --lib interfaces::
+          cargo test --locked --lib sync::
+      - name: Real-process HTTP contract
+        run: cargo test --locked --test server_process -- --test-threads=1
+      - name: Strict lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Locked server build
+        run: cargo build --locked --bin dpm-server
+      - name: Validate checked-in OpenAPI 3.1 document
+        run: python3 -m json.tool openapi/dpm-server-v1.json >/dev/null
+
+  compiler-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.88.0", "1.89.0", "1.90.0", "1.91.0", "stable"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: ${{ matrix.rust }}
+      - name: Compile all targets with the locked dependency graph
+        run: cargo +${{ matrix.rust }} check --locked --all-targets

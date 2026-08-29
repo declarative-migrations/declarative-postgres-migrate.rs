@@ -65,7 +65,6 @@ pub struct IntrospectOptions {
     pub extra_excluded: Vec<String>,
 }
 
-
 pub async fn connect(url: &str) -> Result<PgConnection> {
     let mut conn = PgConnection::connect(url)
         .await
@@ -94,15 +93,24 @@ pub async fn connect(url: &str) -> Result<PgConnection> {
 
 /// Strip password from a URL for error messages.
 pub fn redact_url(url: &str) -> String {
-    match url.split_once("://") {
+    let (base, had_query) = match url.split_once('?') {
+        Some((base, _)) => (base, true),
+        None => (url, false),
+    };
+    let redacted = match base.split_once("://") {
         Some((scheme, rest)) => match rest.split_once('@') {
             Some((creds, host)) => {
                 let user = creds.split(':').next().unwrap_or("");
                 format!("{scheme}://{user}:***@{host}")
             }
-            None => url.to_string(),
+            None => base.to_string(),
         },
-        None => url.to_string(),
+        None => base.to_string(),
+    };
+    if had_query {
+        format!("{redacted}?<redacted>")
+    } else {
+        redacted
     }
 }
 
@@ -129,10 +137,11 @@ pub async fn introspect(conn: &mut PgConnection, opts: &IntrospectOptions) -> Re
     // PostgreSQL exposes this setting as int4 while CockroachDB exposes its
     // PostgreSQL-compatibility value as int8.  Decode the wider type and
     // narrow only after the query so both pgwire servers can be inspected.
-    let server_version_num: i64 = sqlx::query_scalar("SELECT current_setting('server_version_num')::bigint")
-        .fetch_one(&mut *conn)
-        .await
-        .context("reading server_version_num")?;
+    let server_version_num: i64 =
+        sqlx::query_scalar("SELECT current_setting('server_version_num')::bigint")
+            .fetch_one(&mut *conn)
+            .await
+            .context("reading server_version_num")?;
 
     let schemas = resolve_schemas(conn, opts, database_flavor).await?;
     let schema_vec: Vec<String> = schemas.iter().cloned().collect();
@@ -146,17 +155,27 @@ pub async fn introspect(conn: &mut PgConnection, opts: &IntrospectOptions) -> Re
         ..Catalog::default()
     };
 
-    load_extensions(conn, &mut cat).await.context("introspecting extensions")?;
-    load_enums(conn, &schema_vec, &mut cat).await.context("introspecting enums")?;
-    load_tables(conn, &schema_vec, &mut cat).await.context("introspecting tables")?;
-    load_columns(conn, &schema_vec, &mut cat).await.context("introspecting columns")?;
+    load_extensions(conn, &mut cat)
+        .await
+        .context("introspecting extensions")?;
+    load_enums(conn, &schema_vec, &mut cat)
+        .await
+        .context("introspecting enums")?;
+    load_tables(conn, &schema_vec, &mut cat)
+        .await
+        .context("introspecting tables")?;
+    load_columns(conn, &schema_vec, &mut cat)
+        .await
+        .context("introspecting columns")?;
     load_constraints(conn, &schema_vec, &mut cat)
         .await
         .context("introspecting constraints")?;
     load_indexes(conn, &schema_vec, &mut cat, cockroach_database.as_deref())
         .await
         .context("introspecting indexes")?;
-    load_policies(conn, &schema_vec, &mut cat).await.context("introspecting policies")?;
+    load_policies(conn, &schema_vec, &mut cat)
+        .await
+        .context("introspecting policies")?;
     load_sequences(conn, &schema_vec, &mut cat)
         .await
         .context("introspecting sequences")?;
@@ -225,13 +244,16 @@ const NOT_EXTENSION_OWNED: &str = "NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depen
      WHERE ext_d.classid = $CLASS$::regclass AND ext_d.objid = $OID$ AND ext_d.deptype = 'e')";
 
 fn not_ext(class: &str, oid_expr: &str) -> String {
-    NOT_EXTENSION_OWNED.replace("$CLASS$", &format!("'{class}'")).replace("$OID$", oid_expr)
+    NOT_EXTENSION_OWNED
+        .replace("$CLASS$", &format!("'{class}'"))
+        .replace("$OID$", oid_expr)
 }
 
 async fn load_extensions(conn: &mut PgConnection, cat: &mut Catalog) -> Result<()> {
-    let rows = sqlx::query("SELECT extname FROM pg_catalog.pg_extension WHERE extname <> 'plpgsql'")
-        .fetch_all(&mut *conn)
-        .await?;
+    let rows =
+        sqlx::query("SELECT extname FROM pg_catalog.pg_extension WHERE extname <> 'plpgsql'")
+            .fetch_all(&mut *conn)
+            .await?;
     for row in rows {
         cat.extensions.insert(row.get::<String, _>("extname"));
     }
@@ -249,7 +271,11 @@ async fn load_enums(conn: &mut PgConnection, schemas: &[String], cat: &mut Catal
          GROUP BY 1, 2",
         not_ext("pg_type", "t.oid")
     );
-    for row in sqlx::query(&sql).bind(schemas).fetch_all(&mut *conn).await? {
+    for row in sqlx::query(&sql)
+        .bind(schemas)
+        .fetch_all(&mut *conn)
+        .await?
+    {
         cat.enums.insert(
             QName::new(row.get::<String, _>("schema"), row.get::<String, _>("name")),
             row.get::<Vec<String>, _>("labels"),
@@ -269,7 +295,11 @@ async fn load_tables(conn: &mut PgConnection, schemas: &[String], cat: &mut Cata
            AND n.nspname = ANY($1) AND {}",
         not_ext("pg_class", "c.oid")
     );
-    for row in sqlx::query(&sql).bind(schemas).fetch_all(&mut *conn).await? {
+    for row in sqlx::query(&sql)
+        .bind(schemas)
+        .fetch_all(&mut *conn)
+        .await?
+    {
         cat.tables.insert(
             QName::new(row.get::<String, _>("schema"), row.get::<String, _>("name")),
             Table {
@@ -288,9 +318,17 @@ async fn load_tables(conn: &mut PgConnection, schemas: &[String], cat: &mut Cata
 
 use std::collections::BTreeMap;
 
-async fn load_columns(conn: &mut PgConnection, schemas: &[String], cat: &mut Catalog) -> Result<()> {
+async fn load_columns(
+    conn: &mut PgConnection,
+    schemas: &[String],
+    cat: &mut Catalog,
+) -> Result<()> {
     // attgenerated exists from PG 12; guarded via server_version_num.
-    let generated_expr = if cat.server_version_num >= 120000 { "a.attgenerated::text" } else { "''" };
+    let generated_expr = if cat.server_version_num >= 120000 {
+        "a.attgenerated::text"
+    } else {
+        "''"
+    };
     let (hidden_expr, visibility_join) = if cat.database_flavor == DatabaseFlavor::Cockroach {
         (
             "coalesce(isc.is_hidden = 'YES', false)",
@@ -327,9 +365,15 @@ async fn load_columns(conn: &mut PgConnection, schemas: &[String], cat: &mut Cat
            AND n.nspname = ANY($1) \
          ORDER BY n.nspname, c.relname, a.attnum"
     );
-    for row in sqlx::query(&sql).bind(schemas).fetch_all(&mut *conn).await? {
+    for row in sqlx::query(&sql)
+        .bind(schemas)
+        .fetch_all(&mut *conn)
+        .await?
+    {
         let q = QName::new(row.get::<String, _>("schema"), row.get::<String, _>("tbl"));
-        let Some(table) = cat.tables.get_mut(&q) else { continue };
+        let Some(table) = cat.tables.get_mut(&q) else {
+            continue;
+        };
         let identity = match row.get::<String, _>("identity").as_str() {
             "a" => Some(IdentityKind::Always),
             "d" => Some(IdentityKind::ByDefault),
@@ -340,7 +384,9 @@ async fn load_columns(conn: &mut PgConnection, schemas: &[String], cat: &mut Cat
         let serial_seq: Option<String> = row.get("serial_seq");
         let is_serial = identity.is_none()
             && serial_seq.is_some()
-            && default_expr.as_deref().is_some_and(|d| d.starts_with("nextval("));
+            && default_expr
+                .as_deref()
+                .is_some_and(|d| d.starts_with("nextval("));
         let (generated, default) = if generated_kind == "s" {
             (default_expr, None)
         } else {
@@ -361,7 +407,11 @@ async fn load_columns(conn: &mut PgConnection, schemas: &[String], cat: &mut Cat
     Ok(())
 }
 
-async fn load_constraints(conn: &mut PgConnection, schemas: &[String], cat: &mut Catalog) -> Result<()> {
+async fn load_constraints(
+    conn: &mut PgConnection,
+    schemas: &[String],
+    cat: &mut Catalog,
+) -> Result<()> {
     let sql = "SELECT n.nspname AS schema, c.relname AS tbl, con.conname AS name, \
                 con.contype::text AS kind, pg_catalog.pg_get_constraintdef(con.oid) AS def \
          FROM pg_catalog.pg_constraint con \
@@ -370,14 +420,26 @@ async fn load_constraints(conn: &mut PgConnection, schemas: &[String], cat: &mut
          WHERE con.contype IN ('p', 'u', 'c', 'f', 'x') \
            AND n.nspname = ANY($1)"
         .to_string();
-    for row in sqlx::query(&sql).bind(schemas).fetch_all(&mut *conn).await? {
+    for row in sqlx::query(&sql)
+        .bind(schemas)
+        .fetch_all(&mut *conn)
+        .await?
+    {
         let q = QName::new(row.get::<String, _>("schema"), row.get::<String, _>("tbl"));
-        let Some(table) = cat.tables.get_mut(&q) else { continue };
-        let Some(kind) = ConstraintKind::from_contype(&row.get::<String, _>("kind")) else { continue };
+        let Some(table) = cat.tables.get_mut(&q) else {
+            continue;
+        };
+        let Some(kind) = ConstraintKind::from_contype(&row.get::<String, _>("kind")) else {
+            continue;
+        };
         let name: String = row.get("name");
         table.constraints.insert(
             name.clone(),
-            Constraint { name, kind, def: row.get("def") },
+            Constraint {
+                name,
+                kind,
+                def: row.get("def"),
+            },
         );
     }
     Ok(())
@@ -401,9 +463,15 @@ async fn load_indexes(
            AND NOT i.indisprimary \
            AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint con WHERE con.conindid = i.indexrelid)"
         .to_string();
-    for row in sqlx::query(&sql).bind(schemas).fetch_all(&mut *conn).await? {
+    for row in sqlx::query(&sql)
+        .bind(schemas)
+        .fetch_all(&mut *conn)
+        .await?
+    {
         let q = QName::new(row.get::<String, _>("schema"), row.get::<String, _>("tbl"));
-        let Some(table) = cat.tables.get_mut(&q) else { continue };
+        let Some(table) = cat.tables.get_mut(&q) else {
+            continue;
+        };
         let name: String = row.get("name");
         let def: String = row.get("def");
         table.indexes.insert(
@@ -420,22 +488,34 @@ async fn load_indexes(
     Ok(())
 }
 
-async fn load_policies(conn: &mut PgConnection, schemas: &[String], cat: &mut Catalog) -> Result<()> {
+async fn load_policies(
+    conn: &mut PgConnection,
+    schemas: &[String],
+    cat: &mut Catalog,
+) -> Result<()> {
     let sql = "SELECT schemaname AS schema, tablename AS tbl, policyname AS name, \
                 permissive = 'PERMISSIVE' AS permissive, cmd, \
                 coalesce(roles::text[], '{}') AS roles, qual, with_check \
          FROM pg_catalog.pg_policies WHERE schemaname = ANY($1)"
         .to_string();
-    for row in sqlx::query(&sql).bind(schemas).fetch_all(&mut *conn).await? {
+    for row in sqlx::query(&sql)
+        .bind(schemas)
+        .fetch_all(&mut *conn)
+        .await?
+    {
         let q = QName::new(row.get::<String, _>("schema"), row.get::<String, _>("tbl"));
-        let Some(table) = cat.tables.get_mut(&q) else { continue };
+        let Some(table) = cat.tables.get_mut(&q) else {
+            continue;
+        };
         let name: String = row.get("name");
         table.policies.insert(
             name.clone(),
             Policy {
                 name,
                 permissive: row.get("permissive"),
-                command: row.get::<Option<String>, _>("cmd").unwrap_or_else(|| "ALL".into()),
+                command: row
+                    .get::<Option<String>, _>("cmd")
+                    .unwrap_or_else(|| "ALL".into()),
                 roles: row.get("roles"),
                 using_expr: row.get("qual"),
                 check_expr: row.get("with_check"),
@@ -445,7 +525,11 @@ async fn load_policies(conn: &mut PgConnection, schemas: &[String], cat: &mut Ca
     Ok(())
 }
 
-async fn load_sequences(conn: &mut PgConnection, schemas: &[String], cat: &mut Catalog) -> Result<()> {
+async fn load_sequences(
+    conn: &mut PgConnection,
+    schemas: &[String],
+    cat: &mut Catalog,
+) -> Result<()> {
     // Owned sequences (serial columns / identity) are excluded via pg_depend
     // deptype 'a' (auto) / 'i' (internal).
     let sql = format!(
@@ -462,7 +546,11 @@ async fn load_sequences(conn: &mut PgConnection, schemas: &[String], cat: &mut C
                AND d.deptype IN ('a', 'i'))",
         not_ext("pg_class", "c.oid")
     );
-    for row in sqlx::query(&sql).bind(schemas).fetch_all(&mut *conn).await? {
+    for row in sqlx::query(&sql)
+        .bind(schemas)
+        .fetch_all(&mut *conn)
+        .await?
+    {
         cat.sequences.insert(
             QName::new(row.get::<String, _>("schema"), row.get::<String, _>("name")),
             Sequence {
@@ -493,7 +581,11 @@ async fn load_views(
          WHERE c.relkind IN ('v', 'm') AND n.nspname = ANY($1) AND {}",
         not_ext("pg_class", "c.oid")
     );
-    for row in sqlx::query(&sql).bind(schemas).fetch_all(&mut *conn).await? {
+    for row in sqlx::query(&sql)
+        .bind(schemas)
+        .fetch_all(&mut *conn)
+        .await?
+    {
         let def: String = row.get("def");
         cat.views.insert(
             QName::new(row.get::<String, _>("schema"), row.get::<String, _>("name")),
@@ -619,7 +711,10 @@ async fn load_functions(
          ORDER BY n.nspname, p.proname, p.oid",
         not_ext("pg_proc", "p.oid")
     );
-    let rows = sqlx::query(&sql).bind(schemas).fetch_all(&mut *conn).await?;
+    let rows = sqlx::query(&sql)
+        .bind(schemas)
+        .fetch_all(&mut *conn)
+        .await?;
     let mut cockroach_procedures = std::collections::BTreeMap::<QName, Vec<String>>::new();
     for row in &rows {
         if cockroach_database.is_some() && row.get::<String, _>("kind") == "p" {
@@ -699,7 +794,11 @@ async fn load_triggers(
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
          WHERE NOT t.tgisinternal AND n.nspname = ANY($1)"
         .to_string();
-    for row in sqlx::query(&sql).bind(schemas).fetch_all(&mut *conn).await? {
+    for row in sqlx::query(&sql)
+        .bind(schemas)
+        .fetch_all(&mut *conn)
+        .await?
+    {
         let schema: String = row.get("schema");
         let tbl: String = row.get("tbl");
         let name: String = row.get("name");
@@ -745,11 +844,7 @@ async fn load_cockroach_triggers(
                 .fetch_one(&mut *conn)
                 .await
                 .with_context(|| {
-                    format!(
-                        "deparsing CockroachDB trigger {}.{}",
-                        table.label(),
-                        name
-                    )
+                    format!("deparsing CockroachDB trigger {}.{}", table.label(), name)
                 })?
                 .get("create_statement");
             let key = format!("{}.{}.{}", table.schema, table.name, name);
@@ -790,6 +885,25 @@ mod tests {
         assert_eq!(
             strip_cockroach_database_qualifiers(sql, "dépôt"),
             "SELECT public.\"café\", 'café'"
+        );
+    }
+}
+
+#[cfg(test)]
+mod redact_url_hardening_tests {
+    use super::redact_url;
+
+    #[test]
+    fn redacts_authority_password_and_the_entire_query() {
+        assert_eq!(
+            redact_url(
+                "postgresql://alice:secret@db.example/app?sslmode=require&password=still-secret"
+            ),
+            "postgresql://alice:***@db.example/app?<redacted>"
+        );
+        assert_eq!(
+            redact_url("postgres://db.example/app?sslrootcert=/private/client.pem"),
+            "postgres://db.example/app?<redacted>"
         );
     }
 }

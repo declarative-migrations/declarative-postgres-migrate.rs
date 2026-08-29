@@ -28,6 +28,12 @@
 
 use anyhow::{bail, Context, Result};
 use serde_json::json;
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 #[derive(Clone, Debug)]
 pub struct ReviewRequest {
@@ -91,7 +97,9 @@ pub fn provider_for_tool(tool: &str) -> Result<Provider> {
         "chatgpt" | "openai" | "codex" => Provider::OpenAi,
         "gemini" | "google" => Provider::Gemini,
         "custom" => Provider::Custom,
-        other => bail!("unknown --ai-tool {other:?}: expected claude | codex | chatgpt | gemini | custom"),
+        other => bail!(
+            "unknown --ai-tool {other:?}: expected claude | codex | chatgpt | gemini | custom"
+        ),
     })
 }
 
@@ -130,7 +138,9 @@ pub fn tool_command_template(tool: &str, custom_cmd: Option<&str>) -> Result<Str
         "codex" | "chatgpt" | "openai" => "codex exec - < {file}".to_string(),
         "gemini" | "google" => "gemini < {file}".to_string(),
         "custom" => bail!("--ai-tool custom requires --ai-cmd (DPM_AI_CMD)"),
-        other => bail!("unknown --ai-tool {other:?}: expected claude | codex | chatgpt | gemini | custom"),
+        other => bail!(
+            "unknown --ai-tool {other:?}: expected claude | codex | chatgpt | gemini | custom"
+        ),
     })
 }
 
@@ -206,20 +216,16 @@ OUTPUT FORMAT (mandatory)
 
 /// Parse the last `DPM_VERDICT:` line from a reviewer transcript.
 pub fn parse_verdict(transcript: &str) -> Option<(bool, String)> {
-    transcript
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find_map(|line| {
-            let rest = line.strip_prefix("DPM_VERDICT:")?.trim();
-            if rest.to_ascii_uppercase().starts_with("APPROVE") {
-                Some((true, line.to_string()))
-            } else if rest.to_ascii_uppercase().starts_with("REJECT") {
-                Some((false, line.to_string()))
-            } else {
-                None
-            }
-        })
+    transcript.lines().rev().map(str::trim).find_map(|line| {
+        let rest = line.strip_prefix("DPM_VERDICT:")?.trim();
+        if rest.to_ascii_uppercase().starts_with("APPROVE") {
+            Some((true, line.to_string()))
+        } else if rest.to_ascii_uppercase().starts_with("REJECT") {
+            Some((false, line.to_string()))
+        } else {
+            None
+        }
+    })
 }
 
 fn outcome_from_transcript(transcript: String, command: String) -> ReviewOutcome {
@@ -242,7 +248,15 @@ pub async fn run_review(
     verbose: bool,
 ) -> Result<ReviewOutcome> {
     let payload = build_payload(req);
-    run_payload(tool, custom_cmd, transport, model_override, &payload, verbose).await
+    run_payload(
+        tool,
+        custom_cmd,
+        transport,
+        model_override,
+        &payload,
+        verbose,
+    )
+    .await
 }
 
 /// Send an arbitrary payload (which must instruct the DPM_VERDICT protocol)
@@ -256,7 +270,11 @@ pub async fn run_payload(
     payload: &str,
     verbose: bool,
 ) -> Result<ReviewOutcome> {
-    let provider = if custom_cmd.is_some() { Provider::Custom } else { provider_for_tool(tool)? };
+    let provider = if custom_cmd.is_some() {
+        Provider::Custom
+    } else {
+        provider_for_tool(tool)?
+    };
     let env_lookup = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let key = api_key_for(provider, &env_lookup);
 
@@ -302,8 +320,15 @@ pub fn build_discrepancy_payload(
     for (name, agreed, output, error) in reports {
         tool_sections.push_str(&format!(
             "\n--- {name} (agreed: {agreed}) ---\n{}{}\n",
-            if output.is_empty() { "(no residual output)" } else { output },
-            error.as_ref().map(|e| format!("\n[tool error: {e}]")).unwrap_or_default(),
+            if output.is_empty() {
+                "(no residual output)"
+            } else {
+                output
+            },
+            error
+                .as_ref()
+                .map(|e| format!("\n[tool error: {e}]"))
+                .unwrap_or_default(),
         ));
     }
     format!(
@@ -343,7 +368,12 @@ OUTPUT FORMAT (mandatory)
 // HTTP API transport
 // ---------------------------------------------------------------------------
 
-async fn run_review_api(provider: Provider, key: &str, model: &str, payload: &str) -> Result<ReviewOutcome> {
+async fn run_review_api(
+    provider: Provider,
+    key: &str,
+    model: &str,
+    payload: &str,
+) -> Result<ReviewOutcome> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()?;
@@ -359,7 +389,9 @@ async fn run_review_api(provider: Provider, key: &str, model: &str, payload: &st
             Err(e) => {
                 let transient = e.to_string().contains("429")
                     || e.to_string().contains("status 5")
-                    || e.downcast_ref::<reqwest::Error>().map(|r| r.is_connect() || r.is_timeout()).unwrap_or(false);
+                    || e.downcast_ref::<reqwest::Error>()
+                        .map(|r| r.is_connect() || r.is_timeout())
+                        .unwrap_or(false);
                 if !transient {
                     return Err(e);
                 }
@@ -448,14 +480,19 @@ async fn call_provider(
                     doc["error"]["message"].as_str().unwrap_or("(no message)")
                 );
             }
-            let text = doc["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_string();
+            let text = doc["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
             Ok(outcome_from_transcript(
                 text,
                 format!("POST https://api.openai.com/v1/chat/completions (model {model})"),
             ))
         }
         Provider::Gemini => {
-            let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent");
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            );
             let body = json!({
                 "contents": [{"parts": [{"text": payload}]}],
             });
@@ -494,6 +531,72 @@ async fn call_provider(
 // CLI transport
 // ---------------------------------------------------------------------------
 
+static REVIEW_PAYLOAD_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct ReviewPayloadFile {
+    path: PathBuf,
+}
+
+impl ReviewPayloadFile {
+    fn create(payload: &str, tag: usize) -> Result<Self> {
+        let directory = std::env::temp_dir();
+        for _ in 0..64 {
+            let counter = REVIEW_PAYLOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            let path = directory.join(format!(
+                ".dpm-ai-review-{:x}-{tag:x}-{nonce:x}-{counter:x}.md",
+                std::process::id()
+            ));
+
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+
+            match options.open(&path) {
+                Ok(mut file) => {
+                    let write_result = (|| -> std::io::Result<()> {
+                        file.write_all(payload.as_bytes())?;
+                        file.flush()
+                    })();
+                    if let Err(error) = write_result {
+                        let _ = std::fs::remove_file(&path);
+                        return Err(error).with_context(|| {
+                            format!("writing secure AI review payload {}", path.display())
+                        });
+                    }
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("creating secure AI review payload {}", path.display())
+                    });
+                }
+            }
+        }
+        bail!("unable to allocate a unique secure AI review payload file")
+    }
+}
+
+impl Drop for ReviewPayloadFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn run_review_cli(
     tool: &str,
     custom_cmd: Option<&str>,
@@ -502,13 +605,9 @@ fn run_review_cli(
     verbose: bool,
 ) -> Result<ReviewOutcome> {
     let template = tool_command_template(tool, custom_cmd)?;
-
-    let dir = std::env::temp_dir().join("dpm-ai-review");
-    std::fs::create_dir_all(&dir)?;
-    let file = dir.join(format!("payload-{}-{}.md", std::process::id(), tag));
-    std::fs::write(&file, payload).with_context(|| format!("writing {}", file.display()))?;
-
-    let command = template.replace("{file}", &file.display().to_string());
+    let payload_file = ReviewPayloadFile::create(payload, tag)?;
+    let file_argument = shell_quote(payload_file.path.to_string_lossy().as_ref());
+    let command = template.replace("{file}", &file_argument);
     if verbose {
         eprintln!("dpm: ai review via CLI: {command}");
     }
@@ -523,7 +622,6 @@ fn run_review_cli(
         .env_remove("CLAUDECODE")
         .output()
         .with_context(|| format!("running AI reviewer: {command}"))?;
-    let _ = std::fs::remove_file(&file);
 
     let transcript = format!(
         "{}{}",
@@ -562,8 +660,13 @@ mod tests {
 
     #[test]
     fn verdict_parsing_takes_last_line_and_fails_closed() {
-        assert_eq!(parse_verdict("blah\nDPM_VERDICT: APPROVE\n"), Some((true, "DPM_VERDICT: APPROVE".into())));
-        let (ok, line) = parse_verdict("DPM_VERDICT: APPROVE\nlater...\nDPM_VERDICT: REJECT drops users table").unwrap();
+        assert_eq!(
+            parse_verdict("blah\nDPM_VERDICT: APPROVE\n"),
+            Some((true, "DPM_VERDICT: APPROVE".into()))
+        );
+        let (ok, line) =
+            parse_verdict("DPM_VERDICT: APPROVE\nlater...\nDPM_VERDICT: REJECT drops users table")
+                .unwrap();
         assert!(!ok);
         assert!(line.contains("REJECT"));
         assert_eq!(parse_verdict("no verdict here"), None);
@@ -571,13 +674,47 @@ mod tests {
     }
 
     #[test]
+    fn shell_quotes_payload_paths() {
+        assert_eq!(shell_quote("/tmp/a b'c"), "'/tmp/a b'\\''c'");
+    }
+
+    #[test]
+    fn review_payload_file_is_private_and_removed() {
+        let path;
+        {
+            let payload_file = ReviewPayloadFile::create("private schema", 17).unwrap();
+            path = payload_file.path.clone();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "private schema");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600);
+            }
+        }
+        assert!(!path.exists(), "payload file should be removed on drop");
+    }
+
+    #[test]
     fn tool_templates() {
-        assert!(tool_command_template("claude", None).unwrap().starts_with("claude -p"));
-        assert!(tool_command_template("chatgpt", None).unwrap().starts_with("codex exec"));
-        assert!(tool_command_template("gemini", None).unwrap().starts_with("gemini"));
+        assert!(tool_command_template("claude", None)
+            .unwrap()
+            .starts_with("claude -p"));
+        assert!(tool_command_template("chatgpt", None)
+            .unwrap()
+            .starts_with("codex exec"));
+        assert!(tool_command_template("gemini", None)
+            .unwrap()
+            .starts_with("gemini"));
         assert!(tool_command_template("custom", None).is_err());
-        assert_eq!(tool_command_template("custom", Some("x {file}")).unwrap(), "x {file}");
-        assert_eq!(tool_command_template("claude", Some("y {file}")).unwrap(), "y {file}");
+        assert_eq!(
+            tool_command_template("custom", Some("x {file}")).unwrap(),
+            "x {file}"
+        );
+        assert_eq!(
+            tool_command_template("claude", Some("y {file}")).unwrap(),
+            "y {file}"
+        );
         assert!(tool_command_template("skynet", None).is_err());
     }
 
@@ -650,9 +787,16 @@ mod tests {
         assert!(!outcome.approved);
 
         // Reviewer that says nothing useful → fail closed.
-        let outcome = run_review("custom", Some("echo hello"), Transport::Auto, None, &req(), false)
-            .await
-            .unwrap();
+        let outcome = run_review(
+            "custom",
+            Some("echo hello"),
+            Transport::Auto,
+            None,
+            &req(),
+            false,
+        )
+        .await
+        .unwrap();
         assert!(!outcome.approved);
         assert!(outcome.verdict.is_none());
     }

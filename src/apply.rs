@@ -13,6 +13,40 @@
 use anyhow::{Context, Result};
 use sqlx::{Connection, PgConnection};
 
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') || !byte.is_ascii()
+}
+
+fn single_quote_uses_backslash_escapes(bytes: &[u8], quote: usize) -> bool {
+    if quote >= 1
+        && matches!(bytes[quote - 1], b'e' | b'E')
+        && (quote == 1 || !is_identifier_byte(bytes[quote - 2]))
+    {
+        return true;
+    }
+    quote >= 2
+        && matches!(bytes[quote - 2], b'u' | b'U')
+        && bytes[quote - 1] == b'&'
+        && (quote == 2 || !is_identifier_byte(bytes[quote - 3]))
+}
+
+fn dollar_quote_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut end = start.checked_add(1)?;
+    if end >= bytes.len() {
+        return None;
+    }
+    if bytes[end] != b'$' {
+        if !(bytes[end].is_ascii_alphabetic() || bytes[end] == b'_') {
+            return None;
+        }
+        end += 1;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+    }
+    (end < bytes.len() && bytes[end] == b'$').then_some(end)
+}
+
 /// Split SQL text into executable statements. Handles:
 /// - single-quoted strings (with `''` escapes)
 /// - double-quoted identifiers
@@ -28,8 +62,13 @@ pub fn split_statements(sql: &str) -> Vec<String> {
     while i < n {
         match bytes[i] {
             b'\'' => {
+                let backslash_escapes = single_quote_uses_backslash_escapes(bytes, i);
                 i += 1;
                 while i < n {
+                    if backslash_escapes && bytes[i] == b'\\' {
+                        i = (i + 2).min(n);
+                        continue;
+                    }
                     if bytes[i] == b'\'' {
                         if i + 1 < n && bytes[i + 1] == b'\'' {
                             i += 2;
@@ -39,14 +78,21 @@ pub fn split_statements(sql: &str) -> Vec<String> {
                     }
                     i += 1;
                 }
-                i += 1;
+                i = (i + 1).min(n);
             }
             b'"' => {
                 i += 1;
-                while i < n && bytes[i] != b'"' {
+                while i < n {
+                    if bytes[i] == b'"' {
+                        if i + 1 < n && bytes[i + 1] == b'"' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
                     i += 1;
                 }
-                i += 1;
             }
             b'-' if i + 1 < n && bytes[i + 1] == b'-' => {
                 while i < n && bytes[i] != b'\n' {
@@ -71,12 +117,7 @@ pub fn split_statements(sql: &str) -> Vec<String> {
             b'$' => {
                 // Possible dollar-quote opener: $tag$ where tag is
                 // [A-Za-z_][A-Za-z0-9_]* or empty.
-                let tag_start = i + 1;
-                let mut j = tag_start;
-                while j < n && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
-                    j += 1;
-                }
-                if j < n && bytes[j] == b'$' {
+                if let Some(j) = dollar_quote_tag_end(bytes, i) {
                     let tag = &sql[i..=j];
                     if let Some(close) = sql[j + 1..].find(tag) {
                         i = j + 1 + close + tag.len();
@@ -121,10 +162,24 @@ fn only_comments(fragment: &str) -> bool {
             continue;
         }
         if let Some(after) = rest.strip_prefix("/*") {
-            rest = match after.find("*/") {
-                Some(pos) => after[pos + 2..].trim_start(),
-                None => "",
-            };
+            let bytes = after.as_bytes();
+            let mut depth = 1usize;
+            let mut i = 0usize;
+            while i < bytes.len() && depth > 0 {
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if depth > 0 {
+                return true;
+            }
+            rest = after[i..].trim_start();
             continue;
         }
         return false;
@@ -148,8 +203,13 @@ pub fn strip_psql_meta_commands(sql: &str) -> String {
         match bytes[i] {
             b'\'' => {
                 let start = i;
+                let backslash_escapes = single_quote_uses_backslash_escapes(bytes, i);
                 i += 1;
                 while i < n {
+                    if backslash_escapes && bytes[i] == b'\\' {
+                        i = (i + 2).min(n);
+                        continue;
+                    }
                     if bytes[i] == b'\'' {
                         if i + 1 < n && bytes[i + 1] == b'\'' {
                             i += 2;
@@ -165,19 +225,21 @@ pub fn strip_psql_meta_commands(sql: &str) -> String {
             b'"' => {
                 let start = i;
                 i += 1;
-                while i < n && bytes[i] != b'"' {
+                while i < n {
+                    if bytes[i] == b'"' {
+                        if i + 1 < n && bytes[i + 1] == b'"' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
                     i += 1;
                 }
-                i = (i + 1).min(n);
                 in_quote[start..i.min(n)].fill(true);
             }
             b'$' => {
-                let tag_start = i + 1;
-                let mut j = tag_start;
-                while j < n && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
-                    j += 1;
-                }
-                if j < n && bytes[j] == b'$' {
+                if let Some(j) = dollar_quote_tag_end(bytes, i) {
                     let tag = &sql[i..=j];
                     let start = i;
                     if let Some(close) = sql[j + 1..].find(tag) {
@@ -200,7 +262,8 @@ pub fn strip_psql_meta_commands(sql: &str) -> String {
         let line_start = offset;
         offset += line.len();
         let trimmed = line.trim_start();
-        let is_meta = trimmed.starts_with('\\') && !in_quote.get(line_start).copied().unwrap_or(false);
+        let is_meta =
+            trimmed.starts_with('\\') && !in_quote.get(line_start).copied().unwrap_or(false);
         if !is_meta {
             out.push_str(line);
         }
@@ -225,7 +288,11 @@ pub fn truncate_sql(stmt: &str) -> String {
     if stmt.len() <= MAX {
         stmt.to_string()
     } else {
-        format!("{}… [{} bytes]", &stmt[..MAX], stmt.len())
+        let mut end = MAX;
+        while !stmt.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}… [{} bytes]", &stmt[..end], stmt.len())
     }
 }
 
@@ -291,6 +358,22 @@ SELECT 1;
     }
 
     #[test]
+    fn escape_strings_and_quoted_identifier_escapes_do_not_split() {
+        let sql = r#"SELECT E'it\'s; still one', U&'d\0061ta; still one';
+CREATE TABLE "semi;""quoted" (id int);"#;
+        let stmts = split_statements(sql);
+        assert_eq!(stmts.len(), 2, "got: {stmts:#?}");
+        assert!(stmts[0].contains("still one"));
+        assert!(stmts[1].contains("semi;\"\"quoted"));
+    }
+
+    #[test]
+    fn numeric_dollar_tokens_are_not_quote_tags() {
+        let stmts = split_statements("SELECT $1$; SELECT 2;");
+        assert_eq!(stmts.len(), 2, "got: {stmts:#?}");
+    }
+
+    #[test]
     fn comments_with_semicolons_are_ignored() {
         let sql = "-- gated: DROP TABLE x;\n/* also; not this */\nSELECT 1;\n-- trailing comment\n";
         let stmts = split_statements(sql);
@@ -320,19 +403,32 @@ SELECT 1;
         assert!(!cleaned.contains("\\restrict"));
         assert!(!cleaned.contains("\\unrestrict"));
         assert!(!cleaned.contains("\\.\n"));
-        assert!(cleaned.contains("\\not-a-meta-command"), "backslash line inside dollar quotes must survive");
+        assert!(
+            cleaned.contains("\\not-a-meta-command"),
+            "backslash line inside dollar quotes must survive"
+        );
         assert!(cleaned.contains("SET client_encoding"));
     }
 
     #[test]
     fn role_dependent_statements_are_recognized() {
-        assert!(is_role_dependent_statement("GRANT ALL ON TABLE public.t TO app_user"));
-        assert!(is_role_dependent_statement("REVOKE ALL ON SCHEMA public FROM PUBLIC"));
-        assert!(is_role_dependent_statement("ALTER TABLE public.users OWNER TO produser"));
-        assert!(is_role_dependent_statement("  alter function public.f() owner to produser"));
+        assert!(is_role_dependent_statement(
+            "GRANT ALL ON TABLE public.t TO app_user"
+        ));
+        assert!(is_role_dependent_statement(
+            "REVOKE ALL ON SCHEMA public FROM PUBLIC"
+        ));
+        assert!(is_role_dependent_statement(
+            "ALTER TABLE public.users OWNER TO produser"
+        ));
+        assert!(is_role_dependent_statement(
+            "  alter function public.f() owner to produser"
+        ));
         assert!(is_role_dependent_statement("SET SESSION AUTHORIZATION 'x'"));
         assert!(!is_role_dependent_statement("CREATE TABLE t (id int)"));
-        assert!(!is_role_dependent_statement("ALTER TABLE t ADD COLUMN owner_to text"));
+        assert!(!is_role_dependent_statement(
+            "ALTER TABLE t ADD COLUMN owner_to text"
+        ));
     }
 }
 
@@ -345,6 +441,31 @@ mod splitter_edge_tests {
         assert!(split_statements("").is_empty());
         assert!(split_statements("   \n\t\n").is_empty());
         assert!(split_statements("-- just a comment\n/* and a block */\n").is_empty());
+    }
+
+    #[test]
+    fn nested_comment_only_tail_is_not_executed() {
+        assert!(split_statements("/* outer /* inner */ still outer */").is_empty());
+    }
+
+    #[test]
+    fn truncating_multibyte_sql_never_slices_inside_utf8() {
+        let statement = format!("SELECT '{}'", "é".repeat(300));
+        let rendered = truncate_sql(&statement);
+        assert!(rendered.contains("bytes]"));
+        assert!(rendered.len() < statement.len());
+    }
+
+    #[test]
+    fn meta_strip_preserves_lines_inside_escape_strings() {
+        let sql = r#"SELECT E'one\'two
+\. still data
+';
+\.
+"#;
+        let cleaned = strip_psql_meta_commands(sql);
+        assert!(cleaned.contains("\\. still data"));
+        assert!(!cleaned.trim_end().ends_with("\\."));
     }
 
     #[test]
@@ -370,14 +491,22 @@ mod splitter_edge_tests {
     fn meta_strip_preserves_backslash_lines_inside_strings() {
         let sql = "INSERT INTO t VALUES ('line1\n\\. not a meta terminator\nline3');\n\\.\n";
         let cleaned = strip_psql_meta_commands(sql);
-        assert!(cleaned.contains("\\. not a meta terminator"), "inside string must survive");
-        assert!(!cleaned.trim_end().ends_with("\\."), "top-level \\. removed");
+        assert!(
+            cleaned.contains("\\. not a meta terminator"),
+            "inside string must survive"
+        );
+        assert!(
+            !cleaned.trim_end().ends_with("\\."),
+            "top-level \\. removed"
+        );
     }
 
     #[test]
     fn role_statement_detection_is_not_overeager() {
         assert!(!is_role_dependent_statement("CREATE TABLE grants (id int)"));
-        assert!(!is_role_dependent_statement("COMMENT ON TABLE t IS 'GRANT nothing'"));
+        assert!(!is_role_dependent_statement(
+            "COMMENT ON TABLE t IS 'GRANT nothing'"
+        ));
         assert!(is_role_dependent_statement("\n  GRANT SELECT ON t TO r"));
     }
 }

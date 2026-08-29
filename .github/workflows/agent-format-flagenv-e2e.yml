@@ -1,0 +1,41 @@
+name: Rust formatting baseline
+
+on:
+  pull_request:
+    paths:
+      - '**/*.rs'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/agent-format-flagenv-e2e.yml'
+  push:
+    branches: [main]
+    paths:
+      - '**/*.rs'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/agent-format-flagenv-e2e.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rustfmt-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rustfmt
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.97.1
+          components: rustfmt
+
+      - name: Check full repository formatting
+        run: cargo fmt --all -- --check
