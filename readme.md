@@ -49,6 +49,16 @@ DPM_TEST_COCKROACH_DATABASE_URL='postgresql://root@localhost:26257/defaultdb?ssl
 
 The optional external cross-checkers are PostgreSQL tools. For CockroachDB, `dpm apply` still runs its built-in post-apply re-diff and `dpm verify` still performs its shadow-replay convergence proof, but rejects a request for those PostgreSQL-only external checks.
 
+### Extension placement is part of the catalog
+
+DPM records both an extension name and its installation schema. Bootstrap and
+verification replicas therefore reproduce declarations such as `vector` in
+Supabase's conventional `extensions` schema before replaying product tables
+typed as `extensions.vector` or `extensions.halfvec`. A source/target placement
+difference emits `ALTER EXTENSION ... SET SCHEMA ...` after creating the target
+schema. Extension versions are deliberately not pinned; managed PostgreSQL
+providers select their current supported default.
+
 ## The three source/target kinds — every combination works
 
 `--source` and `--target` each accept any of:

@@ -186,12 +186,36 @@ pub fn emit(plan: &Plan, opts: &EmitOptions) -> Script {
                 )],
                 false,
             ),
-            Change::CreateExtension { name } => e.change(
-                &format!("create extension: {name}"),
-                &[format!(
-                    "CREATE EXTENSION IF NOT EXISTS {};",
-                    quote_ident(name)
-                )],
+            Change::CreateExtension { name, schema } => {
+                let mut statements = Vec::new();
+                if let Some(schema) = schema {
+                    statements.push(format!(
+                        "CREATE SCHEMA IF NOT EXISTS {};",
+                        quote_ident(schema)
+                    ));
+                    statements.push(format!(
+                        "CREATE EXTENSION IF NOT EXISTS {} WITH SCHEMA {};",
+                        quote_ident(name),
+                        quote_ident(schema)
+                    ));
+                } else {
+                    statements.push(format!(
+                        "CREATE EXTENSION IF NOT EXISTS {};",
+                        quote_ident(name)
+                    ));
+                }
+                e.change(&format!("create extension: {name}"), &statements, false);
+            }
+            Change::MoveExtension { name, schema } => e.change(
+                &format!("move extension: {name} to schema {schema}"),
+                &[
+                    format!("CREATE SCHEMA IF NOT EXISTS {};", quote_ident(schema)),
+                    format!(
+                        "ALTER EXTENSION {} SET SCHEMA {};",
+                        quote_ident(name),
+                        quote_ident(schema)
+                    ),
+                ],
                 false,
             ),
             Change::CreateEnum { ty, labels } => {
@@ -1296,6 +1320,28 @@ mod tests {
         let script = emit(&plan, &EmitOptions::default());
         assert!(script.sql.contains("No schema differences detected"));
         assert!(!script.sql.contains("BEGIN;"));
+    }
+
+    #[test]
+    fn extension_schema_is_created_before_install_or_move() {
+        let plan = crate::diff::Plan {
+            changes: vec![
+                Change::CreateExtension {
+                    name: "vector".into(),
+                    schema: Some("extensions".into()),
+                },
+                Change::MoveExtension {
+                    name: "postgis".into(),
+                    schema: "extensions".into(),
+                },
+            ],
+        };
+        let sql = emit(&plan, &EmitOptions::default()).sql;
+        assert!(sql.contains("CREATE SCHEMA IF NOT EXISTS \"extensions\";"));
+        assert!(
+            sql.contains("CREATE EXTENSION IF NOT EXISTS \"vector\" WITH SCHEMA \"extensions\";")
+        );
+        assert!(sql.contains("ALTER EXTENSION \"postgis\" SET SCHEMA \"extensions\";"));
     }
 }
 

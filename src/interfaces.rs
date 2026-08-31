@@ -22,6 +22,9 @@ pub const OPENAPI_JSON: &str = include_str!("../openapi/dpm-server-v1.json");
 /// Database URLs are intentionally not part of the public wire contract.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+// Boxing the inline catalog would change the public Rust request shape solely
+// to optimize an operator/control-plane enum that is never kept in bulk.
+#[allow(clippy::large_enum_variant)]
 pub enum CatalogSource {
     Catalog { catalog: Catalog },
     Database { name: String },
