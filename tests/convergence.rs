@@ -1062,6 +1062,24 @@ async fn matrix_exclusion_and_extension_churn() {
 }
 
 #[tokio::test]
+async fn extension_schema_survives_shadow_bootstrap_and_verify() {
+    let Some(admin) = admin_url() else { return };
+    assert_converges(
+        &admin,
+        "CREATE SCHEMA extensions;\n\
+         CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA extensions;\n\
+         CREATE SCHEMA app;\n\
+         CREATE TABLE app.documents (\n\
+           id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n\
+           checksum bytea NOT NULL DEFAULT extensions.digest('document', 'sha256')\n\
+         );",
+        "",
+        "extension-schema-bootstrap",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn matrix_sequence_churn() {
     let Some(admin) = admin_url() else { return };
     verify_with_all_checkers(

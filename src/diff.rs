@@ -25,6 +25,11 @@ pub enum Change {
     },
     CreateExtension {
         name: String,
+        schema: Option<String>,
+    },
+    MoveExtension {
+        name: String,
+        schema: String,
     },
     DropExtension {
         name: String,
@@ -346,8 +351,23 @@ fn diff_schemas(source: &Catalog, target: &Catalog, plan: &mut Plan) {
 
 fn diff_extensions(source: &Catalog, target: &Catalog, plan: &mut Plan) {
     for ext in source.extensions.difference(&target.extensions) {
-        plan.changes
-            .push(Change::CreateExtension { name: ext.clone() });
+        plan.changes.push(Change::CreateExtension {
+            name: ext.clone(),
+            schema: source.extension_schemas.get(ext).cloned(),
+        });
+    }
+    for ext in source.extensions.intersection(&target.extensions) {
+        if let (Some(source_schema), Some(target_schema)) = (
+            source.extension_schemas.get(ext),
+            target.extension_schemas.get(ext),
+        ) {
+            if source_schema != target_schema {
+                plan.changes.push(Change::MoveExtension {
+                    name: ext.clone(),
+                    schema: source_schema.clone(),
+                });
+            }
+        }
     }
     for ext in target.extensions.difference(&source.extensions) {
         plan.changes
@@ -1222,11 +1242,38 @@ mod transition_tests {
         assert!(plan
             .changes
             .iter()
-            .any(|c| matches!(c, Change::CreateExtension { name } if name == "pgcrypto")));
+            .any(|c| matches!(c, Change::CreateExtension { name, .. } if name == "pgcrypto")));
         assert!(plan
             .changes
             .iter()
             .any(|c| matches!(c, Change::DropExtension { name } if name == "uuid-ossp")));
+    }
+
+    #[test]
+    fn extension_installation_schema_is_preserved_and_diffed() {
+        let (mut source, mut target) = (cat(), cat());
+        source.extensions.insert("vector".into());
+        source
+            .extension_schemas
+            .insert("vector".into(), "extensions".into());
+
+        let create = diff(&source, &target);
+        assert!(create.changes.iter().any(|change| matches!(
+            change,
+            Change::CreateExtension { name, schema: Some(schema) }
+                if name == "vector" && schema == "extensions"
+        )));
+
+        target.extensions.insert("vector".into());
+        target
+            .extension_schemas
+            .insert("vector".into(), "public".into());
+        let moved = diff(&source, &target);
+        assert!(moved.changes.iter().any(|change| matches!(
+            change,
+            Change::MoveExtension { name, schema }
+                if name == "vector" && schema == "extensions"
+        )));
     }
 
     #[test]

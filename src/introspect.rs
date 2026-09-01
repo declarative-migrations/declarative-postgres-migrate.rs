@@ -250,12 +250,20 @@ fn not_ext(class: &str, oid_expr: &str) -> String {
 }
 
 async fn load_extensions(conn: &mut PgConnection, cat: &mut Catalog) -> Result<()> {
-    let rows =
-        sqlx::query("SELECT extname FROM pg_catalog.pg_extension WHERE extname <> 'plpgsql'")
-            .fetch_all(&mut *conn)
-            .await?;
+    let rows = sqlx::query(
+        "SELECT e.extname, n.nspname AS schema \
+         FROM pg_catalog.pg_extension e \
+         JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace \
+         WHERE e.extname <> 'plpgsql' \
+         ORDER BY e.extname",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
     for row in rows {
-        cat.extensions.insert(row.get::<String, _>("extname"));
+        let name = row.get::<String, _>("extname");
+        let schema = row.get::<String, _>("schema");
+        cat.extensions.insert(name.clone());
+        cat.extension_schemas.insert(name, schema);
     }
     Ok(())
 }

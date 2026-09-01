@@ -403,6 +403,10 @@ pub struct Catalog {
     /// The schemas this snapshot covers (diff scope).
     pub schemas: BTreeSet<String>,
     pub extensions: BTreeSet<String>,
+    /// Extension name -> installation schema. Older catalog dumps only stored
+    /// the name, so this map is optional-by-default for wire compatibility.
+    #[serde(default)]
+    pub extension_schemas: BTreeMap<String, String>,
     /// Enum name -> ordered labels.
     pub enums: BTreeMap<QName, Vec<String>>,
     /// Standalone sequences only — sequences owned by serial/identity columns
