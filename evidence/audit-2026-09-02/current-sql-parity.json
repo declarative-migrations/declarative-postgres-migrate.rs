@@ -1,0 +1,30 @@
+{
+  "format": "authority-parity-report/v1",
+  "auditDate": "2026-09-02",
+  "scope": "declarative-migrations contract pipeline at audit time",
+  "contractRevision": "current-main",
+  "decision": "pause",
+  "stage": "sql-compared",
+  "missingArtifacts": [
+    "typespec-postgresql-sql-and-catalog",
+    "typespec-cockroachdb-sql-and-catalog",
+    "json-schema-openapi-postgresql-sql-and-catalog",
+    "json-schema-openapi-cockroachdb-sql-and-catalog"
+  ],
+  "observations": [
+    "DPM can compare SQL and normalized database catalogs.",
+    "The corrected contract pipeline does not yet provide both independently generated SQL candidates.",
+    "One authored SQL source or one successful DPM diff is not peer-authority certification."
+  ],
+  "requiredEvaluation": [
+    "exact PostgreSQL and CockroachDB materialization profiles",
+    "unsupported-feature and generator-failure behavior",
+    "catalog normalization and narrowly versioned equivalence rules",
+    "source, tool, SQL, catalog, and release evidence identity"
+  ],
+  "releaseEffect": [
+    "Do not claim TypeSpec and JSON Schema/OpenAPI SQL parity.",
+    "Do not substitute one SQL source for the missing peer artifact.",
+    "Do not permit peer-certified migration apply until both catalogs compare and the report says proceed."
+  ]
+}
