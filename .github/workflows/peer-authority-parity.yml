@@ -6,6 +6,7 @@ on:
       - "scripts/certify-peer-authorities.sh"
       - "scripts/test-certify-peer-authorities.sh"
       - "docs/peer-authority-parity.md"
+      - "docs/peer-authority-current-certification.json"
       - ".github/workflows/peer-authority-parity.yml"
   push:
     branches: [main]
@@ -13,6 +14,7 @@ on:
       - "scripts/certify-peer-authorities.sh"
       - "scripts/test-certify-peer-authorities.sh"
       - "docs/peer-authority-parity.md"
+      - "docs/peer-authority-current-certification.json"
       - ".github/workflows/peer-authority-parity.yml"
   workflow_dispatch:
 
@@ -37,3 +39,24 @@ jobs:
           bash -n scripts/test-certify-peer-authorities.sh
       - name: Prove continue, discrepancy, and missing-artifact decisions
         run: bash scripts/test-certify-peer-authorities.sh
+      - name: Validate the current audit remains explicitly paused
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          report = json.loads(
+              pathlib.Path("docs/peer-authority-current-certification.json")
+              .read_text(encoding="utf-8")
+          )
+          assert report["format"] == "declmig.peer-authority-certification/v1"
+          assert report["decision"] == "pause"
+          assert report["decisionEligible"] is False
+          assert report["policy"]["automaticWinner"] is False
+          assert {item["kind"] for item in report["comparisons"]} == {
+              "sql-catalog",
+              "generated-types",
+              "orm-projection",
+          }
+          assert all(item["status"] != "pass" for item in report["comparisons"])
+          PY
