@@ -1,0 +1,446 @@
+name: Salvage lease and CockroachDB hardening
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/salvage-lease-cockroach.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: salvage-lease-cockroach-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+      TARGET_BRANCH: ${{ github.head_ref }}
+    steps:
+      - name: Check out the exact reviewed feature head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: true
+          fetch-depth: 1
+          submodules: false
+
+      - name: Prove exact branch and head
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$TARGET_BRANCH" = 'salvage/lease-and-cockroach-hardening'
+          test "${{ github.event.pull_request.head.repo.full_name }}" = "$GITHUB_REPOSITORY"
+
+      - name: Apply assertion-guarded semantic reconciliation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected one guarded replacement, found {count}')
+              file.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          lease_path = Path('src/lease.rs')
+          lease = lease_path.read_text(encoding='utf-8')
+          anchor = '''/// Stable organization-wide advisory lock key for the default migration lane.
+          pub const DEFAULT_MIGRATION_LOCK_KEY: i64 = 0x4450_4d5f_4c4f_434b;
+
+          /// Structurally validated, immutable migration script.
+          '''
+          replacement = '''/// Stable organization-wide advisory lock key for the default migration lane.
+          pub const DEFAULT_MIGRATION_LOCK_KEY: i64 = 0x4450_4d5f_4c4f_434b;
+
+          const MAX_LEASE_OWNER_BYTES: usize = 128;
+
+          fn normalize_owner(owner: String) -> Result<String> {
+              let owner = owner.trim();
+              if owner.is_empty() {
+                  bail!("migration lease owner must not be empty");
+              }
+              if owner.len() > MAX_LEASE_OWNER_BYTES {
+                  bail!("migration lease owner exceeds {MAX_LEASE_OWNER_BYTES} UTF-8 bytes");
+              }
+              if owner.chars().any(char::is_control) {
+                  bail!("migration lease owner must not contain control characters");
+              }
+              Ok(owner.to_owned())
+          }
+
+          /// PostgreSQL exposes a one-argument bigint advisory key as two unsigned
+          /// 32-bit values in `pg_locks`: the high half in `classid`, the low half in
+          /// `objid`, and `objsubid = 1`. Splitting through `u64` also preserves negative
+          /// `i64` keys without relying on signed shift or cast behavior in SQL.
+          fn lock_key_halves(key: i64) -> (i64, i64) {
+              let bits = key as u64;
+              let mask = u64::from(u32::MAX);
+              (((bits >> 32) & mask) as i64, (bits & mask) as i64)
+          }
+
+          async fn ensure_session_lease_held(
+              conn: &mut PgConnection,
+              key: i64,
+              owner: &str,
+              boundary: &str,
+          ) -> Result<()> {
+              let (classid, objid) = lock_key_halves(key);
+              let held: bool = sqlx::query_scalar(
+                  r#"
+                  SELECT EXISTS (
+                      SELECT 1
+                      FROM pg_catalog.pg_locks
+                      WHERE locktype = 'advisory'
+                        AND pid = pg_backend_pid()
+                        AND granted
+                        AND objsubid = 1
+                        AND classid::bigint = $1
+                        AND objid::bigint = $2
+                  )
+                  "#,
+              )
+              .bind(classid)
+              .bind(objid)
+              .fetch_one(&mut *conn)
+              .await
+              .with_context(|| {
+                  format!("verifying PostgreSQL migration lease {key} for owner {owner} {boundary}")
+              })?;
+
+              if !held {
+                  bail!("PostgreSQL migration lease {key} was lost for owner {owner} {boundary}");
+              }
+              Ok(())
+          }
+
+          /// Structurally validated, immutable migration script.
+          '''
+          if lease.count(anchor) != 1:
+              raise SystemExit('src/lease.rs: stable lock anchor drifted')
+          lease = lease.replace(anchor, replacement, 1)
+
+          old_owner = '''        let owner = owner.into();
+                  if owner.trim().is_empty() {
+                      bail!("migration lease owner must not be empty");
+                  }
+          '''
+          new_owner = '''        let owner = normalize_owner(owner.into())?;
+          '''
+          if lease.count(old_owner) != 1:
+              raise SystemExit('src/lease.rs: acquisition owner block drifted')
+          lease = lease.replace(old_owner, new_owner, 1)
+
+          old_acquired = '''        if !acquired {
+                      let _ = conn.close().await;
+                      bail!("PostgreSQL migration lease {key} is already held");
+                  }
+
+                  Ok(Self {
+          '''
+          new_acquired = '''        if !acquired {
+                      let _ = conn.close().await;
+                      bail!("PostgreSQL migration lease {key} is already held");
+                  }
+
+                  if let Err(error) =
+                      ensure_session_lease_held(&mut conn, key, &owner, "immediately after acquisition").await
+                  {
+                      let _ = conn.close().await;
+                      return Err(error);
+                  }
+
+                  Ok(Self {
+          '''
+          if lease.count(old_acquired) != 1:
+              raise SystemExit('src/lease.rs: post-acquisition block drifted')
+          lease = lease.replace(old_acquired, new_acquired, 1)
+
+          apply_start = lease.index('    pub async fn apply(&mut self, script: &ValidatedScript')
+          apply_end = lease.index('    pub async fn release(mut self)', apply_start)
+          new_apply = '''    pub async fn apply(&mut self, script: &ValidatedScript<'_>) -> Result<ApplyReport> {
+              let owner = self.owner.clone();
+              let key = self.key;
+              let conn = self
+                  .conn
+                  .as_mut()
+                  .context("migration lease has already been released")?;
+              let mut executed = 0_usize;
+
+              for (index, statement) in script.statements.iter().enumerate() {
+                  let before = format!(
+                      "before statement {}/{}",
+                      index + 1,
+                      script.statement_count()
+                  );
+                  ensure_session_lease_held(conn, key, &owner, &before).await?;
+
+                  if let Err(error) = sqlx::raw_sql(statement).execute(&mut *conn).await {
+                      let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await;
+                      return Err(anyhow::anyhow!(error)).with_context(|| {
+                          format!(
+                              "leased statement {}/{} failed for owner {}:\\n{}",
+                              index + 1,
+                              script.statement_count(),
+                              owner,
+                              truncate_sql(statement)
+                          )
+                      });
+                  }
+                  executed += 1;
+
+                  let after = format!("after statement {}/{}", index + 1, script.statement_count());
+                  if let Err(error) = ensure_session_lease_held(conn, key, &owner, &after).await {
+                      let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await;
+                      return Err(error);
+                  }
+              }
+
+              self.executed += executed;
+              self.last_script_fingerprint = Some(script.fingerprint());
+              Ok(ApplyReport { executed })
+          }
+
+          '''
+          lease = lease[:apply_start] + new_apply + lease[apply_end:]
+
+          if 'fn lease_owner_is_trimmed_bounded_and_control_free()' in lease:
+              raise SystemExit('src/lease.rs: lease tests already present unexpectedly')
+          unit_tests = '''
+
+              #[test]
+              fn lease_owner_is_trimmed_bounded_and_control_free() {
+                  assert_eq!(
+                      normalize_owner("  migrator-a  ".to_string()).unwrap(),
+                      "migrator-a"
+                  );
+                  assert!(normalize_owner(" \\t\\n ".to_string()).is_err());
+                  assert!(normalize_owner("migrator\\nspoof".to_string()).is_err());
+                  assert!(normalize_owner("x".repeat(MAX_LEASE_OWNER_BYTES + 1)).is_err());
+              }
+
+              #[test]
+              fn advisory_key_halves_preserve_all_i64_bits() {
+                  assert_eq!(
+                      lock_key_halves(0x1122_3344_5566_7788),
+                      (0x1122_3344, 0x5566_7788)
+                  );
+                  assert_eq!(
+                      lock_key_halves(-1),
+                      (i64::from(u32::MAX), i64::from(u32::MAX))
+                  );
+              }
+          '''
+          stripped = lease.rstrip()
+          if not stripped.endswith('}'):
+              raise SystemExit('src/lease.rs: unexpected module ending')
+          lease = stripped[:-1] + unit_tests + '\n}\n'
+          lease_path.write_text(lease, encoding='utf-8')
+
+          replace_once(
+              'tests/lease_contract.rs',
+              'use dpm::lease::{PostgresMigrationLease, ValidatedScript, DEFAULT_MIGRATION_LOCK_KEY};\n',
+              'use dpm::lease::{PostgresMigrationLease, ValidatedScript, DEFAULT_MIGRATION_LOCK_KEY};\nuse sqlx::{Connection, PgConnection};\n',
+          )
+          lease_contract_path = Path('tests/lease_contract.rs')
+          lease_contract = lease_contract_path.read_text(encoding='utf-8').rstrip()
+          if 'script_cannot_continue_after_dynamically_releasing_lease' in lease_contract:
+              raise SystemExit('tests/lease_contract.rs: regression already present unexpectedly')
+          lease_contract += r'''
+
+          #[tokio::test]
+          async fn script_cannot_continue_after_dynamically_releasing_lease() {
+              let Some(url) = database_url() else {
+                  return;
+              };
+              let key = test_lock_key() ^ 0x5a5a;
+              let table = format!("dpm_lease_guard_{}", std::process::id());
+              let qualified_table = format!("public.{table}");
+
+              let mut cleanup = PgConnection::connect(&url).await.unwrap();
+              sqlx::raw_sql(&format!("DROP TABLE IF EXISTS {qualified_table}"))
+                  .execute(&mut cleanup)
+                  .await
+                  .unwrap();
+              cleanup.close().await.unwrap();
+
+              // The lease-control name is assembled at runtime, proving that the
+              // statement-boundary invariant is authoritative even when a textual guard
+              // cannot recognize dynamic SQL.
+              let sql = format!(
+                  r#"
+                  DO $dpm$
+                  BEGIN
+                    EXECUTE 'SELECT ' || 'pg_' || 'advisory_unlock({key})';
+                  END
+                  $dpm$;
+                  CREATE TABLE {qualified_table} (id bigint);
+                  "#
+              );
+              assert!(!sql.to_ascii_uppercase().contains("PG_ADVISORY_UNLOCK"));
+              let script = ValidatedScript::parse(&sql).unwrap();
+
+              let mut lease = PostgresMigrationLease::acquire(&url, key, "dynamic-unlock-probe")
+                  .await
+                  .unwrap();
+              let error = lease.apply(&script).await.unwrap_err();
+              assert!(
+                  format!("{error:#}").contains("was lost"),
+                  "unexpected error: {error:#}"
+              );
+              drop(lease);
+
+              let mut verifier = PgConnection::connect(&url).await.unwrap();
+              let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                  .bind(&qualified_table)
+                  .fetch_one(&mut verifier)
+                  .await
+                  .unwrap();
+              assert!(
+                  !exists,
+                  "a statement after lease loss was executed: {qualified_table}"
+              );
+              sqlx::raw_sql(&format!("DROP TABLE IF EXISTS {qualified_table}"))
+                  .execute(&mut verifier)
+                  .await
+                  .unwrap();
+              verifier.close().await.unwrap();
+          }
+          '''.strip()
+          lease_contract_path.write_text(lease_contract + '\n', encoding='utf-8')
+
+          replace_once(
+              'src/introspect.rs',
+              '                pg_catalog.format_type(a.atttypid, a.atttypmod) AS type_sql, \\\n',
+              "                CASE WHEN t.typtype = 'e' THEN \\\n                  pg_catalog.quote_ident(tn.nspname) || '.' || pg_catalog.quote_ident(t.typname) \\\n                ELSE pg_catalog.format_type(a.atttypid, a.atttypmod) END AS type_sql, \\\n",
+          )
+          replace_once(
+              'src/introspect.rs',
+              '         JOIN pg_catalog.pg_type t ON t.oid = a.atttypid \\\n         LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \\\n',
+              '         JOIN pg_catalog.pg_type t ON t.oid = a.atttypid \\\n         JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace \\\n         LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \\\n',
+          )
+
+          cockroach_path = Path('tests/cockroach.rs')
+          cockroach = cockroach_path.read_text(encoding='utf-8')
+          marker = '''#[tokio::test]
+          async fn cockroach_sequence_alter_converges() {
+          '''
+          if cockroach.count(marker) != 1:
+              raise SystemExit('tests/cockroach.rs: sequence test marker drifted')
+          if 'cockroach_nonpublic_enum_column_verifies_and_converges' in cockroach:
+              raise SystemExit('tests/cockroach.rs: enum regression already present unexpectedly')
+          enum_test = '''#[tokio::test]
+          async fn cockroach_nonpublic_enum_column_verifies_and_converges() {
+              let Some(admin) = admin_url() else { return };
+              let source_db = fresh_db(&admin).await;
+              let target_db = fresh_db(&admin).await;
+              source_db
+                  .apply_sql(
+                      "CREATE SCHEMA app; \\
+                       CREATE TYPE app.order_status AS ENUM ('pending', 'paid', 'fulfilled'); \\
+                       CREATE TABLE app.orders (\\
+                         id INT PRIMARY KEY, \\
+                         status app.order_status NOT NULL DEFAULT 'pending');",
+                  )
+                  .await
+                  .unwrap();
+              target_db
+                  .apply_sql(
+                      "CREATE SCHEMA app; \\
+                       CREATE TYPE app.order_status AS ENUM ('pending', 'fulfilled'); \\
+                       CREATE TABLE app.orders (\\
+                         id INT PRIMARY KEY, \\
+                         status app.order_status NOT NULL DEFAULT 'pending');",
+                  )
+                  .await
+                  .unwrap();
+
+              let opts = IntrospectOptions::default();
+              let source = introspect_url(&source_db.url, &opts).await.unwrap();
+              let target = introspect_url(&target_db.url, &opts).await.unwrap();
+              let status_type = &target
+                  .tables
+                  .iter()
+                  .find(|(name, _)| name.schema == "app" && name.name == "orders")
+                  .expect("app.orders must be introspected")
+                  .1
+                  .column("status")
+                  .expect("app.orders.status must be introspected")
+                  .type_sql;
+              assert_eq!(status_type, "app.order_status");
+
+              let outcome = verify(VerifyParams {
+                  source: &source,
+                  target: &target,
+                  shadow_server_url: &admin,
+                  source_url_for_external: None,
+                  allow_destructive: false,
+                  external_check: None,
+                  checks: Default::default(),
+                  bins: Default::default(),
+                  keep_shadow: false,
+                  verbose: false,
+                  introspect: &opts,
+              })
+              .await
+              .expect("CockroachDB verify must materialize a non-public enum column");
+              assert!(
+                  outcome.converged,
+                  "non-public CockroachDB enum migration must converge:\\n{:?}\\n{}",
+                  outcome.residual_sql, outcome.migration_sql
+              );
+
+              source_db.drop_db().await;
+              target_db.drop_db().await;
+          }
+
+          '''
+          cockroach_path.write_text(cockroach.replace(marker, enum_test + marker, 1), encoding='utf-8')
+          PY
+
+          cargo fmt --all
+          grep -RInE '^(<<<<<<<|=======|>>>>>>>)' --exclude-dir=.git . && exit 1 || true
+          git diff --check
+
+      - name: Validate reconciled source offline
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib
+          cargo test --locked --test lease_contract
+          cargo test --locked --test cockroach
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo build --locked --release
+
+      - name: Commit the reconciled files and remove this one-time workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          rm .github/workflows/salvage-lease-cockroach.yml
+          mapfile -t changed < <(git diff --name-only | sort)
+          expected=(
+            .github/workflows/salvage-lease-cockroach.yml
+            src/introspect.rs
+            src/lease.rs
+            tests/cockroach.rs
+            tests/lease_contract.rs
+          )
+          test "${changed[*]}" = "${expected[*]}"
+          git diff --check
+          grep -RInE '^(<<<<<<<|=======|>>>>>>>)' --exclude-dir=.git . && exit 1 || true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- "${expected[@]}"
+          git commit -m 'fix: reconcile lease and CockroachDB hardening onto current main'
+          git push origin "HEAD:$TARGET_BRANCH"
