@@ -19,6 +19,10 @@ fn test_lock_key() -> i64 {
     DEFAULT_MIGRATION_LOCK_KEY ^ i64::from(std::process::id())
 }
 
+fn negative_test_lock_key() -> i64 {
+    (test_lock_key() & i64::MAX) | i64::MIN
+}
+
 #[tokio::test]
 async fn advisory_lease_has_one_owner_and_can_be_reacquired() {
     let Some(url) = database_url() else {
@@ -54,6 +58,36 @@ async fn advisory_lease_has_one_owner_and_can_be_reacquired() {
     let receipt = second.release().await.unwrap();
     assert_eq!(receipt.owner(), "owner-b");
 }
+
+#[tokio::test]
+async fn negative_advisory_key_preserves_ownership_and_normalizes_owner() {
+    let Some(url) = database_url() else {
+        return;
+    };
+    let key = negative_test_lock_key();
+    assert!(key.is_negative());
+
+    let first = PostgresMigrationLease::acquire(&url, key, "  negative-owner  ")
+        .await
+        .expect("negative bigint advisory key must be observable in pg_locks");
+    let collision = PostgresMigrationLease::acquire(&url, key, "collision-owner").await;
+    assert!(
+        collision.is_err(),
+        "a second session acquired the same negative advisory key"
+    );
+
+    let receipt = first.release().await.unwrap();
+    assert_eq!(receipt.owner(), "negative-owner");
+    assert_eq!(receipt.executed(), 0);
+    assert_eq!(receipt.last_script_fingerprint(), None);
+
+    let second = PostgresMigrationLease::acquire(&url, key, "reacquired-negative-owner")
+        .await
+        .expect("released negative advisory key must be reacquirable");
+    let receipt = second.release().await.unwrap();
+    assert_eq!(receipt.owner(), "reacquired-negative-owner");
+}
+
 #[tokio::test]
 async fn script_cannot_continue_after_dynamically_releasing_lease() {
     let Some(url) = database_url() else {
