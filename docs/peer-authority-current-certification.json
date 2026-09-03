@@ -1,0 +1,50 @@
+{
+  "format": "declmig.peer-authority-certification/v1",
+  "decision": "pause",
+  "decisionEligible": false,
+  "policy": {
+    "automaticWinner": false,
+    "onDiscrepancy": "pause-and-evaluate",
+    "requiredComparisons": [
+      "typespec-vs-json-schema-openapi-sql-catalog",
+      "typespec-vs-json-schema-openapi-generated-types",
+      "seaorm-vs-diesel-orm-projection"
+    ]
+  },
+  "comparisons": [
+    {
+      "kind": "sql-catalog",
+      "left": "typespec",
+      "right": "json-schema-openapi",
+      "status": "missing",
+      "toolExitCode": 3,
+      "message": "No complete checked-in TypeSpec-to-SQL candidate or independent JSON Schema/OpenAPI-to-SQL candidate exists for an exact-engine catalog comparison.",
+      "evidenceSha256": null
+    },
+    {
+      "kind": "generated-types",
+      "left": "typespec",
+      "right": "json-schema-openapi",
+      "status": "missing",
+      "message": "JSON Schema-derived language surfaces exist, but the independent TypeSpec/Protobuf/gRPC semantic manifest is absent and the current migration payload remains open-ended.",
+      "evidenceSha256": null
+    },
+    {
+      "kind": "orm-projection",
+      "left": "seaorm",
+      "right": "diesel",
+      "status": "missing",
+      "message": "A SeaORM runtime boundary exists, but no independent Diesel projection generator or paired ORM semantic manifests are available.",
+      "evidenceSha256": null
+    }
+  ],
+  "inputs": {
+    "dpmSha256": null,
+    "typespecSqlSha256": null,
+    "jsonSchemaOpenApiSqlSha256": null,
+    "typespecTypesSha256": null,
+    "jsonSchemaOpenApiTypesSha256": null,
+    "seaOrmProjectionSha256": null,
+    "dieselProjectionSha256": null
+  }
+}

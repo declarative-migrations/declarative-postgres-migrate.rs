@@ -1,0 +1,32 @@
+{
+  "format": "authority-parity-report/v1",
+  "contractRevision": "current-main",
+  "decision": "pause",
+  "artifacts": [],
+  "discrepancies": [
+    {
+      "kind": "missingArtifact",
+      "artifactKind": "sql",
+      "path": "$.authorities.typeSpec.outputs.postgresqlSql",
+      "message": "No TypeSpec-generated PostgreSQL SQL candidate/catalog is supplied."
+    },
+    {
+      "kind": "missingArtifact",
+      "artifactKind": "sql",
+      "path": "$.authorities.typeSpec.outputs.cockroachDbSql",
+      "message": "No TypeSpec-generated CockroachDB SQL candidate/catalog is supplied."
+    },
+    {
+      "kind": "missingArtifact",
+      "artifactKind": "sql",
+      "path": "$.authorities.jsonSchemaOpenApi.outputs.postgresqlSql",
+      "message": "No independently generated JSON Schema/OpenAPI PostgreSQL SQL candidate/catalog is supplied."
+    },
+    {
+      "kind": "missingArtifact",
+      "artifactKind": "sql",
+      "path": "$.authorities.jsonSchemaOpenApi.outputs.cockroachDbSql",
+      "message": "No independently generated JSON Schema/OpenAPI CockroachDB SQL candidate/catalog is supplied."
+    }
+  ]
+}
