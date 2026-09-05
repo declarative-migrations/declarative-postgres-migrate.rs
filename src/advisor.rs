@@ -19,76 +19,79 @@ pub struct FkIndexAdvice {
 }
 
 pub fn advise_fk_indexes(cat: &Catalog) -> Vec<FkIndexAdvice> {
-    let mut out = Vec::new();
-    for (q, table) in &cat.tables {
-        let mut covered: Vec<String> = Vec::new();
-        for con in table.constraints.values() {
-            if matches!(
-                con.kind,
-                ConstraintKind::PrimaryKey | ConstraintKind::Unique
-            ) {
-                if let Some(col) = leading_column_of_key_list(&con.def) {
-                    covered.push(col);
-                }
-            }
-        }
-        for idx in table.indexes.values() {
-            if let Some(col) = leading_column_of_indexdef(&idx.def) {
-                covered.push(col);
-            }
-        }
+    cat.tables
+        .iter()
+        .flat_map(|(q, table)| {
+            let covered: Vec<String> = table
+                .constraints
+                .values()
+                .filter(|con| {
+                    matches!(
+                        con.kind,
+                        ConstraintKind::PrimaryKey | ConstraintKind::Unique
+                    )
+                })
+                .filter_map(|con| leading_column_of_key_list(&con.def))
+                .chain(
+                    table
+                        .indexes
+                        .values()
+                        .filter_map(|idx| leading_column_of_indexdef(&idx.def)),
+                )
+                .collect();
 
-        for con in table.constraints.values() {
-            if con.kind != ConstraintKind::ForeignKey {
-                continue;
-            }
-            let Some(col) = leading_column_of_key_list(&con.def) else {
-                continue;
-            };
-            if covered.iter().any(|c| c.eq_ignore_ascii_case(&col)) {
-                continue;
-            }
-            let index_name = format!("{}_{}_idx", q.name, col.replace('"', ""));
-            out.push(FkIndexAdvice {
-                table: q.clone(),
-                constraint: con.name.clone(),
-                column: col.clone(),
-                suggested_statement: format!(
-                    "CREATE INDEX IF NOT EXISTS {} ON {} ({});",
-                    quote_ident(&index_name),
-                    q.sql(),
-                    quote_ident(&col)
-                ),
-            });
-        }
-    }
-    out
+            table.constraints.values().filter_map(move |con| {
+                (con.kind == ConstraintKind::ForeignKey)
+                    .then(|| leading_column_of_key_list(&con.def))
+                    .flatten()
+                    .filter(|col| !covered.iter().any(|c| c.eq_ignore_ascii_case(col)))
+                    .map(|col| {
+                        let index_name = format!("{}_{}_idx", q.name, col.replace('"', ""));
+                        FkIndexAdvice {
+                            table: q.clone(),
+                            constraint: con.name.clone(),
+                            column: col.clone(),
+                            suggested_statement: format!(
+                                "CREATE INDEX IF NOT EXISTS {} ON {} ({});",
+                                quote_ident(&index_name),
+                                q.sql(),
+                                quote_ident(&col)
+                            ),
+                        }
+                    })
+            })
+        })
+        .collect()
 }
 
 pub fn advisory_comment_block(advice: &[FkIndexAdvice]) -> String {
-    if advice.is_empty() {
-        return String::new();
+    match advice {
+        [] => String::new(),
+        advice => {
+            let header = format!(
+                "-- =============================================================\n\
+                 -- Advisory: {} foreign key(s) without a supporting index\n\
+                 -- Derived from the desired schema; statements are suggestions only\n\
+                 -- and are NOT part of the migration (add them to the source of\n\
+                 -- truth if you want them).\n\
+                 -- =============================================================\n",
+                advice.len()
+            );
+            let body: String = advice
+                .iter()
+                .map(|a| {
+                    format!(
+                        "-- {}.{} ({}):\n--   {}\n",
+                        a.table.label(),
+                        a.column,
+                        a.constraint,
+                        a.suggested_statement
+                    )
+                })
+                .collect();
+            header + &body
+        }
     }
-    let mut out = String::new();
-    out.push_str("-- =============================================================\n");
-    out.push_str(&format!(
-        "-- Advisory: {} foreign key(s) without a supporting index\n",
-        advice.len()
-    ));
-    out.push_str("-- Derived from the desired schema; statements are suggestions only\n");
-    out.push_str("-- and are NOT part of the migration (add them to the source of\n");
-    out.push_str("-- truth if you want them).\n");
-    out.push_str("-- =============================================================\n");
-    for a in advice {
-        out.push_str(&format!(
-            "-- {}.{} ({}):\n--   {}\n",
-            a.table.label(),
-            a.column,
-            a.constraint,
-            a.suggested_statement
-        ));
-    }
-    out
 }
 
 /// Leading column from `... KEY (a, b) ...` / `FOREIGN KEY (a) REFERENCES ...`
@@ -98,10 +101,7 @@ fn leading_column_of_key_list(def: &str) -> Option<String> {
     let rest = &def[open + 1..];
     let end = rest.find([',', ')'])?;
     let raw = rest[..end].trim();
-    if raw.is_empty() {
-        return None;
-    }
-    Some(raw.trim_matches('"').to_string())
+    (!raw.is_empty()).then(|| raw.trim_matches('"').to_string())
 }
 
 /// Leading column from a full `pg_get_indexdef` statement:
@@ -113,24 +113,19 @@ fn leading_column_of_indexdef(def: &str) -> Option<String> {
     let after = &def[using + 7..];
     let open = after.find('(')?;
     let rest = &after[open + 1..];
-    let mut depth = 0usize;
-    let mut end = rest.len();
-    for (i, ch) in rest.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' if depth > 0 => depth -= 1,
-            ')' | ',' if depth == 0 => {
-                end = i;
-                break;
-            }
-            _ => {}
-        }
-    }
+    let end = match rest
+        .char_indices()
+        .try_fold(0usize, |depth, (i, ch)| match (ch, depth) {
+            ('(', d) => Ok(d + 1),
+            (')', d) if d > 0 => Ok(d - 1),
+            (')' | ',', 0) => Err(i),
+            (_, d) => Ok(d),
+        }) {
+        Ok(_) => rest.len(),
+        Err(i) => i,
+    };
     let raw = rest[..end].trim();
-    if raw.is_empty() {
-        return None;
-    }
-    Some(raw.trim_matches('"').to_string())
+    (!raw.is_empty()).then(|| raw.trim_matches('"').to_string())
 }
 
 #[cfg(test)]
