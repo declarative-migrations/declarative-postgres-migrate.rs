@@ -59,6 +59,8 @@ pub struct VerifyParams<'a> {
     pub keep_shadow: bool,
     pub verbose: bool,
     pub introspect: &'a IntrospectOptions,
+    /// Optional flags-2-env snapshot used only for spawned checkers.
+    pub command_env: Option<&'a crate::flagenv::Resolved>,
 }
 
 pub async fn verify(p: VerifyParams<'_>) -> Result<VerifyOutcome> {
@@ -402,9 +404,12 @@ async fn run_on_replica(
             if let Some(template) = p.external_check {
                 let (command, reported_command) =
                     external_check_commands(template, source_url, &replica.url);
-                let output = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&command)
+                let mut child = std::process::Command::new("sh");
+                child.arg("-c").arg(&command);
+                if let Some(resolved) = p.command_env {
+                    resolved.apply_to_child(&mut child);
+                }
+                let output = child
                     .output()
                     .with_context(|| format!("running external check: {reported_command}"))?;
                 let stdout = redact_external_output(

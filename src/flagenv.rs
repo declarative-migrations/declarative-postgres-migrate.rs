@@ -304,12 +304,28 @@ fn normalize_bool(v: &str) -> Result<String> {
 
 /// Layered configuration: flag overrides > process env > declared defaults.
 pub struct Resolved {
-    overrides: HashMap<String, String>,
+    env: HashMap<String, String>,
     defaults: HashMap<String, String>,
+    /// Command-marker keys that a parent shell may still hold. Child processes
+    /// must unset these before the selected marker is applied.
+    child_unset: Vec<String>,
+    command_env_key: Option<String>,
+}
+
+pub fn merge_env(
+    mut initial: HashMap<String, String>,
+    overrides: impl IntoIterator<Item = (String, String)>,
+) -> HashMap<String, String> {
+    initial.extend(overrides);
+    initial
 }
 
 impl Resolved {
-    pub fn new(config: &FlagConfig, overrides: HashMap<String, String>) -> Self {
+    pub fn new(
+        config: &FlagConfig,
+        process_env: HashMap<String, String>,
+        overrides: HashMap<String, String>,
+    ) -> Self {
         let mut defaults = HashMap::new();
         for spec in config.flags.values() {
             if let Some(d) = &spec.default {
@@ -321,19 +337,43 @@ impl Resolved {
             }
         }
         Self {
-            overrides,
+            env: merge_env(process_env, overrides),
             defaults,
+            child_unset: config
+                .commands
+                .values()
+                .filter_map(|spec| spec.env.clone())
+                .collect(),
+            command_env_key: config.command_env_key().map(str::to_owned),
+        }
+    }
+
+    /// Project command identity onto a spawned checker or reviewer without
+    /// writing the parent process environment.
+    pub fn apply_to_child(&self, cmd: &mut std::process::Command) {
+        for key in &self.child_unset {
+            cmd.env_remove(key);
+        }
+        if let Some(key) = &self.command_env_key {
+            if let Some(value) = self.get(key) {
+                cmd.env(key, value);
+            }
+        }
+        for key in &self.child_unset {
+            if let Some(value) = self.get(key) {
+                cmd.env(key, value);
+            }
         }
     }
 
     pub fn get(&self, env_key: &str) -> Option<String> {
-        if let Some(v) = self.overrides.get(env_key) {
-            return Some(v.clone());
-        }
-        if let Ok(v) = std::env::var(env_key) {
-            if !v.is_empty() {
-                return Some(v);
-            }
+        if let Some(v) = self
+            .env
+            .get(env_key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            return Some(v.to_string());
         }
         self.defaults.get(env_key).cloned()
     }
@@ -497,13 +537,122 @@ type = "integer"
     fn resolution_precedence_flag_over_env_over_default() {
         let cfg = config();
         let (map, _) = parse_fallback(&cfg, &args(&["--allow-destructive"])).unwrap();
-        let resolved = Resolved::new(&cfg, map);
+        let resolved = Resolved::new(&cfg, HashMap::new(), map);
         assert!(resolved.get_bool("DPM_ALLOW_DESTRUCTIVE"));
-        let resolved = Resolved::new(&cfg, HashMap::new());
+        let resolved = Resolved::new(&cfg, HashMap::new(), HashMap::new());
         assert_eq!(
             resolved.get("DPM_ALLOW_DESTRUCTIVE").as_deref(),
             Some("false")
         );
+    }
+
+    #[test]
+    fn overrides_win_without_mutating_process_environment() {
+        let before = std::env::var_os("DPM_FORMAT");
+        let env = merge_env(
+            HashMap::from([("DPM_FORMAT".into(), "sql".into())]),
+            [("DPM_FORMAT".into(), "json".into())],
+        );
+        assert_eq!(env.get("DPM_FORMAT").map(String::as_str), Some("json"));
+        assert_eq!(std::env::var_os("DPM_FORMAT"), before);
+    }
+
+    #[test]
+    fn empty_and_whitespace_overrides_are_absent_from_get() {
+        let cfg = config();
+        for raw in ["", " ", "\t"] {
+            let resolved = Resolved::new(
+                &cfg,
+                HashMap::from([("DPM_ALLOW_DESTRUCTIVE".into(), raw.into())]),
+                HashMap::new(),
+            );
+            assert_eq!(
+                resolved.get("DPM_ALLOW_DESTRUCTIVE").as_deref(),
+                Some("false"),
+                "raw={raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_reads_the_snapshot_not_process_env() {
+        let before = std::env::var_os("DPM_JOBS");
+        let cfg = config();
+        let resolved = Resolved::new(
+            &cfg,
+            HashMap::from([("DPM_JOBS".into(), "1".into())]),
+            HashMap::from([("DPM_JOBS".into(), "4".into())]),
+        );
+        assert_eq!(resolved.get("DPM_JOBS").as_deref(), Some("4"));
+        assert_eq!(std::env::var_os("DPM_JOBS"), before);
+    }
+
+    #[test]
+    fn unknown_flag_parse_failure_does_not_mutate_process_environment() {
+        let before = std::env::var_os("DPM_JOBS");
+        let cfg = config();
+        assert!(parse_fallback(&cfg, &args(&["--nope"])).is_err());
+        assert_eq!(std::env::var_os("DPM_JOBS"), before);
+    }
+
+    #[test]
+    fn source_does_not_mutate_process_environment() {
+        const SRC: &str = include_str!("flagenv.rs");
+        let production = SRC.split("#[cfg(test)]").next().unwrap_or(SRC);
+        assert!(!production.contains("std::env::set_var"));
+        assert!(!production.contains("env::set_var"));
+    }
+
+    #[test]
+    fn apply_to_child_replaces_stale_command_markers() {
+        let cfg = {
+            let text = r#"
+[parse]
+command_env = "FLAGS2ENV_COMMAND"
+
+[commands.diff]
+env = "DPM_CMD_DIFF"
+
+[commands.verify]
+env = "DPM_CMD_VERIFY"
+
+[flags.jobs]
+env = "DPM_JOBS"
+type = "integer"
+"#;
+            let parsed: CliFlagsFile = toml::from_str(text).unwrap();
+            FlagConfig {
+                flags: parsed.flags,
+                commands: parsed.commands,
+                parse: parsed.parse,
+            }
+        };
+        let resolved = Resolved::new(
+            &cfg,
+            HashMap::from([
+                ("FLAGS2ENV_COMMAND".into(), "diff".into()),
+                ("DPM_CMD_DIFF".into(), "true".into()),
+            ]),
+            HashMap::from([
+                ("FLAGS2ENV_COMMAND".into(), "verify".into()),
+                ("DPM_CMD_VERIFY".into(), "true".into()),
+            ]),
+        );
+        let mut cmd = std::process::Command::new("true");
+        resolved.apply_to_child(&mut cmd);
+        let env = cmd.get_envs().collect::<Vec<_>>();
+        let as_strings: Vec<(String, Option<String>)> = env
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(as_strings.iter().any(|(k, v)| k == "FLAGS2ENV_COMMAND" && v.as_deref() == Some("verify")));
+        assert!(as_strings.iter().any(|(k, v)| k == "DPM_CMD_VERIFY" && v.as_deref() == Some("true")));
+        assert!(as_strings.iter().any(|(k, v)| k == "DPM_CMD_DIFF" && v.is_none()));
     }
 }
 
@@ -578,7 +727,7 @@ mod contract_tests {
             "postgres://t".to_string(),
         );
         overrides.insert("DATABASE_URL".to_string(), "postgres://d".to_string());
-        let r = Resolved::new(&config, overrides);
+        let r = Resolved::new(&config, HashMap::new(), overrides);
         assert_eq!(
             r.get_first(&["TARGET_DATABASE_URL", "DATABASE_URL"])
                 .as_deref(),
