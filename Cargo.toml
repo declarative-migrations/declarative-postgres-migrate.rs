@@ -34,7 +34,14 @@ sqlx = { version = "0.9", default-features = false, features = [
   "postgres",
   "macros",
 ] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "io-util",
+  "signal",
+  "sync",
+] }
 toml = "1.1"
 
 [dev-dependencies]

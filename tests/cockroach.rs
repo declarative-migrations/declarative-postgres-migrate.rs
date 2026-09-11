@@ -611,6 +611,71 @@ async fn cockroach_enum_insertion_converges() {
 }
 
 #[tokio::test]
+async fn cockroach_nonpublic_enum_column_verifies_and_converges() {
+    let Some(admin) = admin_url() else { return };
+    let source_db = fresh_db(&admin).await;
+    let target_db = fresh_db(&admin).await;
+    source_db
+        .apply_sql(
+            "CREATE SCHEMA app; \
+             CREATE TYPE app.order_status AS ENUM ('pending', 'paid', 'fulfilled'); \
+             CREATE TABLE app.orders (\
+               id INT PRIMARY KEY, \
+               status app.order_status NOT NULL DEFAULT 'pending');",
+        )
+        .await
+        .unwrap();
+    target_db
+        .apply_sql(
+            "CREATE SCHEMA app; \
+             CREATE TYPE app.order_status AS ENUM ('pending', 'fulfilled'); \
+             CREATE TABLE app.orders (\
+               id INT PRIMARY KEY, \
+               status app.order_status NOT NULL DEFAULT 'pending');",
+        )
+        .await
+        .unwrap();
+
+    let opts = IntrospectOptions::default();
+    let source = introspect_url(&source_db.url, &opts).await.unwrap();
+    let target = introspect_url(&target_db.url, &opts).await.unwrap();
+    let status_type = &target
+        .tables
+        .iter()
+        .find(|(name, _)| name.schema == "app" && name.name == "orders")
+        .expect("app.orders must be introspected")
+        .1
+        .column("status")
+        .expect("app.orders.status must be introspected")
+        .type_sql;
+    assert_eq!(status_type, "app.order_status");
+
+    let outcome = verify(VerifyParams {
+        source: &source,
+        target: &target,
+        shadow_server_url: &admin,
+        source_url_for_external: None,
+        allow_destructive: false,
+        external_check: None,
+        checks: Default::default(),
+        bins: Default::default(),
+        keep_shadow: false,
+        verbose: false,
+        introspect: &opts,
+    })
+    .await
+    .expect("CockroachDB verify must materialize a non-public enum column");
+    assert!(
+        outcome.converged,
+        "non-public CockroachDB enum migration must converge:\n{:?}\n{}",
+        outcome.residual_sql, outcome.migration_sql
+    );
+
+    source_db.drop_db().await;
+    target_db.drop_db().await;
+}
+
+#[tokio::test]
 async fn cockroach_sequence_alter_converges() {
     let Some(admin) = admin_url() else { return };
     assert_converges(

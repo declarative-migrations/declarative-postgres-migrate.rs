@@ -1,0 +1,66 @@
+name: rust formal contracts
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: formal-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ownership-and-model:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Format formal-method files
+        run: >-
+          rustfmt --edition 2021 --check
+          src/formal.rs src/lease.rs tests/lease_contract.rs
+      - name: Borrow-check, lint, and run the pure model
+        run: |
+          cargo clippy --locked --lib --tests -- -D warnings
+          cargo test --locked --lib formal::
+          cargo test --locked --lib lease::
+      - name: Compile positive and negative typestate contracts
+        run: cargo test --locked --doc
+
+  postgres-lease:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Prove advisory-lock exclusion and recovery
+        env:
+          DPM_TEST_DATABASE_URL: postgres://postgres@localhost:5432/postgres
+        run: cargo test --locked --test lease_contract -- --test-threads=1

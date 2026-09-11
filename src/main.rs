@@ -22,6 +22,7 @@ use dpm::diff::{diff, Plan};
 use dpm::emit::{emit, EmitOptions, Script};
 use dpm::flagenv::{self, Resolved};
 use dpm::introspect::IntrospectOptions;
+use dpm::lease::{PostgresMigrationLease, ValidatedScript, DEFAULT_MIGRATION_LOCK_KEY};
 use dpm::model::{Catalog, DatabaseFlavor};
 use dpm::source::{resolve, ResolveContext, SideSpec};
 use dpm::verify::{verify, VerifyParams};
@@ -54,6 +55,9 @@ DESTRUCTIVE CHANGES (two separate consents)
   --allow-destructive-sql   generate destructive statements live (otherwise commented out)
   --allow-destructive-ops   actually execute destructive statements during `dpm apply`
   --allow-destructive       legacy shorthand for both
+
+SCHEMA SAFETY
+  --require-plan-checksum   refuse apply unless the reviewed plan checksum matches (hex)
 
 CROSS-CHECKS (independent diff engines validate dpm's result; verify + apply)
   --cross-check-with-migra    run migra after migrating; agreement = no remaining diff
@@ -394,6 +398,61 @@ fn ai_strict(r: &Resolved) -> bool {
     r.get_bool("DPM_AI_STRICT")
 }
 
+fn migration_lease_owner() -> String {
+    let raw_host = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown-host".to_string());
+    let sanitized = raw_host
+        .chars()
+        .take(64)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let host = if sanitized.is_empty() {
+        "unknown-host".to_string()
+    } else {
+        sanitized
+    };
+    format!("dpm:{host}:{}", std::process::id())
+}
+
+async fn acquire_migration_lease(target_url: &str) -> Result<PostgresMigrationLease> {
+    let owner = migration_lease_owner();
+    let lease = PostgresMigrationLease::acquire(target_url, DEFAULT_MIGRATION_LOCK_KEY, owner)
+        .await
+        .context("acquiring the PostgreSQL migration execution lease")?;
+    eprintln!(
+        "dpm: acquired PostgreSQL migration lease {} as {}",
+        lease.key(),
+        lease.owner()
+    );
+    Ok(lease)
+}
+
+async fn release_migration_lease(lease: Option<PostgresMigrationLease>) -> Result<()> {
+    let Some(lease) = lease else {
+        return Ok(());
+    };
+    let receipt = lease.release().await?;
+    let fingerprint = receipt
+        .last_script_fingerprint()
+        .map(|value| format!("{value:016x}"))
+        .unwrap_or_else(|| "none".to_string());
+    eprintln!(
+        "dpm: released PostgreSQL migration lease {} (owner {}, statements {}, fingerprint {})",
+        receipt.key(),
+        receipt.owner(),
+        receipt.executed(),
+        fingerprint
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // commands
 // ---------------------------------------------------------------------------
@@ -405,10 +464,15 @@ async fn cmd_diff(r: &Resolved, bootstrap: bool) -> Result<i32> {
     let allow_sql = policy.sql || bootstrap;
     let (plan, script, text) = render(r, &inputs, allow_sql);
 
+    let plan_checksum = dpm::plan_safety::reviewed_plan_checksum(&plan, &script.sql);
+    eprintln!("dpm: reviewed plan checksum {plan_checksum}");
     if r.get("DPM_FORMAT").as_deref() == Some("json") {
+        let certificate = plan.borrow_check();
         let doc = serde_json::json!({
             "source": inputs.source_desc,
             "target": inputs.target_desc,
+            "planChecksum": plan_checksum,
+            "planFingerprint": certificate.fingerprint,
             "changes": plan.changes,
             "summary": {
                 "total": script.change_count,
@@ -443,7 +507,7 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
             target.describe()
         );
     };
-    let inputs = load_sides(r, false).await?;
+    let mut inputs = load_sides(r, false).await?;
     let policy = destructive_policy(r);
     if inputs.source_cat.database_flavor == DatabaseFlavor::Cockroach && check_selection(r).any() {
         bail!(
@@ -455,6 +519,20 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
     if plan.is_empty() {
         eprintln!("dpm: no differences — nothing to apply");
         return Ok(0);
+    }
+
+    let plan_checksum = dpm::plan_safety::reviewed_plan_checksum(&plan, &script.sql);
+    eprintln!("dpm: reviewed plan checksum {plan_checksum}");
+    if let Some(expected) = r.get("DPM_REQUIRE_PLAN_CHECKSUM") {
+        if !expected.trim().is_empty()
+            && !dpm::plan_safety::checksums_match(&expected, &plan_checksum)
+        {
+            bail!(
+                "reviewed plan checksum {plan_checksum} does not match required checksum {}; \
+                 refusing writes",
+                expected.trim()
+            );
+        }
     }
 
     // Two-consent destructive model: generating live destructive SQL is one
@@ -508,7 +586,47 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
         }
     }
 
-    let report = dpm::apply::apply_script(target_url, &script.sql).await?;
+    // PostgreSQL execution is serialized by a session-scoped advisory lease.
+    // Re-introspect and re-render while holding it so the reviewed preview can
+    // never be applied after another migrator changes the desired/current
+    // catalogs. CockroachDB retains its existing convergence/recovery path
+    // until it has an equivalent distributed lease primitive.
+    let mut lease = if inputs.source_cat.database_flavor == DatabaseFlavor::Postgres {
+        Some(acquire_migration_lease(target_url).await?)
+    } else {
+        None
+    };
+    if lease.is_some() {
+        let refreshed_inputs = load_sides(r, false).await?;
+        let (refreshed_plan, refreshed_script, _) = render(r, &refreshed_inputs, policy.sql);
+        if refreshed_plan.is_empty() {
+            eprintln!(
+                "dpm: target converged before the execution lease was acquired — nothing to apply"
+            );
+            release_migration_lease(lease).await?;
+            return Ok(0);
+        }
+        let refreshed_checksum =
+            dpm::plan_safety::reviewed_plan_checksum(&refreshed_plan, &refreshed_script.sql);
+        if refreshed_script.sql != script.sql || refreshed_checksum != plan_checksum {
+            release_migration_lease(lease).await?;
+            bail!(
+                "the source or target schema changed after the migration was reviewed \
+                 (plan checksum {plan_checksum} -> {refreshed_checksum}); \
+                 nothing was applied — re-run dpm apply to review the fresh plan"
+            );
+        }
+        inputs = refreshed_inputs;
+    }
+
+    let report = match lease.as_mut() {
+        Some(lease) => {
+            let validated = ValidatedScript::parse(&script.sql)
+                .context("validating the reviewed migration before leased execution")?;
+            lease.apply(&validated).await?
+        }
+        None => dpm::apply::apply_script(target_url, &script.sql).await?,
+    };
     eprintln!(
         "dpm: applied {} statement(s) to {}",
         report.executed,
@@ -554,6 +672,7 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
             eprintln!("--- residual diff ---\n{sql}");
         }
     }
+    let mut exit_code = if converged { 0 } else { 3 };
 
     // Optional independent cross-checks of the freshly migrated target.
     // (flyway is verify-only: it validates the script on a replica, and the
@@ -610,14 +729,18 @@ async fn cmd_apply(r: &Resolved) -> Result<i32> {
                 db.drop_db().await;
             }
             if !checks.iter().all(|c| c.agreed) {
-                return Ok(3);
+                exit_code = 3;
             }
             if !scan_ok && ai_strict(r) {
-                return Ok(4);
+                exit_code = 4;
             }
         }
     }
-    Ok(if converged { 0 } else { 3 })
+
+    // Keep the PostgreSQL lease through convergence and independent checks so
+    // the emitted evidence describes one stable execution epoch.
+    release_migration_lease(lease).await?;
+    Ok(exit_code)
 }
 
 async fn cmd_dump(r: &Resolved) -> Result<i32> {

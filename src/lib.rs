@@ -13,8 +13,11 @@
 //! - [`introspect`]: live database → `Catalog` (canonical `search_path = ''`
 //!   deparsing, extension-owned objects excluded).
 //! - [`diff()`]: `Catalog` × `Catalog` → typed [`diff::Plan`]. Pure.
+//! - [`plan_safety`]: typed-plan resource borrows and exact plan certificates.
 //! - [`emit()`]: `Plan` → ordered SQL script with destructive-change gating.
 //! - [`apply`]: statement-splitting executor.
+//! - [`formal`]: typestate capabilities and a bounded migration model checker.
+//! - [`lease`]: borrow-checked PostgreSQL advisory leases and validated scripts.
 //! - [`verify`]: replay the migration on a shadow replica and prove
 //!   convergence; optional external cross-checkers (migra, pgdiff, ...).
 //! - [`advisor`]: non-DDL advice (foreign keys lacking supporting indexes).
@@ -28,13 +31,19 @@ pub mod advisor;
 pub mod ai;
 pub mod apply;
 pub mod canonicalize;
+// `DirBuilder::mode` mutates the scratch-directory builder only on Unix. Keep
+// Windows strict-lint builds focused while preserving mode 0o700 on Unix.
+#[cfg_attr(windows, allow(unused_mut))]
 pub mod crosscheck;
 pub mod diff;
 pub mod emit;
 pub mod flagenv;
+pub mod formal;
 pub mod interfaces;
 pub mod introspect;
+pub mod lease;
 pub mod model;
+pub mod plan_safety;
 pub mod server;
 pub mod source;
 pub mod sync;
@@ -44,3 +53,7 @@ pub use diff::{diff, Change, Plan};
 pub use emit::{emit, EmitOptions, Script};
 pub use introspect::{introspect_url, IntrospectOptions};
 pub use model::{Catalog, DatabaseFlavor, RoutineKind, TriggerMode};
+pub use plan_safety::{
+    certify_plan, check_parallel_changes, checksums_match, reviewed_plan_checksum, BorrowConflict,
+    BorrowMode, BorrowScope, CertifiedPlan, PlanCertificate, ResourceBorrow, ResourcePath,
+};

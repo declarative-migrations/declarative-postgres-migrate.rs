@@ -60,6 +60,13 @@ request per HTTP/1.1 connection, rejects request pipelining, conflicting
 content lengths, unsupported transfer encodings, oversized headers, and
 oversized bodies.
 
+Accepted connections run as owned local tasks. Each task moves its socket,
+concurrency permit, and cloned server state across the task boundary, so the
+SQLx request path may retain non-`Send` database state across awaits without
+making connection handling serial. `DPM_SERVER_MAX_IN_FLIGHT` remains a hard
+bound on simultaneously serviced connections. `SIGINT` stops the accept loop
+and closes the local task set cleanly.
+
 ## Diff example
 
 A source or target is either an inline catalog or an operator-defined database
@@ -94,10 +101,14 @@ the following:
    `"confirmation": "apply-destructive:<alias>"` for a destructive plan.
 6. No manual-only plan steps.
 
-Live applies are serialized inside the process. The server recomputes the plan
-while holding the apply lock, executes statement by statement using the core
-executor, introspects the target again, and fails the request when convergence
-verification finds remaining changes.
+Live applies are serialized inside the process. PostgreSQL applies also acquire
+the same session-scoped advisory lease as the current `dpm apply` path. While
+holding that lease, the server re-introspects and re-renders the plan, rejects
+gated or manual work, validates the generated script structurally, executes it
+through the lease-owned connection, verifies convergence, and records an audit
+receipt when the lease is released. CockroachDB retains the in-process lock and
+post-apply convergence check because it does not expose PostgreSQL advisory
+locks.
 
 ```sh
 curl --fail-with-body \
@@ -113,9 +124,12 @@ curl --fail-with-body \
   http://127.0.0.1:8080/v1/apply
 ```
 
-Run one active replica per independently mutable alias set until a distributed
-coordination backend is added. In Kubernetes, use a single replica or enforce
-leader election for live apply; read-only diff replicas can scale separately.
+Cooperating PostgreSQL CLI and server processes use one organization-wide
+advisory-lock key, so they cannot apply concurrently to the same database.
+Non-DPM writers can still race with a migration and are detected by the fresh
+plan and convergence checks. For CockroachDB, run one active apply replica per
+independently mutable alias set or enforce leader election. Read-only diff
+replicas can scale separately for either engine.
 
 ## Consumer compatibility
 

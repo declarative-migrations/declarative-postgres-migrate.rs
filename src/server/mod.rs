@@ -9,6 +9,7 @@ mod http;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -16,14 +17,15 @@ use anyhow::{bail, Context, Result as AnyResult};
 use serde::de::DeserializeOwned;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
+use tokio::task::LocalSet;
 
 use crate::interfaces::{
-    ApiError, ApplyRequest, ApplyResponse, CatalogSource, DiffRequest, DiffResponse,
-    ErrorResponse, HealthResponse, MigrationSummary, ReadyResponse, VersionResponse,
-    API_VERSION, APPLY_PATH, DIFF_PATH, HEALTH_PATH, OPENAPI_JSON, OPENAPI_PATH,
-    READY_PATH, VERSION_PATH,
+    ApiError, ApplyRequest, ApplyResponse, CatalogSource, DiffRequest, DiffResponse, ErrorResponse,
+    HealthResponse, MigrationSummary, ReadyResponse, VersionResponse, API_VERSION, APPLY_PATH,
+    DIFF_PATH, HEALTH_PATH, OPENAPI_JSON, OPENAPI_PATH, READY_PATH, VERSION_PATH,
 };
-use crate::model::{Catalog, CATALOG_FORMAT_VERSION};
+use crate::lease::{PostgresMigrationLease, ValidatedScript, DEFAULT_MIGRATION_LOCK_KEY};
+use crate::model::{Catalog, DatabaseFlavor, CATALOG_FORMAT_VERSION};
 use crate::{diff, emit, introspect_url, EmitOptions, IntrospectOptions};
 
 use self::http::{read_request, write_response, Request, Response};
@@ -59,14 +61,8 @@ impl ServerConfig {
             _ => BTreeMap::new(),
         };
         let allow_apply = env_bool("DPM_SERVER_ALLOW_APPLY", false)?;
-        let max_body_bytes = env_usize(
-            "DPM_SERVER_MAX_BODY_BYTES",
-            DEFAULT_MAX_BODY_BYTES,
-        )?;
-        let max_in_flight = env_usize(
-            "DPM_SERVER_MAX_IN_FLIGHT",
-            DEFAULT_MAX_IN_FLIGHT,
-        )?;
+        let max_body_bytes = env_usize("DPM_SERVER_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES)?;
+        let max_in_flight = env_usize("DPM_SERVER_MAX_IN_FLIGHT", DEFAULT_MAX_IN_FLIGHT)?;
         Self {
             bind,
             bearer_token,
@@ -80,12 +76,10 @@ impl ServerConfig {
 
     pub fn validate(self) -> AnyResult<Self> {
         if !self.bind.ip().is_loopback() && self.bearer_token.is_none() {
-            bail!(
-                "DPM_SERVER_TOKEN is required when DPM_SERVER_BIND is not loopback"
-            );
+            bail!("DPM_SERVER_TOKEN is required when DPM_SERVER_BIND is not loopback");
         }
         if let Some(token) = &self.bearer_token {
-            if token.as_bytes().len() < 24 {
+            if token.len() < 24 {
                 bail!("DPM_SERVER_TOKEN must contain at least 24 bytes");
             }
         }
@@ -95,16 +89,12 @@ impl ServerConfig {
         for (name, url) in &self.databases {
             validate_alias(name)?;
             let lower = url.to_ascii_lowercase();
-            if !lower.starts_with("postgres://")
-                && !lower.starts_with("postgresql://")
-            {
+            if !lower.starts_with("postgres://") && !lower.starts_with("postgresql://") {
                 bail!("database alias {name:?} must use a postgres URL");
             }
         }
         if self.max_body_bytes == 0 || self.max_body_bytes > MAX_MAX_BODY_BYTES {
-            bail!(
-                "DPM_SERVER_MAX_BODY_BYTES must be between 1 and {MAX_MAX_BODY_BYTES}"
-            );
+            bail!("DPM_SERVER_MAX_BODY_BYTES must be between 1 and {MAX_MAX_BODY_BYTES}");
         }
         if self.max_in_flight == 0 || self.max_in_flight > 4096 {
             bail!("DPM_SERVER_MAX_IN_FLIGHT must be between 1 and 4096");
@@ -174,7 +164,12 @@ pub async fn run(config: ServerConfig) -> AnyResult<()> {
 }
 
 pub async fn serve(listener: TcpListener, config: ServerConfig) -> AnyResult<()> {
-    let state = Arc::new(ServerState {
+    let tasks = LocalSet::new();
+    tasks.run_until(serve_local(listener, config)).await
+}
+
+async fn serve_local(listener: TcpListener, config: ServerConfig) -> AnyResult<()> {
+    let state = Rc::new(ServerState {
         config: config.validate()?,
         apply_lock: Mutex::new(()),
         request_counter: AtomicU64::new(1),
@@ -190,8 +185,8 @@ pub async fn serve(listener: TcpListener, config: ServerConfig) -> AnyResult<()>
                     .acquire_owned()
                     .await
                     .context("server concurrency limiter closed")?;
-                let state = Arc::clone(&state);
-                tokio::spawn(async move {
+                let state = Rc::clone(&state);
+                tokio::task::spawn_local(async move {
                     let _permit = permit;
                     if let Err(error) = handle_connection(stream, state).await {
                         eprintln!("dpm-server: connection error: {error:#}");
@@ -207,17 +202,12 @@ pub async fn serve(listener: TcpListener, config: ServerConfig) -> AnyResult<()>
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> AnyResult<()> {
+async fn handle_connection(mut stream: TcpStream, state: Rc<ServerState>) -> AnyResult<()> {
     let request_id = state.next_request_id();
     let request = match read_request(&mut stream, state.config.max_body_bytes).await {
         Ok(request) => request,
         Err(error) => {
-            let response = error_response(
-                error.status,
-                error.code,
-                error.message,
-                &request_id,
-            );
+            let response = error_response(error.status, error.code, error.message, &request_id);
             write_response(&mut stream, response).await?;
             return Ok(());
         }
@@ -301,11 +291,7 @@ fn version_response() -> VersionResponse {
     }
 }
 
-fn authorize(
-    request: &Request,
-    state: &ServerState,
-    request_id: &str,
-) -> Result<(), Response> {
+fn authorize(request: &Request, state: &ServerState, request_id: &str) -> Result<(), Response> {
     let Some(expected) = &state.config.bearer_token else {
         return Ok(());
     };
@@ -392,13 +378,8 @@ async fn handle_apply(body: &[u8], state: &ServerState, request_id: &str) -> Res
         let target = CatalogSource::Database {
             name: request.target.clone(),
         };
-        return match compute_migration(
-            &request.source,
-            &target,
-            request.allow_destructive,
-            state,
-        )
-        .await
+        return match compute_migration(&request.source, &target, request.allow_destructive, state)
+            .await
         {
             Ok(computed) => Response::json(200, &computed.into_apply_response(true, 0, 0)),
             Err(failure) => failure.into_response(request_id),
@@ -431,32 +412,16 @@ async fn handle_apply(body: &[u8], state: &ServerState, request_id: &str) -> Res
     let target = CatalogSource::Database {
         name: request.target.clone(),
     };
-    let computed = match compute_migration(
-        &request.source,
-        &target,
-        request.allow_destructive,
-        state,
-    )
-    .await
-    {
-        Ok(computed) => computed,
-        Err(failure) => return failure.into_response(request_id),
-    };
-    if computed.summary.manual_count > 0 {
-        return error_response(
-            409,
-            "manual_changes_present",
-            "the migration contains manual changes and cannot be applied automatically",
-            request_id,
-        );
+    let mut computed =
+        match compute_migration(&request.source, &target, request.allow_destructive, state).await {
+            Ok(computed) => computed,
+            Err(failure) => return failure.into_response(request_id),
+        };
+    if let Err(failure) = validate_live_plan(&computed) {
+        return failure.into_response(request_id);
     }
-    if computed.summary.gated_count > 0 {
-        return error_response(
-            409,
-            "destructive_changes_gated",
-            "the migration contains destructive changes; explicitly allow and confirm them",
-            request_id,
-        );
+    if computed.summary.change_count == 0 {
+        return Response::json(200, &computed.into_apply_response(false, 0, 0));
     }
 
     let Some(target_url) = state.config.databases.get(&request.target) else {
@@ -467,7 +432,56 @@ async fn handle_apply(body: &[u8], state: &ServerState, request_id: &str) -> Res
             request_id,
         );
     };
-    let report = match crate::apply::apply_script(target_url, &computed.sql).await {
+
+    // Preserve current-main's owned execution boundary. PostgreSQL mutation
+    // holds the cross-process advisory lease while re-introspecting, applying,
+    // and verifying. The request task owns the non-Send SQLx state, while the
+    // listener remains free to service other bounded local tasks.
+    let mut lease = if computed.source_catalog.database_flavor == DatabaseFlavor::Postgres {
+        let owner = format!("dpm-server:{}:{request_id}", std::process::id());
+        match PostgresMigrationLease::acquire(target_url, DEFAULT_MIGRATION_LOCK_KEY, owner).await {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                return Failure::logged(
+                    503,
+                    "migration_lease_unavailable",
+                    "the PostgreSQL migration execution lease is unavailable",
+                    error,
+                )
+                .into_response(request_id);
+            }
+        }
+    } else {
+        None
+    };
+
+    if lease.is_some() {
+        computed =
+            match compute_migration(&request.source, &target, request.allow_destructive, state)
+                .await
+            {
+                Ok(computed) => computed,
+                Err(failure) => return failure.into_response(request_id),
+            };
+        if let Err(failure) = validate_live_plan(&computed) {
+            return failure.into_response(request_id);
+        }
+        if computed.summary.change_count == 0 {
+            if let Err(failure) = release_migration_lease(lease, request_id).await {
+                return failure.into_response(request_id);
+            }
+            return Response::json(200, &computed.into_apply_response(false, 0, 0));
+        }
+    }
+
+    let report_result = match lease.as_mut() {
+        Some(lease) => match ValidatedScript::parse(&computed.sql) {
+            Ok(script) => lease.apply(&script).await,
+            Err(error) => Err(error.context("validating the leased migration script")),
+        },
+        None => crate::apply::apply_script(target_url, &computed.sql).await,
+    };
+    let report = match report_result {
         Ok(report) => report,
         Err(error) => {
             eprintln!("dpm-server: apply failed request_id={request_id}: {error:#}");
@@ -495,10 +509,61 @@ async fn handle_apply(body: &[u8], state: &ServerState, request_id: &str) -> Res
         );
     }
 
+    if let Err(failure) = release_migration_lease(lease, request_id).await {
+        return failure.into_response(request_id);
+    }
+
     Response::json(
         200,
         &computed.into_apply_response(false, report.executed, remaining),
     )
+}
+
+fn validate_live_plan(computed: &ComputedMigration) -> Result<(), Failure> {
+    if computed.summary.manual_count > 0 {
+        return Err(Failure::safe(
+            409,
+            "manual_changes_present",
+            "the migration contains manual changes and cannot be applied automatically",
+        ));
+    }
+    if computed.summary.gated_count > 0 {
+        return Err(Failure::safe(
+            409,
+            "destructive_changes_gated",
+            "the migration contains destructive changes; explicitly allow and confirm them",
+        ));
+    }
+    Ok(())
+}
+
+async fn release_migration_lease(
+    lease: Option<PostgresMigrationLease>,
+    request_id: &str,
+) -> Result<(), Failure> {
+    let Some(lease) = lease else {
+        return Ok(());
+    };
+    let receipt = lease.release().await.map_err(|error| {
+        Failure::logged(
+            500,
+            "migration_lease_release_failed",
+            "the migration completed but its execution lease could not be released cleanly",
+            error,
+        )
+    })?;
+    let fingerprint = receipt
+        .last_script_fingerprint()
+        .map(|value| format!("{value:016x}"))
+        .unwrap_or_else(|| "none".to_string());
+    eprintln!(
+        "dpm-server: released migration lease {} (owner {}, statements {}, fingerprint {}, request_id={request_id})",
+        receipt.key(),
+        receipt.owner(),
+        receipt.executed(),
+        fingerprint
+    );
+    Ok(())
 }
 
 fn parse_json<T: DeserializeOwned>(body: &[u8], request_id: &str) -> Result<T, Response> {
@@ -586,9 +651,8 @@ async fn compute_migration(
             target_desc: Some(target.clone()),
         },
     );
-    let plan = serde_json::to_value(&plan).map_err(|error| {
-        Failure::internal("serializing migration plan", error)
-    })?;
+    let plan = serde_json::to_value(&plan)
+        .map_err(|error| Failure::internal("serializing migration plan", error))?;
     let database_flavor = source_catalog.database_flavor.label().to_string();
     Ok(ComputedMigration {
         source_catalog,
@@ -640,9 +704,8 @@ fn validate_catalog(catalog: &Catalog) -> Result<(), Failure> {
 }
 
 async fn introspect_alias(name: &str, state: &ServerState) -> Result<Catalog, Failure> {
-    validate_alias(name).map_err(|error| {
-        Failure::safe(422, "invalid_database_alias", error.to_string())
-    })?;
+    validate_alias(name)
+        .map_err(|error| Failure::safe(422, "invalid_database_alias", error.to_string()))?;
     let Some(url) = state.config.databases.get(name) else {
         return Err(Failure::safe(
             404,
@@ -707,12 +770,7 @@ impl Failure {
         if let Some(log) = self.log {
             eprintln!("dpm-server: request_id={request_id} {}: {log}", self.code);
         }
-        error_response(
-            self.status,
-            self.code,
-            self.message,
-            request_id,
-        )
+        error_response(self.status, self.code, self.message, request_id)
     }
 }
 
