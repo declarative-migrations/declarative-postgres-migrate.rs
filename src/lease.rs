@@ -44,6 +44,67 @@ use crate::formal::stable_fingerprint;
 /// Stable organization-wide advisory lock key for the default migration lane.
 pub const DEFAULT_MIGRATION_LOCK_KEY: i64 = 0x4450_4d5f_4c4f_434b;
 
+const MAX_LEASE_OWNER_BYTES: usize = 128;
+
+fn normalize_owner(owner: String) -> Result<String> {
+    let owner = owner.trim();
+    if owner.is_empty() {
+        bail!("migration lease owner must not be empty");
+    }
+    if owner.len() > MAX_LEASE_OWNER_BYTES {
+        bail!("migration lease owner exceeds {MAX_LEASE_OWNER_BYTES} UTF-8 bytes");
+    }
+    if owner.chars().any(char::is_control) {
+        bail!("migration lease owner must not contain control characters");
+    }
+    Ok(owner.to_owned())
+}
+
+/// PostgreSQL exposes a one-argument bigint advisory key as two unsigned
+/// 32-bit values in `pg_locks`: the high half in `classid`, the low half in
+/// `objid`, and `objsubid = 1`. Splitting through `u64` also preserves negative
+/// `i64` keys without relying on signed shift or cast behavior in SQL.
+fn lock_key_halves(key: i64) -> (i64, i64) {
+    let bits = key as u64;
+    let mask = u64::from(u32::MAX);
+    (((bits >> 32) & mask) as i64, (bits & mask) as i64)
+}
+
+async fn ensure_session_lease_held(
+    conn: &mut PgConnection,
+    key: i64,
+    owner: &str,
+    boundary: &str,
+) -> Result<()> {
+    let (classid, objid) = lock_key_halves(key);
+    let held: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_locks
+            WHERE locktype = 'advisory'
+              AND pid = pg_backend_pid()
+              AND granted
+              AND objsubid = 1
+              AND classid::bigint = $1
+              AND objid::bigint = $2
+        )
+        "#,
+    )
+    .bind(classid)
+    .bind(objid)
+    .fetch_one(&mut *conn)
+    .await
+    .with_context(|| {
+        format!("verifying PostgreSQL migration lease {key} for owner {owner} {boundary}")
+    })?;
+
+    if !held {
+        bail!("PostgreSQL migration lease {key} was lost for owner {owner} {boundary}");
+    }
+    Ok(())
+}
+
 /// Structurally validated, immutable migration script.
 pub struct ValidatedScript<'sql> {
     sql: &'sql str,
@@ -110,10 +171,7 @@ pub struct PostgresMigrationLease {
 
 impl PostgresMigrationLease {
     pub async fn acquire(url: &str, key: i64, owner: impl Into<String>) -> Result<Self> {
-        let owner = owner.into();
-        if owner.trim().is_empty() {
-            bail!("migration lease owner must not be empty");
-        }
+        let owner = normalize_owner(owner.into())?;
 
         let mut conn = PgConnection::connect(url)
             .await
@@ -126,6 +184,13 @@ impl PostgresMigrationLease {
         if !acquired {
             let _ = conn.close().await;
             bail!("PostgreSQL migration lease {key} is already held");
+        }
+
+        if let Err(error) =
+            ensure_session_lease_held(&mut conn, key, &owner, "immediately after acquisition").await
+        {
+            let _ = conn.close().await;
+            return Err(error);
         }
 
         Ok(Self {
@@ -151,12 +216,21 @@ impl PostgresMigrationLease {
 
     pub async fn apply(&mut self, script: &ValidatedScript<'_>) -> Result<ApplyReport> {
         let owner = self.owner.clone();
+        let key = self.key;
         let conn = self
             .conn
             .as_mut()
             .context("migration lease has already been released")?;
         let mut executed = 0_usize;
+
         for (index, statement) in script.statements.iter().enumerate() {
+            let before = format!(
+                "before statement {}/{}",
+                index + 1,
+                script.statement_count()
+            );
+            ensure_session_lease_held(conn, key, &owner, &before).await?;
+
             if let Err(error) = sqlx::raw_sql(statement).execute(&mut *conn).await {
                 let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await;
                 return Err(anyhow::anyhow!(error)).with_context(|| {
@@ -170,7 +244,14 @@ impl PostgresMigrationLease {
                 });
             }
             executed += 1;
+
+            let after = format!("after statement {}/{}", index + 1, script.statement_count());
+            if let Err(error) = ensure_session_lease_held(conn, key, &owner, &after).await {
+                let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await;
+                return Err(error);
+            }
         }
+
         self.executed += executed;
         self.last_script_fingerprint = Some(script.fingerprint());
         Ok(ApplyReport { executed })
@@ -243,6 +324,29 @@ mod tests {
         assert_eq!(
             script.fingerprint(),
             stable_fingerprint(script.sql().as_bytes())
+        );
+    }
+
+    #[test]
+    fn lease_owner_is_trimmed_bounded_and_control_free() {
+        assert_eq!(
+            normalize_owner("  migrator-a  ".to_string()).unwrap(),
+            "migrator-a"
+        );
+        assert!(normalize_owner(" \t\n ".to_string()).is_err());
+        assert!(normalize_owner("migrator\nspoof".to_string()).is_err());
+        assert!(normalize_owner("x".repeat(MAX_LEASE_OWNER_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn advisory_key_halves_preserve_all_i64_bits() {
+        assert_eq!(
+            lock_key_halves(0x1122_3344_5566_7788),
+            (0x1122_3344, 0x5566_7788)
+        );
+        assert_eq!(
+            lock_key_halves(-1),
+            (i64::from(u32::MAX), i64::from(u32::MAX))
         );
     }
 }

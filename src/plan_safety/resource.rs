@@ -219,7 +219,9 @@ fn change_borrows(change: &Change) -> BTreeSet<ResourceBorrow> {
         Change::CreateSchema { name } | Change::DropSchema { name } => {
             exclusive_subtree!(ResourcePath::schema(name));
         }
-        Change::CreateExtension { .. } | Change::DropExtension { .. } => {
+        Change::CreateExtension { .. }
+        | Change::MoveExtension { .. }
+        | Change::DropExtension { .. } => {
             // Extensions can install objects in multiple schemas.
             exclusive_subtree!(ResourcePath::database());
         }
@@ -324,6 +326,7 @@ fn has_opaque_dependencies(change: &Change) -> bool {
         Change::CreateSchema { .. }
         | Change::DropSchema { .. }
         | Change::CreateExtension { .. }
+        | Change::MoveExtension { .. }
         | Change::DropExtension { .. }
         | Change::CreateEnum { .. }
         | Change::AddEnumValue { .. }
@@ -351,6 +354,7 @@ fn change_operation(change: &Change) -> &'static str {
         Change::CreateSchema { .. } => "create_schema",
         Change::DropSchema { .. } => "drop_schema",
         Change::CreateExtension { .. } => "create_extension",
+        Change::MoveExtension { .. } => "move_extension",
         Change::DropExtension { .. } => "drop_extension",
         Change::CreateEnum { .. } => "create_enum",
         Change::AddEnumValue { .. } => "add_enum_value",

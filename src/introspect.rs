@@ -250,12 +250,20 @@ fn not_ext(class: &str, oid_expr: &str) -> String {
 }
 
 async fn load_extensions(conn: &mut PgConnection, cat: &mut Catalog) -> Result<()> {
-    let rows =
-        sqlx::query("SELECT extname FROM pg_catalog.pg_extension WHERE extname <> 'plpgsql'")
-            .fetch_all(&mut *conn)
-            .await?;
+    let rows = sqlx::query(
+        "SELECT e.extname, n.nspname AS schema \
+         FROM pg_catalog.pg_extension e \
+         JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace \
+         WHERE e.extname <> 'plpgsql' \
+         ORDER BY e.extname",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
     for row in rows {
-        cat.extensions.insert(row.get::<String, _>("extname"));
+        let name = row.get::<String, _>("extname");
+        let schema = row.get::<String, _>("schema");
+        cat.extensions.insert(name.clone());
+        cat.extension_schemas.insert(name, schema);
     }
     Ok(())
 }
@@ -341,7 +349,9 @@ async fn load_columns(
     };
     let sql = format!(
         "SELECT n.nspname AS schema, c.relname AS tbl, a.attname AS name, \
-                pg_catalog.format_type(a.atttypid, a.atttypmod) AS type_sql, \
+                CASE WHEN t.typtype = 'e' THEN \
+                  pg_catalog.quote_ident(tn.nspname) || '.' || pg_catalog.quote_ident(t.typname) \
+                ELSE pg_catalog.format_type(a.atttypid, a.atttypmod) END AS type_sql, \
                 a.attnotnull AS not_null, a.attidentity::text AS identity, \
                 {generated_expr} AS generated, \
                 pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) AS default_expr, \
@@ -356,6 +366,7 @@ async fn load_columns(
          JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
          JOIN pg_catalog.pg_type t ON t.oid = a.atttypid \
+         JOIN pg_catalog.pg_namespace tn ON tn.oid = t.typnamespace \
          LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
          LEFT JOIN pg_catalog.pg_collation col ON col.oid = a.attcollation \
          LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid = col.collnamespace \

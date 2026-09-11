@@ -1,0 +1,89 @@
+name: CockroachDB quoted enum regression
+
+on:
+  pull_request:
+    paths:
+      - 'src/introspect.rs'
+      - 'src/diff.rs'
+      - 'src/emit.rs'
+      - 'src/verify.rs'
+      - 'tests/cockroach_quoted_enum.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/cockroach-quoted-enum.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cockroach-quoted-enum-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  quoted-enum:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+      DPM_TEST_COCKROACH_DATABASE_URL: postgresql://root@localhost:26257/defaultdb?sslmode=disable
+    steps:
+      - name: Check out the exact reviewed head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+
+      - name: Prove exact-head execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+
+      - name: Install the repository Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Start CockroachDB v25.2.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --name dpm-cockroach-quoted-enum \
+            --publish 26257:26257 --publish 8080:8080 \
+            cockroachdb/cockroach:v25.2.4 \
+            start-single-node --insecure
+
+      - name: Wait for CockroachDB
+        shell: bash
+        run: |
+          set -euo pipefail
+          for _ in {1..60}; do
+            if docker exec dpm-cockroach-quoted-enum cockroach sql \
+              --insecure --host=localhost:26257 --execute='SELECT 1' >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs dpm-cockroach-quoted-enum
+          exit 1
+
+      - name: Validate formatting and run the quoted-enum regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2021 --check --config skip_children=true \
+            tests/cockroach_quoted_enum.rs
+          cargo test --locked --test cockroach_quoted_enum -- --test-threads=1
+          git diff --check
+          git diff --exit-code -- .
+
+      - name: CockroachDB logs on failure
+        if: failure()
+        run: docker logs dpm-cockroach-quoted-enum
+
+      - name: Stop CockroachDB
+        if: always()
+        run: docker rm -f dpm-cockroach-quoted-enum >/dev/null 2>&1 || true
