@@ -585,6 +585,7 @@ async fn cockroach_verify_replays_and_proves_convergence() {
         keep_shadow: false,
         verbose: false,
         introspect: &opts,
+        command_env: None,
     })
     .await
     .expect("CockroachDB verify should complete");

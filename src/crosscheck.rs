@@ -133,12 +133,15 @@ pub(crate) fn shell_quote(s: &str) -> String {
 }
 
 fn redact_secrets(value: &str, secrets: &[&str]) -> String {
-    let mut redacted = value.to_string();
-    for secret in secrets.iter().copied().filter(|secret| !secret.is_empty()) {
-        redacted = redacted.replace(&shell_quote(secret), "'***'");
-        redacted = redacted.replace(secret, "***");
-    }
-    redacted
+    secrets
+        .iter()
+        .copied()
+        .filter(|secret| !secret.is_empty())
+        .fold(value.to_string(), |redacted, secret| {
+            redacted
+                .replace(&shell_quote(secret), "'***'")
+                .replace(secret, "***")
+        })
 }
 
 fn reported_url(url: &str) -> String {
@@ -198,23 +201,19 @@ pub fn parse_postgres_url(url: &str) -> Result<UrlParts> {
         },
         None => ("postgres".to_string(), None),
     };
-    let mut sslmode = "disable".to_string();
-    if let Some(q) = query {
-        for pair in q.split('&') {
-            if let Some((k, v)) = pair.split_once('=') {
-                if k == "sslmode" {
-                    sslmode = v.to_string();
-                }
-            }
-        }
-    }
+    let sslmode = query
+        .into_iter()
+        .flat_map(|q| q.split('&'))
+        .filter_map(|pair| pair.split_once('='))
+        .filter_map(|(k, v)| (k == "sslmode").then(|| v.to_string()))
+        .last()
+        .unwrap_or_else(|| "disable".to_string());
     Ok(UrlParts {
         user,
         password,
-        host: if host.is_empty() {
-            "localhost".into()
-        } else {
-            host.into()
+        host: match host.is_empty() {
+            true => "localhost".into(),
+            false => host.into(),
         },
         port: port.to_string(),
         dbname: dbname.to_string(),
@@ -236,21 +235,22 @@ pub fn normalize_pg_scheme(url: &str) -> String {
 /// when the URL doesn't already choose one.
 pub fn ensure_sslmode(url: &str) -> String {
     let url = normalize_pg_scheme(url);
-    if url.contains("sslmode=") {
-        url
-    } else if url.contains('?') {
-        format!("{url}&sslmode=disable")
-    } else {
-        format!("{url}?sslmode=disable")
+    match (url.contains("sslmode="), url.contains('?')) {
+        (true, _) => url,
+        (false, true) => format!("{url}&sslmode=disable"),
+        (false, false) => format!("{url}?sslmode=disable"),
     }
 }
 
 fn libpq_env(parts: &UrlParts) -> Vec<(String, String)> {
-    let mut env = vec![("PGSSLMODE".to_string(), parts.sslmode.clone())];
-    if let Some(pw) = &parts.password {
-        env.push(("PGPASSWORD".to_string(), pw.clone()));
-    }
-    env
+    std::iter::once(("PGSSLMODE".to_string(), parts.sslmode.clone()))
+        .chain(
+            parts
+                .password
+                .as_ref()
+                .map(|pw| ("PGPASSWORD".to_string(), pw.clone())),
+        )
+        .collect()
 }
 
 static SCRATCH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -406,37 +406,41 @@ pub fn run_pgdiff(bin: &str, migrated_url: &str, source_url: &str) -> CheckRepor
         d2 = shell_quote(&b.dbname),
     );
 
-    let mut all_sql = String::new();
-    let mut errors = Vec::new();
-    for aspect in PGDIFF_SCHEMA_TYPES {
-        let command = format!("{base} {aspect}");
-        match run_shell(&command, &env) {
-            Ok((success, stdout, stderr)) => {
-                let real: Vec<&str> = stdout
-                    .lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty() && !l.starts_with("--"))
-                    .collect();
-                if !real.is_empty() {
-                    all_sql.push_str(&format!("-- [{aspect}]\n{}\n", real.join("\n")));
+    let outcomes: Vec<(Option<String>, Option<String>)> = PGDIFF_SCHEMA_TYPES
+        .iter()
+        .map(|aspect| {
+            let command = format!("{base} {aspect}");
+            match run_shell(&command, &env) {
+                Ok((success, stdout, stderr)) => {
+                    let real: Vec<&str> = stdout
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty() && !l.starts_with("--"))
+                        .collect();
+                    match (real.is_empty(), success) {
+                        (false, _) => (Some(format!("-- [{aspect}]\n{}\n", real.join("\n"))), None),
+                        (true, false) => (None, Some(format!("[{aspect}] {}", stderr.trim()))),
+                        (true, true) => (None, None),
+                    }
                 }
-                if !success && real.is_empty() {
-                    errors.push(format!("[{aspect}] {}", stderr.trim()));
-                }
+                Err(e) => (None, Some(format!("[{aspect}] {e:#}"))),
             }
-            Err(e) => errors.push(format!("[{aspect}] {e:#}")),
-        }
-    }
+        })
+        .collect();
+    let all_sql: String = outcomes
+        .iter()
+        .filter_map(|(sql, _)| sql.as_deref())
+        .collect();
+    let errors: Vec<String> = outcomes.into_iter().filter_map(|(_, err)| err).collect();
 
     CheckReport {
         name: name.into(),
         command: format!("{base} <{} aspects>", PGDIFF_SCHEMA_TYPES.len()),
         agreed: all_sql.is_empty() && errors.is_empty(),
         output: all_sql.trim().to_string(),
-        error: if errors.is_empty() {
-            None
-        } else {
-            Some(errors.join("; "))
+        error: match errors.is_empty() {
+            true => None,
+            false => Some(errors.join("; ")),
         },
     }
 }
@@ -614,19 +618,22 @@ pub fn run_liquibase(bin: &str, migrated_url: &str, source_url: &str) -> CheckRe
         reference_url = shell_quote(&jdbc(&b)),
         reference_user = shell_quote(&b.user),
     );
-    let mut env = Vec::new();
-    if let Some(password) = &a.password {
-        env.push((
-            "LIQUIBASE_COMMAND_PASSWORD".to_string(),
-            password.to_string(),
-        ));
-    }
-    if let Some(password) = &b.password {
-        env.push((
-            "LIQUIBASE_COMMAND_REFERENCE_PASSWORD".to_string(),
-            password.to_string(),
-        ));
-    }
+    let env: Vec<(String, String)> = a
+        .password
+        .iter()
+        .map(|password| {
+            (
+                "LIQUIBASE_COMMAND_PASSWORD".to_string(),
+                password.to_string(),
+            )
+        })
+        .chain(b.password.iter().map(|password| {
+            (
+                "LIQUIBASE_COMMAND_REFERENCE_PASSWORD".to_string(),
+                password.to_string(),
+            )
+        }))
+        .collect();
     let secrets: Vec<&str> = [a.password.as_deref(), b.password.as_deref()]
         .into_iter()
         .flatten()
@@ -873,10 +880,11 @@ pub fn run_flyway(bin: &str, replica_url: &str, migration_sql: &str) -> CheckRep
         user = shell_quote(&parts.user),
         directory = shell_quote(&dir.path().display().to_string()),
     );
-    let mut env = Vec::new();
-    if let Some(password) = &parts.password {
-        env.push(("FLYWAY_PASSWORD".to_string(), password.to_string()));
-    }
+    let env: Vec<(String, String)> = parts
+        .password
+        .iter()
+        .map(|password| ("FLYWAY_PASSWORD".to_string(), password.to_string()))
+        .collect();
     let secrets: Vec<&str> = parts.password.as_deref().into_iter().collect();
     match run_shell(&command, &env) {
         Ok((success, stdout, stderr)) => {
@@ -891,14 +899,13 @@ pub fn run_flyway(bin: &str, replica_url: &str, migration_sql: &str) -> CheckRep
                     error: None,
                 }
             } else {
-                let tail: String = stdout
-                    .lines()
-                    .chain(stderr.lines())
+                let lines: Vec<&str> = stdout.lines().chain(stderr.lines()).collect();
+                let tail = lines
+                    .iter()
                     .rev()
                     .take(15)
-                    .collect::<Vec<_>>()
-                    .into_iter()
                     .rev()
+                    .copied()
                     .collect::<Vec<_>>()
                     .join("\n");
                 CheckReport {
@@ -926,49 +933,31 @@ pub fn run_diff_checks(
     migrated_url: &str,
     source_url: &str,
 ) -> Vec<CheckReport> {
-    let mut reports = Vec::new();
-    let want = |explicit: bool, bin: &str| -> Option<bool> {
-        if explicit {
-            Some(true) // requested by name: missing binary = failure
-        } else if sel.all {
-            if binary_exists(bin) {
-                Some(true)
-            } else {
-                None // --cross-check-all skips uninstalled tools silently
-            }
-        } else {
-            Some(false)
-        }
+    let want = |explicit: bool, bin: &str| match (explicit, sel.all) {
+        (true, _) => true,
+        (false, true) => binary_exists(bin),
+        (false, false) => false,
     };
-    if want(sel.migra, &bins.migra).unwrap_or(false) {
-        reports.push(run_migra(&bins.migra, migrated_url, source_url));
-    }
-    if want(sel.pgdiff, &bins.pgdiff).unwrap_or(false) {
-        reports.push(run_pgdiff(&bins.pgdiff, migrated_url, source_url));
-    }
-    if want(sel.atlas, &bins.atlas).unwrap_or(false) {
-        reports.push(run_atlas(&bins.atlas, migrated_url, source_url));
-    }
-    if want(sel.pg_schema_diff, &bins.pg_schema_diff).unwrap_or(false) {
-        reports.push(run_pg_schema_diff(
-            &bins.pg_schema_diff,
-            &bins.pg_dump,
-            migrated_url,
-            source_url,
-        ));
-    }
-    if want(sel.liquibase, &bins.liquibase).unwrap_or(false) {
-        reports.push(run_liquibase(&bins.liquibase, migrated_url, source_url));
-    }
-    if want(sel.apgdiff, &bins.apgdiff).unwrap_or(false) {
-        reports.push(run_apgdiff(
-            &bins.apgdiff,
-            &bins.pg_dump,
-            migrated_url,
-            source_url,
-        ));
-    }
-    reports
+    [
+        want(sel.migra, &bins.migra).then(|| run_migra(&bins.migra, migrated_url, source_url)),
+        want(sel.pgdiff, &bins.pgdiff).then(|| run_pgdiff(&bins.pgdiff, migrated_url, source_url)),
+        want(sel.atlas, &bins.atlas).then(|| run_atlas(&bins.atlas, migrated_url, source_url)),
+        want(sel.pg_schema_diff, &bins.pg_schema_diff).then(|| {
+            run_pg_schema_diff(
+                &bins.pg_schema_diff,
+                &bins.pg_dump,
+                migrated_url,
+                source_url,
+            )
+        }),
+        want(sel.liquibase, &bins.liquibase)
+            .then(|| run_liquibase(&bins.liquibase, migrated_url, source_url)),
+        want(sel.apgdiff, &bins.apgdiff)
+            .then(|| run_apgdiff(&bins.apgdiff, &bins.pg_dump, migrated_url, source_url)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 #[cfg(test)]
