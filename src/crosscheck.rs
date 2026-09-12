@@ -205,8 +205,9 @@ pub fn parse_postgres_url(url: &str) -> Result<UrlParts> {
         .into_iter()
         .flat_map(|q| q.split('&'))
         .filter_map(|pair| pair.split_once('='))
-        .filter_map(|(k, v)| (k == "sslmode").then(|| v.to_string()))
-        .last()
+        .filter(|(key, _)| *key == "sslmode")
+        .map(|(_, value)| value.to_string())
+        .next_back()
         .unwrap_or_else(|| "disable".to_string());
     Ok(UrlParts {
         user,
@@ -975,6 +976,12 @@ mod tests {
         assert_eq!(p.port, "6432");
         assert_eq!(p.dbname, "appdb");
         assert_eq!(p.sslmode, "require");
+
+        let p = parse_postgres_url(
+            "postgres://u@h/db?sslmode=prefer&application_name=dpm&sslmode=require",
+        )
+        .unwrap();
+        assert_eq!(p.sslmode, "require", "the last sslmode parameter must win");
 
         let p = parse_postgres_url("postgres://postgres@127.0.0.1:54329/postgres").unwrap();
         assert_eq!(p.password, None);

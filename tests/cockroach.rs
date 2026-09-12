@@ -663,6 +663,7 @@ async fn cockroach_nonpublic_enum_column_verifies_and_converges() {
         keep_shadow: false,
         verbose: false,
         introspect: &opts,
+        command_env: None,
     })
     .await
     .expect("CockroachDB verify must materialize a non-public enum column");

@@ -92,6 +92,7 @@ async fn quoted_nonpublic_enum_type_is_introspected_and_converges() {
         keep_shadow: false,
         verbose: false,
         introspect: &options,
+        command_env: None,
     })
     .await
     .expect("quoted CockroachDB enum migration must materialize");
