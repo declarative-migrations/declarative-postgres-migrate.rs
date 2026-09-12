@@ -27,82 +27,87 @@ jobs:
 
           cross = Path("src/crosscheck.rs")
           text = cross.read_text()
-          old = '''    let sslmode = query
-              .into_iter()
-              .flat_map(|q| q.split('&'))
-              .filter_map(|pair| pair.split_once('='))
-              .filter_map(|(k, v)| (k == "sslmode").then(|| v.to_string()))
-              .last()
-              .unwrap_or_else(|| "disable".to_string());'''
-          new = '''    let sslmode = query
-              .into_iter()
-              .flat_map(|q| q.split('&'))
-              .filter_map(|pair| pair.split_once('='))
-              .filter(|(key, _)| *key == "sslmode")
-              .map(|(_, value)| value.to_string())
-              .next_back()
-              .unwrap_or_else(|| "disable".to_string());'''
+          old = "\n".join([
+              "    let sslmode = query",
+              "        .into_iter()",
+              "        .flat_map(|q| q.split('&'))",
+              "        .filter_map(|pair| pair.split_once('='))",
+              "        .filter_map(|(k, v)| (k == \"sslmode\").then(|| v.to_string()))",
+              "        .last()",
+              "        .unwrap_or_else(|| \"disable\".to_string());",
+          ])
+          new = "\n".join([
+              "    let sslmode = query",
+              "        .into_iter()",
+              "        .flat_map(|q| q.split('&'))",
+              "        .filter_map(|pair| pair.split_once('='))",
+              "        .filter(|(key, _)| *key == \"sslmode\")",
+              "        .map(|(_, value)| value.to_string())",
+              "        .next_back()",
+              "        .unwrap_or_else(|| \"disable\".to_string());",
+          ])
           if text.count(old) != 1:
               raise SystemExit(f"expected one sslmode parser block, found {text.count(old)}")
           text = text.replace(old, new, 1)
 
-          marker = '''        assert_eq!(p.sslmode, "require");
-
-          let p = parse_postgres_url("postgres://postgres@127.0.0.1:54329/postgres").unwrap();'''
-          replacement = '''        assert_eq!(p.sslmode, "require");
-
-          let p = parse_postgres_url(
-              "postgres://u@h/db?sslmode=prefer&application_name=dpm&sslmode=require",
-          )
-          .unwrap();
-          assert_eq!(p.sslmode, "require", "the last sslmode parameter must win");
-
-          let p = parse_postgres_url("postgres://postgres@127.0.0.1:54329/postgres").unwrap();'''
+          marker = "\n".join([
+              "        assert_eq!(p.sslmode, \"require\");",
+              "",
+              "        let p = parse_postgres_url(\"postgres://postgres@127.0.0.1:54329/postgres\").unwrap();",
+          ])
+          replacement = "\n".join([
+              "        assert_eq!(p.sslmode, \"require\");",
+              "",
+              "        let p = parse_postgres_url(",
+              "            \"postgres://u@h/db?sslmode=prefer&application_name=dpm&sslmode=require\",",
+              "        )",
+              "        .unwrap();",
+              "        assert_eq!(p.sslmode, \"require\", \"the last sslmode parameter must win\");",
+              "",
+              "        let p = parse_postgres_url(\"postgres://postgres@127.0.0.1:54329/postgres\").unwrap();",
+          ])
           if text.count(marker) != 1:
               raise SystemExit(f"expected one URL parser test marker, found {text.count(marker)}")
           cross.write_text(text.replace(marker, replacement, 1))
 
           cockroach = Path("tests/cockroach.rs")
           text = cockroach.read_text()
-          old = '''        shadow_server_url: &admin,
-              source_url_for_external: None,
-              allow_destructive: false,
-              external_check: None,'''
-          new = '''        shadow_server_url: &admin,
-              source_url_for_external: None,
-              allow_destructive: false,
-              external_check: None,'''
-          if text.count(old) != 1:
-              raise SystemExit(f"expected one non-destructive Cockroach verify block, found {text.count(old)}")
-          text = text.replace(old, new, 1)
-          needle = '''        verbose: false,
-              introspect: &opts,
-          })
-          .await
-          .expect("CockroachDB verify must materialize a non-public enum column");'''
-          replacement = '''        verbose: false,
-              introspect: &opts,
-              command_env: None,
-          })
-          .await
-          .expect("CockroachDB verify must materialize a non-public enum column");'''
+          needle = "\n".join([
+              "        verbose: false,",
+              "        introspect: &opts,",
+              "    })",
+              "    .await",
+              "    .expect(\"CockroachDB verify must materialize a non-public enum column\");",
+          ])
+          replacement = "\n".join([
+              "        verbose: false,",
+              "        introspect: &opts,",
+              "        command_env: None,",
+              "    })",
+              "    .await",
+              "    .expect(\"CockroachDB verify must materialize a non-public enum column\");",
+          ])
           if text.count(needle) != 1:
               raise SystemExit(f"expected one Cockroach enum verify tail, found {text.count(needle)}")
           cockroach.write_text(text.replace(needle, replacement, 1))
 
           quoted = Path("tests/cockroach_quoted_enum.rs")
           text = quoted.read_text()
-          needle = '''        verbose: false,
-              introspect: &options,
-          })
-          .await
-          .expect("quoted CockroachDB enum migration must materialize");'''
-          replacement = '''        verbose: false,
-              introspect: &options,
-              command_env: None,
-          })
-          .await
-          .expect("quoted CockroachDB enum migration must materialize");'''
+          needle = "\n".join([
+              "        verbose: false,",
+              "        introspect: &options,",
+              "    })",
+              "    .await",
+              "    .expect(\"quoted CockroachDB enum migration must materialize\");",
+          ])
+          replacement = "\n".join([
+              "        verbose: false,",
+              "        introspect: &options,",
+              "        command_env: None,",
+              "    })",
+              "    .await",
+              "    .expect(\"quoted CockroachDB enum migration must materialize\");",
+          ])
           if text.count(needle) != 1:
               raise SystemExit(f"expected one quoted-enum verify tail, found {text.count(needle)}")
           quoted.write_text(text.replace(needle, replacement, 1))
