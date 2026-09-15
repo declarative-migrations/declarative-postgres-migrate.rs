@@ -2,8 +2,7 @@
 
 use std::fs;
 
-const SHARED_ZED_COORDINATE: &str =
-    "\"oresoftware/ores-locks-and-leases\" = \"=0.1.1\"";
+const SHARED_ZED_COORDINATE: &str = "\"oresoftware/ores-locks-and-leases\" = \"=0.1.1\"";
 
 #[test]
 fn migration_executor_declares_the_shared_coordination_package() {
