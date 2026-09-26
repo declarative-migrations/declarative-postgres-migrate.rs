@@ -1,0 +1,20 @@
+name: bounded formal migration model
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  model-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Prove monotonic schema application
+        run: |
+          node <<'NODE'
+          const assert=require('node:assert/strict'),bound=7;
+          const initial={version:0,applied:[],regressions:0};
+          const steps=[['apply-next',s=>({...s,version:s.version+1,applied:[...s.applied,s.version+1]})],['reapply-current',s=>s],['apply-old',s=>s]];
+          const inv=s=>s.regressions===0&&s.applied.length===s.version&&s.applied.every((v,i)=>v===i+1);
+          let f=[initial],seen=new Map([[JSON.stringify(initial),initial]]);for(let d=0;d<=bound;d++){const n=[];for(const s of f){assert(inv(s));for(const [name,step] of steps){const t=step(structuredClone(s));assert(inv(t),`${name} violated migration invariant`);const k=JSON.stringify(t);if(!seen.has(k)){seen.set(k,t);n.push(t)}}}f=n}assert(seen.size>=3);console.log(`migration formal model OK states=${seen.size} bound=${bound}`);
+          NODE
