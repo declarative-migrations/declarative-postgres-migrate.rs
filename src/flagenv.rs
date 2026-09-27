@@ -309,6 +309,9 @@ pub struct Resolved {
     /// Command-marker keys that a parent shell may still hold. Child processes
     /// must unset these before the selected marker is applied.
     child_unset: Vec<String>,
+    /// Command markers selected by the current invocation. Stale markers from
+    /// the parent process are intentionally excluded from child propagation.
+    child_set: HashMap<String, String>,
     command_env_key: Option<String>,
 }
 
@@ -336,14 +339,24 @@ impl Resolved {
                 defaults.insert(spec.env.clone(), v);
             }
         }
+        let child_unset: Vec<String> = config
+            .commands
+            .values()
+            .filter_map(|spec| spec.env.clone())
+            .collect();
+        let child_set = child_unset
+            .iter()
+            .filter_map(|key| {
+                overrides
+                    .get(key)
+                    .map(|value| (key.clone(), value.clone()))
+            })
+            .collect();
         Self {
             env: merge_env(process_env, overrides),
             defaults,
-            child_unset: config
-                .commands
-                .values()
-                .filter_map(|spec| spec.env.clone())
-                .collect(),
+            child_unset,
+            child_set,
             command_env_key: config.command_env_key().map(str::to_owned),
         }
     }
@@ -359,10 +372,8 @@ impl Resolved {
                 cmd.env(key, value);
             }
         }
-        for key in &self.child_unset {
-            if let Some(value) = self.get(key) {
-                cmd.env(key, value);
-            }
+        for (key, value) in &self.child_set {
+            cmd.env(key, value);
         }
     }
 
