@@ -346,11 +346,7 @@ impl Resolved {
             .collect();
         let child_set = child_unset
             .iter()
-            .filter_map(|key| {
-                overrides
-                    .get(key)
-                    .map(|value| (key.clone(), value.clone()))
-            })
+            .filter_map(|key| overrides.get(key).map(|value| (key.clone(), value.clone())))
             .collect();
         Self {
             env: merge_env(process_env, overrides),
@@ -661,9 +657,15 @@ type = "integer"
                 )
             })
             .collect();
-        assert!(as_strings.iter().any(|(k, v)| k == "FLAGS2ENV_COMMAND" && v.as_deref() == Some("verify")));
-        assert!(as_strings.iter().any(|(k, v)| k == "DPM_CMD_VERIFY" && v.as_deref() == Some("true")));
-        assert!(as_strings.iter().any(|(k, v)| k == "DPM_CMD_DIFF" && v.is_none()));
+        assert!(as_strings
+            .iter()
+            .any(|(k, v)| k == "FLAGS2ENV_COMMAND" && v.as_deref() == Some("verify")));
+        assert!(as_strings
+            .iter()
+            .any(|(k, v)| k == "DPM_CMD_VERIFY" && v.as_deref() == Some("true")));
+        assert!(as_strings
+            .iter()
+            .any(|(k, v)| k == "DPM_CMD_DIFF" && v.is_none()));
     }
 }
 
