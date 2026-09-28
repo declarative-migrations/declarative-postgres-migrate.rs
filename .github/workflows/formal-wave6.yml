@@ -8,19 +8,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: {persist-credentials: false}
-      - name: Audit and execute proof
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - name: Format proof crate
+        run: cargo fmt --manifest-path tools/formal-wave6-model/Cargo.toml -- --check
+      - name: Lint proof crate
+        run: cargo clippy --locked --manifest-path tools/formal-wave6-model/Cargo.toml --all-targets -- -D warnings
+      - name: Test proof crate
+        run: cargo test --locked --manifest-path tools/formal-wave6-model/Cargo.toml
+      - name: Execute proof deterministically
         run: |
           set -euo pipefail
-          python3 -m py_compile conformance/formal_wave6_model.py
-          python3 - <<'PY'
-          import ast,pathlib
-          t=ast.parse(pathlib.Path('conformance/formal_wave6_model.py').read_text()); assert any(isinstance(n,ast.Assert) for n in ast.walk(t))
-          banned={'eval','exec','compile','__import__','open'}; mods={'os','subprocess','socket','urllib','http','requests','shutil','tempfile'}
-          for n in ast.walk(t):
-            if isinstance(n,ast.Call) and isinstance(n.func,ast.Name): assert n.func.id not in banned,n.func.id
-            if isinstance(n,(ast.Import,ast.ImportFrom)):
-              x=[a.name.split('.')[0] for a in n.names] if isinstance(n,ast.Import) else [(n.module or '').split('.')[0]]; assert not set(x)&mods,x
-          PY
-          python3 -I conformance/formal_wave6_model.py >/tmp/a
-          python3 -I conformance/formal_wave6_model.py >/tmp/b
-          cmp /tmp/a /tmp/b && cat /tmp/a
+          cargo run --quiet --locked --manifest-path tools/formal-wave6-model/Cargo.toml >/tmp/formal-wave6-a
+          cargo run --quiet --locked --manifest-path tools/formal-wave6-model/Cargo.toml >/tmp/formal-wave6-b
+          cmp /tmp/formal-wave6-a /tmp/formal-wave6-b
+          grep -Fx 'migration partial-order/idempotency model: ok' /tmp/formal-wave6-a
+          cat /tmp/formal-wave6-a
