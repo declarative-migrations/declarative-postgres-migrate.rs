@@ -6,15 +6,9 @@ const COMMENTS: &str = "comments";
 
 fn dependencies(node: &str) -> &'static [&'static str] {
     match node {
-        USERS => {
-            return &[];
-        }
-        POSTS => {
-            return &[USERS];
-        }
-        COMMENTS => {
-            return &[POSTS];
-        }
+        USERS => &[],
+        POSTS => &[USERS],
+        COMMENTS => &[POSTS],
         _ => {
             panic!("unknown migration node: {node}");
         }
@@ -35,7 +29,7 @@ fn valid_order(order: [&str; 3]) -> bool {
         seen.insert(node);
     }
 
-    return true;
+    true
 }
 
 fn valid_orders() -> Vec<[&'static str; 3]> {
@@ -61,7 +55,7 @@ fn valid_orders() -> Vec<[&'static str; 3]> {
         }
     }
 
-    return valid;
+    valid
 }
 
 fn duplicate_application_is_idempotent() -> bool {
@@ -69,7 +63,7 @@ fn duplicate_application_is_idempotent() -> bool {
     let before = applied.clone();
     applied.insert(USERS);
 
-    return applied == before;
+    applied == before
 }
 
 fn prove() {
@@ -82,7 +76,6 @@ fn prove() {
 fn main() {
     prove();
     println!("migration partial-order/idempotency model: ok");
-    return;
 }
 
 #[cfg(test)]
