@@ -1,0 +1,54 @@
+name: Formal bounded migration invariants
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bounded-migration-model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Exhaustively check bounded migration state space
+        shell: bash
+        run: |
+          node <<'NODE'
+          const assert = require('node:assert/strict');
+          const actions = ['plan', 'apply', 'rollback', 'promote_baseline', 'stale_apply'];
+          const initial = { desired: 0, applied: 0, baseline: 0 };
+          const step = (s, action) => {
+            switch (action) {
+              case 'plan': return { ...s, desired: s.desired + 1 };
+              case 'apply': return s.applied < s.desired ? { ...s, applied: s.applied + 1 } : s;
+              case 'rollback': return s.applied > s.baseline ? { ...s, applied: s.applied - 1 } : s;
+              case 'promote_baseline': return { ...s, baseline: s.applied };
+              case 'stale_apply': return s;
+              default: throw new Error(`unknown action ${action}`);
+            }
+          };
+          const key = (s) => JSON.stringify(s);
+          let frontier = [initial];
+          const seen = new Set([key(initial)]);
+          for (let depth = 0; depth < 9; depth += 1) {
+            const next = [];
+            for (const state of frontier) {
+              assert.ok(state.baseline <= state.applied && state.applied <= state.desired, 'baseline <= applied <= desired');
+              for (const action of actions) {
+                const after = step(state, action);
+                assert.ok(after.desired >= state.desired, 'desired schema version never regresses');
+                assert.ok(after.baseline >= state.baseline, 'protected baseline never regresses');
+                assert.ok(after.baseline <= after.applied && after.applied <= after.desired, 'migration ordering preserved');
+                if (action === 'stale_apply') assert.deepEqual(after, state, 'stale apply is a no-op');
+                const k = key(after);
+                if (!seen.has(k)) { seen.add(k); next.push(after); }
+              }
+            }
+            frontier = next;
+          }
+          console.log(`formal migration model OK: ${seen.size} reachable states checked`);
+          NODE
