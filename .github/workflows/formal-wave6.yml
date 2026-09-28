@@ -1,0 +1,28 @@
+name: Formal Wave 6
+on: {pull_request: {}, workflow_dispatch: {}}
+permissions: {contents: read}
+jobs:
+  formal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - name: Format proof crate
+        run: cargo fmt --manifest-path tools/formal-wave6-model/Cargo.toml -- --check
+      - name: Lint proof crate
+        run: cargo clippy --locked --manifest-path tools/formal-wave6-model/Cargo.toml --all-targets -- -D warnings
+      - name: Test proof crate
+        run: cargo test --locked --manifest-path tools/formal-wave6-model/Cargo.toml
+      - name: Execute proof deterministically
+        run: |
+          set -euo pipefail
+          cargo run --quiet --locked --manifest-path tools/formal-wave6-model/Cargo.toml >/tmp/formal-wave6-a
+          cargo run --quiet --locked --manifest-path tools/formal-wave6-model/Cargo.toml >/tmp/formal-wave6-b
+          cmp /tmp/formal-wave6-a /tmp/formal-wave6-b
+          grep -Fx 'migration partial-order/idempotency model: ok' /tmp/formal-wave6-a
+          cat /tmp/formal-wave6-a
