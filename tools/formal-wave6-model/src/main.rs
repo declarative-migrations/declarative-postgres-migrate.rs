@@ -25,7 +25,10 @@ fn valid_order(order: [&str; 3]) -> bool {
     let mut seen = BTreeSet::new();
 
     for node in order {
-        if !dependencies(node).iter().all(|dependency| seen.contains(dependency)) {
+        if !dependencies(node)
+            .iter()
+            .all(|dependency| seen.contains(dependency))
+        {
             return false;
         }
 
