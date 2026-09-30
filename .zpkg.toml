@@ -11,6 +11,14 @@ language = "rust"
 vcs = "git"
 url = "https://github.com/declarative-migrations/declarative-postgres-migrate.rs"
 
+# DPM is the privileged migration executor. All fleet-level lock/lease/fencing
+# semantics must come through this shared package rather than a direct Fiducia
+# or other provider dependency. The existing PostgreSQL advisory-key path is a
+# compatibility lane until a dual-lock cutover has exact-head contention and
+# stale-runner evidence; do not perform a flag-day key swap.
+[dependencies]
+"oresoftware/ores-locks-and-leases" = "=0.1.1"
+
 [build]
 command = "cargo build --release --locked --bins"
 outputs = ["target/release/dpm", "target/release/dpm-server"]
