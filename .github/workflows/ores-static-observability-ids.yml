@@ -1,0 +1,8 @@
+# Hardcoded ORES IDs: routine IDs at function entry; trace IDs inline at log calls.
+name: ORES static observability IDs
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  ores-static-observability-ids:
+    uses: ores-otel/ores.otel.log/.github/workflows/ores-trace-contract-reusable.yml@a90638c5dba2a59b1b77c9c55d4c60829b4480d8
