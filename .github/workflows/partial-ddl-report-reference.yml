@@ -1,0 +1,21 @@
+name: partial-ddl-report source regression
+on:
+  pull_request:
+    paths:
+      - 'src/apply.rs'
+      - 'src/partial_failure_diagnostic.rs'
+      - '.github/workflows/partial-ddl-report-reference.yml'
+  workflow_dispatch:
+permissions: {contents: read}
+jobs:
+  focused:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Execute exact checked-out regression
+        run: |
+          set -euo pipefail
+          rustc --edition=2021 --test src/partial_failure_diagnostic.rs -o "$RUNNER_TEMP/partial-failure-tests" && "$RUNNER_TEMP/partial-failure-tests"

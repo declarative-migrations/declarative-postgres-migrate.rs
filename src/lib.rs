@@ -30,6 +30,7 @@
 pub mod advisor;
 pub mod ai;
 pub mod apply;
+mod partial_failure_diagnostic;
 pub mod canonicalize;
 // `DirBuilder::mode` mutates the scratch-directory builder only on Unix. Keep
 // Windows strict-lint builds focused while preserving mode 0o700 on Unix.
