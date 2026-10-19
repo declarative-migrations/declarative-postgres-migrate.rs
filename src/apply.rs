@@ -299,9 +299,20 @@ pub struct ApplyReport {
     pub executed: usize,
 }
 
-/// Execute a script statement-by-statement. On error the connection has
-/// whatever transaction state the script left; we attempt a ROLLBACK so the
-/// error surfaces cleanly.
+/// Operator-facing recovery context. The count is the number of completed
+/// execute() calls, *not* a guarantee that they all remain committed.
+fn partial_failure_context(index: usize, total: usize, executed: usize, sql: &str) -> String {
+    format!(
+        "statement {index}/{total} failed after {executed} earlier successful execute calls; \
+partial migration possible: attempted ROLLBACK cannot undo previously committed DDL; \
+catalog restoration is UNVERIFIED. Re-introspect the target and generate a residual reconciliation plan before retrying.\\n{}",
+        truncate_sql(sql)
+    )
+}
+
+/// Execute a script statement-by-statement. Earlier autocommitted statements
+/// may persist after a failure. ROLLBACK only affects an open transaction and
+/// is **never** evidence that the original catalog was restored.
 pub async fn apply_script(url: &str, sql: &str) -> Result<ApplyReport> {
     let mut conn = PgConnection::connect(url)
         .await
@@ -313,12 +324,7 @@ pub async fn apply_script(url: &str, sql: &str) -> Result<ApplyReport> {
             let _ = sqlx::raw_sql("ROLLBACK").execute(&mut conn).await;
             let _ = conn.close().await;
             return Err(anyhow::anyhow!(err)).with_context(|| {
-                format!(
-                    "statement {}/{} failed:\n{}",
-                    i + 1,
-                    statements.len(),
-                    truncate_sql(stmt)
-                )
+                partial_failure_context(i + 1, statements.len(), executed, stmt)
             });
         }
         executed += 1;
@@ -330,6 +336,15 @@ pub async fn apply_script(url: &str, sql: &str) -> Result<ApplyReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_failure_does_not_claim_rollback_restores_autocommitted_ddl() {
+        let report = partial_failure_context(2, 3, 1, "ALTER TABLE example ADD COLUMN x INT");
+        assert!(report.contains("after 1 earlier successful execute calls"));
+        assert!(report.contains("catalog restoration is UNVERIFIED"));
+        assert!(report.contains("Re-introspect"));
+        assert!(!report.contains("rollback succeeded"));
+    }
 
     #[test]
     fn splits_simple_statements() {
