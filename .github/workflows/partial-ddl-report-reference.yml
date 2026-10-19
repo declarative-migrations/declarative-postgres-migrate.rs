@@ -3,6 +3,7 @@ on:
   pull_request:
     paths:
       - 'src/apply.rs'
+      - 'src/partial_failure_diagnostic.rs'
       - '.github/workflows/partial-ddl-report-reference.yml'
   workflow_dispatch:
 permissions: {contents: read}
@@ -17,4 +18,4 @@ jobs:
       - name: Execute exact checked-out regression
         run: |
           set -euo pipefail
-          cargo test --locked partial_failure_does_not_claim_rollback_restores_autocommitted_ddl
+          rustc --edition=2021 --test src/partial_failure_diagnostic.rs -o "$RUNNER_TEMP/partial-failure-tests" && "$RUNNER_TEMP/partial-failure-tests"
