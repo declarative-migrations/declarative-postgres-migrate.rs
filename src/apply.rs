@@ -302,12 +302,7 @@ pub struct ApplyReport {
 /// Operator-facing recovery context. The count is the number of completed
 /// execute() calls, *not* a guarantee that they all remain committed.
 fn partial_failure_context(index: usize, total: usize, executed: usize, sql: &str) -> String {
-    format!(
-        "statement {index}/{total} failed after {executed} earlier successful execute calls; \
-partial migration possible: attempted ROLLBACK cannot undo previously committed DDL; \
-catalog restoration is UNVERIFIED. Re-introspect the target and generate a residual reconciliation plan before retrying.\\n{}",
-        truncate_sql(sql)
-    )
+    crate::partial_failure_diagnostic::partial_failure_context(index,total,executed,&truncate_sql(sql))
 }
 
 /// Execute a script statement-by-statement. Earlier autocommitted statements
