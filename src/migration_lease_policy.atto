@@ -1,0 +1,18 @@
+// Pure AttoLang lease authorization policy. NOT a DB-backed or compiled proof.
+define module migration_lease_policy as
+  pub fnc apply_denied(int current_epoch, int claimed_epoch,
+                       bool lease_held, bool owner_matches,
+                       bool script_validated): bool {
+    return !lease_held || !owner_matches ||
+      current_epoch <= 0 || claimed_epoch != current_epoch ||
+      !script_validated;
+  }
+
+  pub fnc self_check(): bool {
+    return !apply_denied(2,2,true,true,true) &&
+      apply_denied(2,1,true,true,true) &&
+      apply_denied(2,2,true,false,true) &&
+      apply_denied(2,2,false,true,true) &&
+      apply_denied(2,2,true,true,false);
+  }
+end
