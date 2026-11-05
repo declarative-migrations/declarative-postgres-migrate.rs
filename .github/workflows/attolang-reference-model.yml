@@ -1,0 +1,22 @@
+name: AttoLang reference model (abstract only)
+on:
+  pull_request:
+    paths:
+      - 'formal/attolang/**'
+      - '.github/workflows/attolang-reference-model.yml'
+  push:
+    paths:
+      - 'formal/attolang/**'
+      - '.github/workflows/attolang-reference-model.yml'
+  workflow_dispatch:
+jobs:
+  finite-model:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node formal/attolang/model_check.mjs
