@@ -1,0 +1,35 @@
+name: Bounded migration lease and AttoLang policy
+on:
+  pull_request:
+    paths:
+      - "src/migration_lease_policy.atto"
+      - "scripts/check_attolang_migration_lease.py"
+      - ".github/workflows/attolang-lease-formal.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/migration_lease_policy.atto"
+      - "scripts/check_attolang_migration_lease.py"
+      - ".github/workflows/attolang-lease-formal.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  bounded-lease:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Check out exact head without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Check exact-head lease model and source inputs
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          python3 scripts/check_attolang_migration_lease.py
+          sha256sum src/migration_lease_policy.atto scripts/check_attolang_migration_lease.py
