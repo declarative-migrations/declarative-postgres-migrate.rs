@@ -1,0 +1,14 @@
+// Pure dialect guard: no SQL execution or DDL proof is implied.
+define module migration_policy as
+  pub fnc may_plan(bool same_dialect): bool {
+    return same_dialect;
+  }
+  pub fnc may_apply(bool same_dialect, bool plan_checked): bool {
+    return same_dialect && plan_checked;
+  }
+  pub fnc self_check(): bool {
+    return may_plan(true) && !may_plan(false) &&
+      may_apply(true,true) && !may_apply(true,false) &&
+      !may_apply(false,true);
+  }
+end
