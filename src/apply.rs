@@ -294,6 +294,21 @@ pub fn truncate_sql(stmt: &str) -> String {
     }
 }
 
+/// Guard against unbounded script or statement allocation before connecting.
+/// These limits apply to the generated migration script, not to catalog dumps.
+pub const MAX_APPLY_SCRIPT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_APPLY_STATEMENTS: usize = 100_000;
+
+/// Validate execution budgets before opening a database connection.
+pub fn preflight_apply_script(sql: &str) -> Result<Vec<String>> {
+    anyhow::ensure!(!sql.trim().is_empty(), "refusing to apply an empty script");
+    anyhow::ensure!(sql.len() <= MAX_APPLY_SCRIPT_BYTES, "migration script exceeds 64 MiB");
+    let statements = split_statements(sql);
+    anyhow::ensure!(!statements.is_empty(), "migration script contains no executable statements");
+    anyhow::ensure!(statements.len() <= MAX_APPLY_STATEMENTS, "migration script exceeds 100000 statements");
+    Ok(statements)
+}
+
 #[derive(Debug)]
 pub struct ApplyReport {
     pub executed: usize,
@@ -303,10 +318,11 @@ pub struct ApplyReport {
 /// whatever transaction state the script left; we attempt a ROLLBACK so the
 /// error surfaces cleanly.
 pub async fn apply_script(url: &str, sql: &str) -> Result<ApplyReport> {
+    // Fail before acquiring connection or reaching the target for invalid input.
+    let statements = preflight_apply_script(sql)?;
     let mut conn = PgConnection::connect(url)
         .await
         .with_context(|| format!("connecting to {}", crate::introspect::redact_url(url)))?;
-    let statements = split_statements(sql);
     let mut executed = 0usize;
     for (i, stmt) in statements.iter().enumerate() {
         if let Err(err) = sqlx::raw_sql(stmt).execute(&mut conn).await {
@@ -330,6 +346,19 @@ pub async fn apply_script(url: &str, sql: &str) -> Result<ApplyReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preflight_refuses_empty_or_comment_only_scripts() {
+        assert!(preflight_apply_script("").is_err());
+        assert!(preflight_apply_script(" /* no execution */ ").is_err());
+        assert_eq!(preflight_apply_script("SELECT 1;").unwrap(), vec!["SELECT 1"]);
+    }
+
+    #[test]
+    fn preflight_rejects_oversized_scripts_before_connecting() {
+        let huge = " ".repeat(MAX_APPLY_SCRIPT_BYTES + 1);
+        assert!(preflight_apply_script(&huge).is_err());
+    }
 
     #[test]
     fn splits_simple_statements() {
